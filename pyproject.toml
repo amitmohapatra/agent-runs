@@ -1,0 +1,54 @@
+[project]
+name = "agent-runs"
+version = "0.1.0"
+description = "Durable agent runs: start, pause for a human, resume, cancel, replay."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.141,<1",
+  "uvicorn[standard]>=0.53",
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.15,<3",
+  "sqlalchemy[asyncio]>=2.0.53,<3",
+  "psycopg[binary,pool]>=3.3,<4",
+  "alembic>=1.20,<2",
+  "structlog>=25.2",
+  "universal-agent-contracts>=0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.28", "ruff>=0.6"]
+otel = ["opentelemetry-sdk>=1.44", "opentelemetry-exporter-otlp-proto-http>=1.44",
+        "opentelemetry-instrumentation-fastapi>=0.65b0"]
+
+[project.scripts]
+agent-runs = "agent_runs.__main__:main"
+
+[tool.uv.sources]
+universal-agent-contracts = { path = "../agent-contracts", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_runs"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "PLC0415"]
+# PLR0913: the list filters are keyword-only and optional. Collapsing them into a filter
+# object would make the common call ("this tenant's paused runs") harder to write, which is
+# the opposite of what the rule is protecting.
+"src/agent_runs/store/runs.py" = ["PLR0913"]
+# PLR0913/PLR0917: FastAPI expresses query parameters as function arguments. Collapsing the
+# list filters into an object would change the public API to please a linter.
+"src/agent_runs/api/routers/runs.py" = ["PLR0913", "PLR0917"]
