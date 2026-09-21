@@ -6,6 +6,7 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict
 
 from agent_runs.api.deps import Session, Tenant
 from agent_runs.domain.models import RUNNING, InvalidTransition, Run, RunCreate, RunTransition
@@ -18,6 +19,19 @@ _NOT_FOUND = 404
 _FORBIDDEN = 403
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
+
+
+class ResumeRequest(BaseModel):
+    """A human's reply to a paused run.
+
+    ``answer`` is deliberately ``Any``: what a pause asked for is the agent's business — a
+    yes/no, a chosen option, a filled-in form — and this service records it rather than
+    interpreting it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: Any = None
 
 
 @router.post("", status_code=201)
@@ -54,9 +68,22 @@ async def transition(run_id: str, change: RunTransition, db: Session, tenant_id:
 
 
 @router.post("/{run_id}/resume")
-async def resume(run_id: str, db: Session, tenant_id: Tenant, answer: Any = None) -> Run:
-    """What a human reply does to a paused run."""
-    change = RunTransition(status=RUNNING, metadata={"answer": answer} if answer else {})
+async def resume(
+    run_id: str, db: Session, tenant_id: Tenant, body: ResumeRequest | None = None
+) -> Run:
+    """What a human reply does to a paused run.
+
+    The answer arrives in the **body**. It used to be declared ``answer: Any = None``, which
+    FastAPI reads as a *query* parameter for a non-model type — so every UI that posted
+    ``{"answer": ...}`` as JSON resumed the run with no answer at all, and got a 200 saying
+    so. An answer is the whole point of a pause, and it can be an object; a query string is
+    the wrong place for it either way.
+    """
+    answer = body.answer if body is not None else None
+    # ``is not None`` rather than truthiness: False is a decision, and a rejection must not
+    # be indistinguishable from no reply at all.
+    metadata = {"answer": answer} if answer is not None else {}
+    change = RunTransition(status=RUNNING, metadata=metadata)
     return await transition(run_id, change, db, tenant_id)
 
 

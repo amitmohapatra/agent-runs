@@ -1,0 +1,51 @@
+# The service and the one dependency it has. `make up` builds and starts both.
+#
+# Postgres is declared here so `docker compose up` is genuinely all it takes; point
+# RUNS__DATABASE__URL at your own database and remove it when you have one.
+
+name: agent-runs
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: memory
+      POSTGRES_DB: agent_runs
+    ports:
+      - "${RUNS_DB_PORT:-5442}:5432"
+    volumes:
+      - runs-db:/var/lib/postgresql/data
+    healthcheck:
+      # The API creates its table at startup, so it must not start before the database
+      # answers — otherwise the first boot of a clean stack fails and restarts its way in.
+      test: ["CMD-SHELL", "pg_isready -U memory -d agent_runs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
+      RUNS__SERVICE__PORT: "8090"
+      RUNS__SERVICE__ENVIRONMENT: dev
+      RUNS__OBSERVABILITY__LOG_JSON: "true"
+    env_file:
+      # Optional: anything here overrides the defaults above. Never committed.
+      - path: .env
+        required: false
+    ports:
+      # The published port is a property of the machine, not of the service: anything else
+      # may already hold 8090 there. Override with RUNS_PORT in .env — on the developer
+      # machine this was written on, a Bifrost process holds 127.0.0.1:8090 while Docker
+      # holds *:8090 on IPv6, so the host and a container reached *different services*
+      # through the same URL.
+      - "${RUNS_PORT:-8090}:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  runs-db:

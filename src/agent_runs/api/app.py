@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from agent_runs.api.deps import Session
 from agent_runs.api.routers import runs
 from agent_runs.config.settings import Settings, get_settings
+from agent_runs.observability.logging import configure_logging
 from agent_runs.store.tables import Base
 
 log = structlog.get_logger(__name__)
@@ -20,6 +21,10 @@ log = structlog.get_logger(__name__)
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    # Before anything else logs: settings that nothing reads are not configuration.
+    configure_logging(
+        level=settings.observability.log_level, json_output=settings.observability.log_json
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_runs.domain.models import RUNNING, Run, RunCreate, RunTransition, check
@@ -55,12 +56,7 @@ class RunStore:
         9am job twice whenever its acknowledgement was lost.
         """
         if spec.idempotency_key:
-            existing = await self._session.scalar(
-                select(RunRow).where(
-                    RunRow.tenant_id == spec.tenant_id,
-                    RunRow.idempotency_key == spec.idempotency_key,
-                )
-            )
+            existing = await self._find_by_key(spec.tenant_id, spec.idempotency_key)
             if existing is not None:
                 return _to_run(existing), False
 
@@ -79,8 +75,33 @@ class RunStore:
             run_metadata=spec.metadata or None,
         )
         self._session.add(row)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError:
+            # Lost the race. The look-up above is not enough on its own: two concurrent
+            # starts with one key both see no row, both insert, and the unique constraint
+            # rejects exactly one of them. Measured before this was handled — eight
+            # concurrent starts on one key produced seven 201s and one 500, which is the
+            # opposite of what an idempotency key promises the caller.
+            #
+            # The winner's row is the answer, so roll this attempt back and read it.
+            if not spec.idempotency_key:
+                raise
+            await self._session.rollback()
+            existing = await self._find_by_key(spec.tenant_id, spec.idempotency_key)
+            if existing is None:
+                # A different constraint failed; this is not the race we know how to lose.
+                raise
+            return _to_run(existing), False
         return _to_run(row), True
+
+    async def _find_by_key(self, tenant_id: str, idempotency_key: str) -> RunRow | None:
+        return await self._session.scalar(
+            select(RunRow).where(
+                RunRow.tenant_id == tenant_id,
+                RunRow.idempotency_key == idempotency_key,
+            )
+        )
 
     async def get(self, tenant_id: str, run_id: str) -> Run | None:
         row = await self._session.scalar(

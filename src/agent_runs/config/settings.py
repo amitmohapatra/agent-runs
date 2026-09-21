@@ -52,6 +52,10 @@ def _dev_credentials() -> dict[str, Credential]:
 
 class ServiceSettings(BaseModel):
     name: str = "agent-runs"
+    #: Where uvicorn binds. In a container the port is chosen by whoever runs it, so it is
+    #: configuration (RUNS__SERVICE__PORT), not a literal in the entry point.
+    host: str = "0.0.0.0"
+    port: int = 8090
     environment: str = "dev"
     #: Every request is authenticated, in every environment.
     #:
