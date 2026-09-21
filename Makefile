@@ -2,7 +2,7 @@ CONTRACTS ?= ../agent-contracts
 VENDOR    := vendor/agent-contracts
 
 .DEFAULT_GOAL := help
-.PHONY: help vendor install lint test image up down
+.PHONY: help vendor install lint test migrate image up down
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -28,6 +28,9 @@ install: ## Sync the dev environment
 lint: ## Ruff check and format check
 	uv run ruff check src tests
 	uv run ruff format --check src tests
+
+migrate: ## Bring the database to the latest schema
+	uv run alembic upgrade head
 
 test: ## Run the test suite
 	uv run pytest -q

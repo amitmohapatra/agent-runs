@@ -69,6 +69,10 @@ class RunCreate(BaseModel):
     input: Any = None
     deadline: datetime | None = None
     idempotency_key: str | None = None
+    #: Where to POST when this run pauses or finishes. Captured at start, because that is
+    #: when the caller who wants to know is still present — a schedule fired at 3am has no
+    #: one to ask later.
+    webhook_url: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -105,6 +109,7 @@ class Run(BaseModel):
     attempt: int = 1
     deadline: datetime | None = None
     idempotency_key: str | None = None
+    webhook_url: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
@@ -122,6 +127,17 @@ class InvalidTransition(Exception):
         self.run_id, self.frm, self.to = run_id, frm, to
 
 
+#: States with nowhere left to go. Derived from ALLOWED rather than listed again, because a
+#: second list is a second thing to forget: adding a status without adding it here would
+#: silently stop notifying anyone that a run in that state had finished.
+TERMINAL: frozenset[str] = frozenset(
+    status for statuses in ALLOWED.values() for status in statuses if not ALLOWED.get(status)
+)
+
+#: The transitions a person waiting on a run cares about: it finished, or it needs them.
+NOTIFIABLE: frozenset[str] = TERMINAL | {str(AgentStatus.PAUSED)}
+
+
 def check(run_id: str, frm: str, to: str) -> None:
     """Raise unless ``frm -> to`` is legal."""
     if to not in ALLOWED.get(frm, frozenset()):
@@ -131,7 +147,9 @@ def check(run_id: str, frm: str, to: str) -> None:
 __all__ = [
     "ALLOWED",
     "LIVE",
+    "NOTIFIABLE",
     "RUNNING",
+    "TERMINAL",
     "InvalidTransition",
     "Run",
     "RunCreate",

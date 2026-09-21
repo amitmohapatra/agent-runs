@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from agent_runs.api.deps import Session, Tenant
@@ -54,7 +54,9 @@ async def get(run_id: str, db: Session, tenant_id: Tenant) -> Run:
 
 
 @router.post("/{run_id}/transition")
-async def transition(run_id: str, change: RunTransition, db: Session, tenant_id: Tenant) -> Run:
+async def transition(
+    run_id: str, change: RunTransition, db: Session, tenant_id: Tenant, request: Request
+) -> Run:
     try:
         run = await RunStore(db).transition(tenant_id, run_id, change)
     except InvalidTransition as exc:
@@ -64,12 +66,20 @@ async def transition(run_id: str, change: RunTransition, db: Session, tenant_id:
         raise HTTPException(_NOT_FOUND, f"no run {run_id}")
     await db.commit()
     log.info("run.transitioned", run_id=run_id, status=run.status)
+    # After the commit, never before: a notification for a state that failed to persist is
+    # worse than a late one. Scheduling is non-blocking, so a slow receiver cannot turn
+    # "your run finished" into a timeout on the call that finished it.
+    request.app.state.webhooks.schedule(run)
     return run
 
 
 @router.post("/{run_id}/resume")
 async def resume(
-    run_id: str, db: Session, tenant_id: Tenant, body: ResumeRequest | None = None
+    run_id: str,
+    db: Session,
+    tenant_id: Tenant,
+    request: Request,
+    body: ResumeRequest | None = None,
 ) -> Run:
     """What a human reply does to a paused run.
 
@@ -84,7 +94,7 @@ async def resume(
     # be indistinguishable from no reply at all.
     metadata = {"answer": answer} if answer is not None else {}
     change = RunTransition(status=RUNNING, metadata=metadata)
-    return await transition(run_id, change, db, tenant_id)
+    return await transition(run_id, change, db, tenant_id, request)
 
 
 @router.get("")

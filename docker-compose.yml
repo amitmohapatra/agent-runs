@@ -24,6 +24,21 @@ services:
       timeout: 3s
       retries: 10
 
+  migrate:
+    # One shot, and the API waits for it to succeed. Migrating from inside the API instead
+    # would mean two replicas racing to apply the same migration on every deploy.
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build: .
     environment:
@@ -31,10 +46,14 @@ services:
       RUNS__SERVICE__PORT: "8090"
       RUNS__SERVICE__ENVIRONMENT: dev
       RUNS__OBSERVABILITY__LOG_JSON: "true"
+      RUNS__WEBHOOKS__SIGNING_SECRET: ${RUNS_WEBHOOK_SECRET:-}
     env_file:
       # Optional: anything here overrides the defaults above. Never committed.
       - path: .env
         required: false
+    extra_hosts:
+      # A receiver may well be on the host during development.
+      - "host.docker.internal:host-gateway"
     ports:
       # The published port is a property of the machine, not of the service: anything else
       # may already hold 8090 there. Override with RUNS_PORT in .env — on the developer
@@ -45,6 +64,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:

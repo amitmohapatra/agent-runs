@@ -66,6 +66,29 @@ class ServiceSettings(BaseModel):
     api_keys: dict[str, Credential] = Field(default_factory=_dev_credentials)
 
 
+class WebhookSettings(BaseModel):
+    """Telling whoever started a run that it paused or finished.
+
+    A UI should not have to poll to find out that the 3am job needs an approval. What this
+    is *not* is a second source of truth: the run row stays authoritative, delivery is
+    at-least-once, and a client that missed one reconciles by reading the run.
+    """
+
+    enabled: bool = True
+    timeout_seconds: float = 10.0
+    #: Attempts per notification, including the first. Each failure waits
+    #: ``backoff_seconds * 2 ** attempt``.
+    max_attempts: int = 4
+    backoff_seconds: float = 1.0
+    #: Signs the body as ``X-Run-Signature: sha256=<hex>`` so a receiver can tell a real
+    #: notification from anything else that can reach its URL. Empty means unsigned, which
+    #: is only defensible on a laptop — and the startup check refuses it anywhere else.
+    signing_secret: str = ""
+    #: Schemes a webhook may use. Plain http is allowed in dev and nowhere else: a
+    #: notification carries a run's output.
+    allowed_schemes: tuple[str, ...] = ("https", "http")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RUNS__", env_nested_delimiter="__", env_file=".env", extra="ignore"
@@ -74,6 +97,7 @@ class Settings(BaseSettings):
     service: ServiceSettings = ServiceSettings()
     database: DatabaseSettings = DatabaseSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
+    webhooks: WebhookSettings = WebhookSettings()
 
     def check(self) -> None:
         """Refuse configurations that only look like they work."""
@@ -86,6 +110,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "the development credential is still configured outside dev: "
                 "issue real keys in service.api_keys"
+            )
+        if (
+            self.service.environment != "dev"
+            and self.webhooks.enabled
+            and not self.webhooks.signing_secret
+        ):
+            raise ValueError(
+                "webhooks.signing_secret is empty outside dev: an unsigned notification "
+                "carries a run's output to whoever holds the URL, and a receiver has no "
+                "way to tell it came from this service"
             )
         if self.observability.otel_enabled and not self.observability.otel_endpoint:
             raise ValueError("observability.otel_enabled requires observability.otel_endpoint")

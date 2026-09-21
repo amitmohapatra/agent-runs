@@ -12,6 +12,9 @@ dependencies = [
   "psycopg[binary,pool]>=3.3,<4",
   "alembic>=1.20,<2",
   "structlog>=25.2",
+  # Webhook delivery. Present transitively through the test client, which is how it went
+  # missing from the image while every local test passed.
+  "httpx>=0.28",
   "universal-agent-contracts>=0.1",
 ]
 

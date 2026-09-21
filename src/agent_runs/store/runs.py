@@ -36,6 +36,7 @@ def _to_run(row: RunRow) -> Run:
         attempt=row.attempt,
         deadline=row.deadline,
         idempotency_key=row.idempotency_key,
+        webhook_url=row.webhook_url,
         metadata=row.run_metadata or {},
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -72,6 +73,7 @@ class RunStore:
             input=spec.input,
             deadline=spec.deadline,
             idempotency_key=spec.idempotency_key,
+            webhook_url=spec.webhook_url,
             run_metadata=spec.metadata or None,
         )
         self._session.add(row)

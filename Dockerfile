@@ -27,6 +27,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
 COPY src ./src
+# The schema belongs in the image: the `migrate` service runs `alembic upgrade head` from
+# it, and the API reads the head revision at startup to refuse a database it cannot use.
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"

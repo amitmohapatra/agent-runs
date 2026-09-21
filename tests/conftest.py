@@ -3,15 +3,19 @@ never silently passed against a stand-in that cannot reproduce a race."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
+from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from agent_runs.api.app import create_app
 from agent_runs.config.settings import Credential, DatabaseSettings, ServiceSettings, Settings
+from alembic import command
 
 ADMIN_URL = os.environ.get(
     "RUNS_TEST_ADMIN_URL", "postgresql://memory:memory@localhost:5432/postgres"
@@ -27,17 +31,42 @@ def _pg_ready() -> bool:
 
     try:
         with psycopg.connect(ADMIN_URL, autocommit=True, connect_timeout=2) as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (DB_NAME,)
-            ).fetchone()
-            if not exists:
-                conn.execute(f'CREATE DATABASE "{DB_NAME}"')
+            # Dropped and recreated, not reused. The schema comes from migrations, and a
+            # database left over from an older build carries its tables *and* no alembic
+            # version — so the first migration tries to create a table that is already
+            # there and every test errors on a DuplicateTable that has nothing to do with
+            # the code under test.
+            conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (DB_NAME,),
+            )
+            conn.execute(f'DROP DATABASE IF EXISTS "{DB_NAME}"')
+            conn.execute(f'CREATE DATABASE "{DB_NAME}"')
         return True
     except Exception:
         return False
 
 
 PG = _pg_ready()
+
+
+#: Resolved at import: touching the filesystem inside an async fixture blocks the loop.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+async def _migrate(url: str) -> None:
+    """Bring the test database to head. Runs in a thread: alembic is synchronous."""
+
+    def upgrade() -> None:
+        config = Config(str(ROOT / "alembic.ini"))
+        config.set_main_option("script_location", str(ROOT / "alembic"))
+        os.environ["RUNS__DATABASE__URL"] = url
+        from agent_runs.config.settings import reset_settings_cache
+
+        reset_settings_cache()
+        command.upgrade(config, "head")
+
+    await asyncio.to_thread(upgrade)
 
 
 @pytest.fixture
@@ -56,6 +85,9 @@ async def client() -> AsyncIterator[AsyncClient]:
             }
         ),
     )
+    # The schema comes from migrations now, exactly as it does in production: a fixture
+    # that built tables with create_all would test a schema no deployment ever has.
+    await _migrate(DB_URL)
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         # Each test starts from an empty table: a state-machine test that inherits another

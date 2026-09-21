@@ -31,6 +31,7 @@ class RunRow(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
+    webhook_url: Mapped[str | None] = mapped_column(String(2048))
     run_metadata: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
