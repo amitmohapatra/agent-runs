@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 
-from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from agent_runs.config.settings import get_settings
 from agent_runs.store.tables import Base
+from alembic import context
 
 config = context.config
 target_metadata = Base.metadata

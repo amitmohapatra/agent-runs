@@ -26,8 +26,10 @@ install: ## Sync the dev environment
 	uv sync --all-extras
 
 lint: ## Ruff check and format check
-	uv run ruff check src tests
-	uv run ruff format --check src tests
+	@# alembic/ too: the migrations ship in the image and define the schema the service
+	@# refuses to start without, so they are not a scratch directory.
+	uv run ruff check src tests alembic
+	uv run ruff format --check src tests alembic
 
 migrate: ## Bring the database to the latest schema
 	uv run alembic upgrade head
