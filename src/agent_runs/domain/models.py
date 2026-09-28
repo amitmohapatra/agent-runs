@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from universal_agent_contracts.messages import AgentStatus
+from trellis.contracts.messages import AgentStatus
 
 
 def _now() -> datetime:
