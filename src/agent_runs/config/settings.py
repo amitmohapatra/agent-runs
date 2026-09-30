@@ -6,6 +6,7 @@ decisions are constants in ``constants.py``.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,12 @@ class DatabaseSettings(BaseModel):
     pool_size: int = 10
 
 
+class TickerSettings(BaseModel):
+    #: The file the ticker touches every tick and ``python -m agent_runs.heartbeat`` reads.
+    #: Unset: a per-process file in the temp directory (and no probe).
+    heartbeat_file: Path | None = None
+
+
 class ObservabilitySettings(BaseModel):
     log_level: str = "INFO"
     log_json: bool = True
@@ -47,6 +54,7 @@ class Settings(BaseSettings):
     service: ServiceSettings = ServiceSettings()
     memory: MemorySettings = MemorySettings()
     database: DatabaseSettings = DatabaseSettings()
+    ticker: TickerSettings = TickerSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
 
 

@@ -12,7 +12,7 @@ Every step is bounded per tick and safe to run in several replicas at once: a ro
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
 A tick that fails as a whole (the database is down) counts against a breaker, so an outage
 does not become a tight retry loop. A heartbeat file, touched after every tick, is the
-liveness probe (``python -m agent_runs.heartbeat``).
+liveness probe (``python -m agent_runs.heartbeat``), one file per ticker (see ``heartbeat``).
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class Ticker:
         sessions: Sessions,
         webhooks: WebhookSender,
         *,
-        heartbeat_path: Path = heartbeat.DEFAULT,
+        heartbeat_path: Path,
         interval: float = TICK_SECONDS,
     ) -> None:
         self._sessions = sessions
@@ -184,7 +184,11 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
     try:
-        ticker = Ticker(async_sessionmaker(engine, expire_on_commit=False), webhooks)
+        beat = heartbeat.path_for(settings.ticker.heartbeat_file)
+        log.info("ticker.heartbeat", path=str(beat))
+        ticker = Ticker(
+            async_sessionmaker(engine, expire_on_commit=False), webhooks, heartbeat_path=beat
+        )
         await ticker.run_forever(stop)
     finally:
         await webhooks.aclose()

@@ -77,7 +77,8 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
 (the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
-check (a heartbeat file touched after every tick).
+check (a heartbeat file touched after every tick, `RUNS__TICKER__HEARTBEAT_FILE`, one per
+ticker; unset, each ticker process beats into its own file in the temp directory).
 
 ## Authentication
 

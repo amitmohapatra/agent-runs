@@ -66,7 +66,10 @@ services:
     # Schedules, lapsed leases and overdue interrupts. One is plenty; more are harmless.
     <<: *image
     command: ["agent-runs-ticker"]
-    environment: *env
+    environment:
+      <<: *env
+      # one ticker per container: the probe below reads this file
+      RUNS__TICKER__HEARTBEAT_FILE: /tmp/agent-runs-ticker.heartbeat
     env_file:
       - path: .env
         required: false

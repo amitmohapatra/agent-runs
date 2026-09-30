@@ -56,8 +56,7 @@ SWEEP_BATCH: Final = 100
 #: Consecutive failed ticks (the database, not one schedule) before the ticker backs off.
 BREAKER_THRESHOLD: Final = 5
 BREAKER_COOLDOWN: Final = timedelta(minutes=2)
-#: Touched after every tick; the container probe calls the loop dead past the max age.
-HEARTBEAT_PATH: Final = "/tmp/agent-runs-ticker.heartbeat"  # container-local
+#: The heartbeat file is touched after every tick; the probe calls the loop dead past this.
 HEARTBEAT_MAX_AGE_SECONDS: Final = 60.0
 
 # --------------------------------------------------------------------------- schedules

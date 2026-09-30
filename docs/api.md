@@ -305,4 +305,5 @@ receivers drop repeats by `event_id` and read the run for anything the summary l
 ## Ops
 
 `GET /health/live` · `GET /health/ready` (the database answers). The ticker's probe is
-`python -m agent_runs.heartbeat`.
+`python -m agent_runs.heartbeat`, which reads
+`RUNS__TICKER__HEARTBEAT_FILE` (set per ticker; compose sets it in the ticker container).

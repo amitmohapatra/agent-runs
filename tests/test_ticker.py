@@ -4,6 +4,7 @@ overdue interrupts, straight against the database, safe in several replicas."""
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -172,3 +173,27 @@ async def test_one_tick_requeues_lapsed_leases_and_escalates_with_webhooks(
     assert (report.requeued, report.escalated, report.sent) == (1, 1, 1)
     assert (await client.get(f"/v1/runs/{leased}")).json()["status"] == "QUEUED"
     assert [e["type"] for e in receiver.events()] == ["run.escalated"]
+
+
+def test_each_ticker_process_has_its_own_heartbeat_unless_one_is_configured(tmp_path) -> None:
+    from agent_runs.heartbeat import path_for
+
+    mine = path_for(None)
+    assert str(os.getpid()) in mine.name
+    assert path_for(tmp_path / "beat") == tmp_path / "beat"
+
+
+def test_the_probe_reads_the_configured_file(tmp_path, monkeypatch) -> None:
+    from agent_runs.config.settings import reset_settings_cache
+    from agent_runs.heartbeat import main
+
+    monkeypatch.delenv("RUNS__TICKER__HEARTBEAT_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)  # no .env
+    reset_settings_cache()
+    assert main() == 1  # nothing to probe
+    beat = tmp_path / "beat"
+    beat.write_text(str(time.time()))
+    monkeypatch.setenv("RUNS__TICKER__HEARTBEAT_FILE", str(beat))
+    reset_settings_cache()
+    assert main() == 0
+    reset_settings_cache()
