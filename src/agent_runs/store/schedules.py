@@ -1,5 +1,9 @@
 """Reading and writing schedules.
 
+A schedule's identity is ``(tenant_id, agent_id, on_behalf_of, cadence, input_sha256)``:
+creating one that exists returns it (the upsert every redeploy of a harness relies on), and
+the unique index behind it makes that hold under concurrency. ``name`` is only a label.
+
 One rule runs through all of it: ``next_fire_at`` only ever moves *forward past now*. It is
 the clock of an unattended loop, so a value in the past means "due", and a value further in
 the past means "due for every tick in between", each a different idempotency key and so a
@@ -17,6 +21,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import Select, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError
@@ -31,7 +36,7 @@ from agent_runs.config.constants import (
 )
 from agent_runs.domain.cadence import next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable
-from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate
+from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
 from agent_runs.store.tables import ScheduleRow
 
@@ -53,11 +58,15 @@ def _checked(fields: dict[str, Any]) -> ScheduleSpec:
     return spec.model_copy(update={"cadence": validate_cadence(spec.cadence)})
 
 
+_IDENTITY = ("tenant_id", "agent_id", "on_behalf_of", "cadence", "input_sha256")
+
+
 def _apply(row: ScheduleRow, spec: ScheduleSpec) -> None:
     for name in _SPEC_FIELDS:
         if name != "metadata":
             setattr(row, name, getattr(spec, name))
     row.schedule_metadata = spec.metadata or None
+    row.input_sha256 = input_sha256(spec.input)
 
 
 def _arm(row: ScheduleRow, *, after: datetime) -> None:
@@ -82,9 +91,13 @@ class ScheduleStore:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def create(self, spec: ScheduleSpec, *, created_by: str, now: datetime) -> Schedule:
-        """A schedule armed for its first occurrence after ``now``. ``created_by`` is the
-        credential's principal; the spec refuses the field."""
+    async def upsert(
+        self, spec: ScheduleSpec, *, created_by: str, now: datetime
+    ) -> tuple[Schedule, bool]:
+        """The schedule with this spec's identity: created (armed for its first occurrence
+        after ``now``; ``created_by`` is the credential's principal) or, when it exists,
+        returned as it is. Returns ``(schedule, created)``. ``ON CONFLICT DO NOTHING`` on the
+        identity index makes two concurrent creates one schedule."""
         spec = _checked(spec.model_dump())
         row = ScheduleRow(
             schedule_id=new_id("sch_"),
@@ -95,12 +108,23 @@ class ScheduleStore:
         )
         _apply(row, spec)
         _arm(row, after=now)
-        self._session.add(row)
-        try:
-            await self._session.flush()
-        except IntegrityError as exc:
-            raise DuplicateSchedule(spec.tenant_id, spec.name) from exc
-        return _schedule(row)
+        values = {column.key: getattr(row, column.key) for column in ScheduleRow.__table__.columns}
+        inserted = await self._session.scalar(
+            insert(ScheduleRow)
+            .values(**{k: v for k, v in values.items() if v is not None})
+            .on_conflict_do_nothing(index_elements=list(_IDENTITY))
+            .returning(ScheduleRow)
+        )
+        if inserted is not None:
+            return _schedule(inserted), True
+        existing = await self._session.scalar(
+            select(ScheduleRow).where(
+                *(getattr(ScheduleRow, name) == getattr(row, name) for name in _IDENTITY)
+            )
+        )
+        if existing is None:  # deleted between the insert and the read: vanishingly rare
+            raise DuplicateSchedule(row.schedule_id)
+        return _schedule(existing), False
 
     async def get(self, tenant_id: str, schedule_id: str) -> Schedule:
         return _schedule(await self._row(tenant_id, schedule_id))
@@ -130,7 +154,10 @@ class ScheduleStore:
     ) -> Schedule:
         """Apply the fields sent. The next fire is recomputed when the cadence or zone
         actually *changed* (a client sending the whole representation back must not throw
-        tonight's run away), and looks forward when the schedule is re-enabled."""
+        tonight's run away). ``enabled: false`` pauses; ``enabled: true`` on a paused schedule
+        resumes it: it clears the failure count, last error and backoff of an auto-pause and
+        fires from the next occurrence it can still honour, never the backlog. A change that
+        would give the schedule another schedule's identity is ``DuplicateSchedule``."""
         row = await self._row(tenant_id, schedule_id)
         changes = change.model_dump(exclude_unset=True)
         if "metadata" in changes:
@@ -144,22 +171,16 @@ class ScheduleStore:
             _arm(row, after=now)
         elif re_enabled:
             _rearm(row, at=now)
-        row.updated_at = now
-        return await self._flushed(row)
-
-    async def set_enabled(
-        self, tenant_id: str, schedule_id: str, *, enabled: bool, now: datetime
-    ) -> Schedule:
-        """Pause, or resume: resuming clears the failure count that caused an auto-pause and
-        looks forward instead of replaying the backlog."""
-        row = await self._row(tenant_id, schedule_id)
-        row.enabled = enabled
-        if enabled:
+        if re_enabled:
             row.consecutive_failures = 0
             row.last_error = row.retry_after = None
-            _rearm(row, at=now)
         row.updated_at = now
-        return await self._flushed(row)
+        try:
+            async with self._session.begin_nested():
+                await self._session.flush()
+        except IntegrityError as exc:
+            raise DuplicateSchedule(schedule_id) from exc
+        return _schedule(row)
 
     async def delete(self, tenant_id: str, schedule_id: str) -> None:
         await self._session.delete(await self._row(tenant_id, schedule_id))

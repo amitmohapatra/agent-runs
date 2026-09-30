@@ -9,7 +9,9 @@ as comes from the stored row.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict
@@ -60,8 +62,13 @@ class FireResult(BaseModel):
 
 
 class DuplicateSchedule(Conflict):
-    def __init__(self, tenant_id: str, name: str) -> None:
-        super().__init__(f"tenant {tenant_id} already has a schedule named {name!r}")
+    """An update that would give a schedule the identity another one already has."""
+
+    def __init__(self, schedule_id: str) -> None:
+        super().__init__(
+            f"schedule {schedule_id} would duplicate another schedule of this tenant: the same "
+            "agent_id, on_behalf_of, cadence and input"
+        )
 
 
 class ScheduleNotFiring(Conflict):
@@ -97,3 +104,11 @@ def idempotency_key(schedule_id: str, fire_time: datetime) -> str:
     """One schedule, one instant, one run. UTC first, so one instant spelled in two zones is
     one key."""
     return f"{schedule_id}@{fire_time.astimezone(UTC).isoformat()}"
+
+
+def input_sha256(value: Any) -> str:
+    """Half of a schedule's identity: the SHA-256 (hex) of its input as canonical JSON (keys
+    sorted, no whitespace, UTF-8, non-ASCII kept). Two inputs that are equal as JSON are one
+    input, however their keys were ordered."""
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(canonical.encode()).hexdigest()

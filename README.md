@@ -55,8 +55,9 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
-| `POST/GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | schedules |
-| `POST /v1/schedules/{id}/pause` · `/resume` · `/fire` | stop, restart, fire now |
+| `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
+| `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
+| `POST /v1/schedules/{id}/fire` | fire now |
 
 ## The ticker
 

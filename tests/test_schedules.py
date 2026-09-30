@@ -7,6 +7,7 @@ failing forever with nobody watching, one tenant reaching for another's schedule
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 from tests.conftest import arm, queued_runs, scheduled
@@ -122,7 +123,9 @@ async def test_a_fire_request_cannot_name_an_identity(app, client) -> None:
 
 async def test_a_paused_or_disabled_schedule_does_not_fire(app, client) -> None:
     sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
-    assert (await client.post(f"/v1/schedules/{sid}/pause")).json()["enabled"] is False
+    assert (await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})).json()[
+        "enabled"
+    ] is False
     assert (await client.post(f"/v1/schedules/{sid}/fire")).status_code == 409
     disabled = (await client.post("/v1/schedules", json=scheduled(enabled=False))).json()
     assert (await client.post(f"/v1/schedules/{disabled['schedule_id']}/fire")).status_code == 409
@@ -133,7 +136,7 @@ async def test_a_paused_schedule_is_not_due(app, client, ticker) -> None:
     sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
         "schedule_id"
     ]
-    await client.post(f"/v1/schedules/{sid}/pause")
+    await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})
     assert (await ticker.tick(now=datetime.now(UTC) + timedelta(days=30))).fired == 0
 
 
@@ -141,8 +144,8 @@ async def test_resuming_looks_forward_instead_of_replaying_the_backlog(client) -
     sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
         "schedule_id"
     ]
-    await client.post(f"/v1/schedules/{sid}/pause")
-    resumed = (await client.post(f"/v1/schedules/{sid}/resume")).json()
+    await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})
+    resumed = (await client.patch(f"/v1/schedules/{sid}", json={"enabled": True})).json()
     assert resumed["enabled"] is True
     assert datetime.fromisoformat(resumed["next_fire_at"]) > datetime.now(UTC)
 
@@ -191,7 +194,7 @@ async def test_resuming_clears_the_failure_count_that_caused_the_auto_pause(clie
     broken.fail()
     for attempt in range(1, 4):
         await client.post(f"/v1/schedules/{sid}/fire", json={"at": _instant(attempt)})
-    resumed = (await client.post(f"/v1/schedules/{sid}/resume")).json()
+    resumed = (await client.patch(f"/v1/schedules/{sid}", json={"enabled": True})).json()
     assert (resumed["consecutive_failures"], resumed["last_error"]) == (0, None)
 
 
@@ -371,8 +374,8 @@ async def test_resuming_keeps_an_occurrence_it_can_still_honour(app, client, tic
         "schedule_id"
     ]
     missed = await arm(app, sid, _last_tick())
-    await client.post(f"/v1/schedules/{sid}/pause")
-    resumed = (await client.post(f"/v1/schedules/{sid}/resume")).json()
+    await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})
+    resumed = (await client.patch(f"/v1/schedules/{sid}", json={"enabled": True})).json()
     assert datetime.fromisoformat(resumed["next_fire_at"]) == missed
     assert (await ticker.tick()).fired == 1
 
@@ -382,8 +385,8 @@ async def test_resuming_looks_past_an_occurrence_a_later_one_superseded(app, cli
         "schedule_id"
     ]
     await arm(app, sid, _last_tick() - timedelta(days=30))
-    await client.post(f"/v1/schedules/{sid}/pause")
-    resumed = (await client.post(f"/v1/schedules/{sid}/resume")).json()
+    await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})
+    resumed = (await client.patch(f"/v1/schedules/{sid}", json={"enabled": True})).json()
     assert datetime.fromisoformat(resumed["next_fire_at"]) > datetime.now(UTC)
 
 
@@ -393,18 +396,65 @@ async def test_resuming_looks_past_an_occurrence_a_later_one_superseded(app, cli
 async def test_listing_filters_by_agent_and_by_enabled(client) -> None:
     mine = (await client.post("/v1/schedules", json=scheduled(agent_id="briefing"))).json()
     other = (await client.post("/v1/schedules", json=scheduled(agent_id="billing"))).json()
-    await client.post(f"/v1/schedules/{other['schedule_id']}/pause")
+    await client.patch(f"/v1/schedules/{other['schedule_id']}", json={"enabled": False})
     briefing = (await client.get("/v1/schedules", params={"agent_id": "briefing"})).json()
     assert [s["schedule_id"] for s in briefing] == [mine["schedule_id"]]
     paused = (await client.get("/v1/schedules", params={"enabled": False})).json()
     assert [s["schedule_id"] for s in paused] == [other["schedule_id"]]
 
 
-async def test_a_retried_create_does_not_leave_two_schedules_firing(client) -> None:
-    body = scheduled(name="nightly digest")
-    assert (await client.post("/v1/schedules", json=body)).status_code == 201
-    assert (await client.post("/v1/schedules", json=body)).status_code == 409
+async def test_a_repeated_create_returns_the_schedule_it_made(client) -> None:
+    """The create is an upsert on (agent_id, on_behalf_of, cadence, input): a redeploy gets
+    200 and the existing schedule, unchanged, never a second one firing."""
+    body = scheduled(name="nightly digest", input={"a": 1, "b": [1, 2]})
+    first = await client.post("/v1/schedules", json=body)
+    assert first.status_code == 201
+    again = await client.post(
+        "/v1/schedules", json={**body, "name": "renamed", "input": {"b": [1, 2], "a": 1}}
+    )
+    assert again.status_code == 200
+    assert again.json()["schedule_id"] == first.json()["schedule_id"]
+    assert again.json()["name"] == "nightly digest"
     assert len((await client.get("/v1/schedules")).json()) == 1
+
+
+async def test_concurrent_creates_of_one_schedule_make_one(client) -> None:
+    body = scheduled()
+    answers = await asyncio.gather(*(client.post("/v1/schedules", json=body) for _ in range(5)))
+    assert sorted(r.status_code for r in answers) == [200, 200, 200, 200, 201]
+    assert len({r.json()["schedule_id"] for r in answers}) == 1
+
+
+async def test_any_part_of_the_identity_makes_another_schedule(client) -> None:
+    body = scheduled(input={"topic": "inbox"})
+    base = (await client.post("/v1/schedules", json=body)).json()["schedule_id"]
+    for change in (
+        {"input": {"topic": "calendar"}},
+        {"cadence": "hourly"},
+        {"agent_id": "digest"},
+        {"on_behalf_of": "user_bob"},
+    ):
+        other = await client.post("/v1/schedules", json={**body, **change})
+        assert other.status_code == 201, change
+        assert other.json()["schedule_id"] != base
+    assert (await client.post("/v1/schedules", json=scheduled(name=body["name"]))).status_code == (
+        201
+    )  # a name is a label, not an identity
+
+
+async def test_an_update_onto_another_schedules_identity_is_refused(client) -> None:
+    a = (await client.post("/v1/schedules", json=scheduled(input={"x": 1}))).json()
+    b = (await client.post("/v1/schedules", json=scheduled(input={"x": 2}))).json()
+    clash = await client.patch(f"/v1/schedules/{b['schedule_id']}", json={"input": {"x": 1}})
+    assert clash.status_code == 409
+    assert (await client.get(f"/v1/schedules/{b['schedule_id']}")).json()["input"] == {"x": 2}
+    assert a["schedule_id"] != b["schedule_id"]
+
+
+async def test_there_are_no_pause_or_resume_routes(client) -> None:
+    sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
+    for verb in ("pause", "resume"):
+        assert (await client.post(f"/v1/schedules/{sid}/{verb}")).status_code in {404, 405}
 
 
 async def test_two_tenants_may_use_the_same_schedule_name(client, other_tenant) -> None:
@@ -470,7 +520,7 @@ async def test_a_key_cannot_repoint_a_schedule_that_runs_as_someone_else(
     repoint = {"agent_id": "shell", "input": {"command": "exfiltrate"}}
     assert (await narrow.patch(f"/v1/schedules/{sid}", json=repoint)).status_code == 403
     assert (await narrow.post(f"/v1/schedules/{sid}/fire")).status_code == 403
-    assert (await narrow.post(f"/v1/schedules/{sid}/pause")).status_code == 403
+    assert (await narrow.patch(f"/v1/schedules/{sid}", json={"enabled": False})).status_code == 403
     assert (await narrow.delete(f"/v1/schedules/{sid}")).status_code == 403
     assert await queued_runs(app) == []
     untouched = (await client.get(f"/v1/schedules/{sid}")).json()
@@ -483,4 +533,6 @@ async def test_a_key_cannot_repoint_a_schedule_that_runs_as_someone_else(
 
 async def test_a_platform_key_administers_a_tenants_schedules(client, platform) -> None:
     sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
-    assert (await platform.post(f"/v1/schedules/{sid}/pause")).status_code == 200
+    assert (
+        await platform.patch(f"/v1/schedules/{sid}", json={"enabled": False})
+    ).status_code == 200

@@ -204,11 +204,14 @@ _names = count(1)
 
 
 def scheduled(**over: Any) -> dict[str, Any]:
-    """A create body; the name is unique per call because (tenant, name) is unique."""
+    """A create body. Each call is a different schedule (its input differs), because a
+    create with the identity of an existing schedule returns that one."""
+    n = next(_names)
     return {
         "tenant_id": "acme",
         "agent_id": "briefing",
-        "name": f"schedule-{next(_names)}",
+        "name": f"schedule-{n}",
+        "input": {"n": n},
         "cadence": "daily",
         "timezone": "UTC",
         "on_behalf_of": "user_ada",

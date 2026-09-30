@@ -27,13 +27,17 @@ _CREATED = 201
 _NO_CONTENT = 204
 
 
-@router.post("", status_code=_CREATED)
-async def create(spec: ScheduleSpec, db: Session, who: Who) -> Schedule:
-    """A schedule armed for its next occurrence. ``created_by`` is the key's principal."""
+@router.post("", status_code=_CREATED, responses={200: {"model": Schedule}})
+async def create(spec: ScheduleSpec, db: Session, who: Who, response: Response) -> Schedule:
+    """An upsert on the schedule's identity ``(agent_id, on_behalf_of, cadence, input)`` in
+    this tenant: ``201`` with a new schedule armed for its next occurrence (``created_by`` is
+    the key's principal), or ``200`` with the existing one, unchanged."""
     who.require_tenant(spec.tenant_id)
     who.require_may_act_for(spec.on_behalf_of)
-    schedule = await ScheduleStore(db).create(spec, created_by=who.principal, now=now())
+    schedule, created = await ScheduleStore(db).upsert(spec, created_by=who.principal, now=now())
     await db.commit()
+    if not created:
+        response.status_code = 200
     return schedule
 
 
@@ -58,7 +62,8 @@ async def get(schedule_id: str, db: Session, who: Who) -> Schedule:
 
 @router.patch("/{schedule_id}")
 async def update(schedule_id: str, change: ScheduleUpdate, db: Session, who: Who) -> Schedule:
-    """Change the fields sent; ``on_behalf_of`` is not one of them."""
+    """Change the fields sent; ``on_behalf_of`` is not one of them. ``{"enabled": false}``
+    pauses, ``{"enabled": true}`` resumes (clearing an auto-pause)."""
     await _administered(schedule_id, db, who)
     schedule = await ScheduleStore(db).update(who.tenant_id, schedule_id, change, now=now())
     await db.commit()
@@ -71,17 +76,6 @@ async def delete(schedule_id: str, db: Session, who: Who) -> Response:
     await ScheduleStore(db).delete(who.tenant_id, schedule_id)
     await db.commit()
     return Response(status_code=_NO_CONTENT)
-
-
-@router.post("/{schedule_id}/pause")
-async def pause(schedule_id: str, db: Session, who: Who) -> Schedule:
-    return await _set_enabled(schedule_id, db, who, enabled=False)
-
-
-@router.post("/{schedule_id}/resume")
-async def resume(schedule_id: str, db: Session, who: Who) -> Schedule:
-    """Fire again from the next occurrence it can still honour; clears an auto-pause."""
-    return await _set_enabled(schedule_id, db, who, enabled=True)
 
 
 @router.post("/{schedule_id}/fire")
@@ -106,12 +100,3 @@ async def _administered(schedule_id: str, db: Session, who: Who) -> None:
     """404 before 403: "exists but is not yours" is itself an answer about someone else."""
     schedule = await ScheduleStore(db).get(who.tenant_id, schedule_id)
     who.require_may_act_for(schedule.on_behalf_of)
-
-
-async def _set_enabled(schedule_id: str, db: Session, who: Who, *, enabled: bool) -> Schedule:
-    await _administered(schedule_id, db, who)
-    schedule = await ScheduleStore(db).set_enabled(
-        who.tenant_id, schedule_id, enabled=enabled, now=now()
-    )
-    await db.commit()
-    return schedule

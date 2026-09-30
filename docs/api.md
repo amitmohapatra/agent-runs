@@ -11,7 +11,7 @@ Errors answer `{"detail": ...}`.
 | `401` | unknown or missing `X-Api-Key` |
 | `403` | the body or header names another tenant, or `on_behalf_of` the key may not act as |
 | `404` | no such run or schedule in this tenant |
-| `409` | the record is not in a state that allows it: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken name or run id |
+| `409` | the record is not in a state that allows it: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
 | `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON |
 | `422` | the body is invalid (including the contracts' own validators) |
 | `503` | a schedule fire could not queue its run (recorded on the schedule) |
@@ -151,33 +151,42 @@ A schedule fires runs as `on_behalf_of`, the person who set it, while nobody is 
 Creating one needs a key that may act as that principal; editing, pausing, resuming, firing
 or deleting one needs the same of the schedule's stored `on_behalf_of` (`404` before `403`).
 
-### `POST /v1/schedules` → `201 Schedule`
+### `POST /v1/schedules` → `201 Schedule` (`200` for an existing one)
 
 Body: a `ScheduleSpec` (`created_by` is refused; it is the key's principal):
 
 ```json
 {"tenant_id": "acme", "agent_id": "briefing", "name": "morning briefing",
  "cadence": "0 8 * * 1-5", "timezone": "Europe/Berlin", "on_behalf_of": "user_ada",
- "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true,
- "webhook_url": null, "metadata": {}}
+ "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true, "metadata": {}}
 ```
 
 `cadence` is `hourly | daily | weekly | weekdays | manual` (local midnight; weekly on Monday;
-`manual` never fires on its own) or a cron expression firing at most once an hour. The name
-is unique per tenant (`409`).
+`manual` never fires on its own) or a cron expression firing at most once an hour.
+
+**An upsert.** A schedule's identity is `(tenant_id, agent_id, on_behalf_of, cadence,
+input_sha256)`, where `cadence` is the normalised expression and `input_sha256` is the
+lowercase hex SHA-256 of the UTF-8 bytes of the input as canonical JSON (Python's
+`json.dumps(input, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`; no input is
+`null`). A create whose identity is new answers `201` with the new schedule, armed for its
+next occurrence; one whose identity exists answers `200` with the existing schedule,
+**unchanged** (its name, timezone, metadata and enabled flag stay as they are; change them
+with `PATCH`). Concurrent creates of one identity make one schedule. `name` is a label and
+need not be unique. This is the one idempotency mechanism: a client repeats the create and
+needs no name, no `409` handling and no follow-up `PATCH`.
 
 ### `GET /v1/schedules?enabled=&agent_id=&limit=` · `GET /v1/schedules/{id}` · `DELETE /v1/schedules/{id}` (`204`)
 
 ### `PATCH /v1/schedules/{id}` → `Schedule`
 
-Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, webhook_url,
-metadata` (merged). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the cadence
-or zone re-arms the next fire; re-enabling keeps an occurrence that is merely late.
+Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, metadata`
+(`metadata` is merged). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
+cadence or zone re-arms the next fire. A change that would give the schedule the identity of
+another one is `409`.
 
-### `POST /v1/schedules/{id}/pause` · `/resume` → `Schedule`
-
-Resume clears an auto-pause (failure count, last error, backoff) and fires from the next
-occurrence it can still honour, never the backlog.
+Pausing and resuming are `PATCH`es: `{"enabled": false}` pauses; `{"enabled": true}` on a
+paused schedule resumes it, clearing an auto-pause (failure count, last error, backoff) and
+firing from the next occurrence it can still honour, never the backlog.
 
 ### `POST /v1/schedules/{id}/fire` → `FireResult`
 

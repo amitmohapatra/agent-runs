@@ -96,6 +96,8 @@ class ScheduleRow(Base):
     cadence: Mapped[str] = mapped_column(String(128))
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
     input: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    #: SHA-256 of the input as canonical JSON: part of the schedule's identity
+    input_sha256: Mapped[str] = mapped_column(String(64))
     #: NOT NULL: a schedule with no identity is a run nobody authorised
     on_behalf_of: Mapped[str] = mapped_column(String(128))
     workspace_id: Mapped[str | None] = mapped_column(String(128))
@@ -114,7 +116,15 @@ class ScheduleRow(Base):
     updated_at: Mapped[datetime] = _created()
 
     __table_args__ = (
-        UniqueConstraint("tenant_id", "name", name="uq_schedules_tenant_name"),
+        # the identity a create upserts on
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "on_behalf_of",
+            "cadence",
+            "input_sha256",
+            name="uq_schedules_identity",
+        ),
         Index("ix_schedules_tenant_created", "tenant_id", "created_at"),
         # the ticker: enabled schedules by next fire
         Index("ix_schedules_due", "next_fire_at", postgresql_where=text("enabled")),
