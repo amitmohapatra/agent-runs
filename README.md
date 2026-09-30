@@ -1,97 +1,120 @@
 # agent-runs
 
-Durable agent runs: start, pause for a human, resume, cancel, replay.
+Durable agent runs, the worker queue, the human inbox, and the schedules that start runs.
+One service (it absorbed agent-schedules in 0.2.0): an API process and a ticker process over
+one PostgreSQL database.
 
-A run is the unit of work a user can leave and come back to. The harness executes; this
-service remembers — so a run that pauses for an approval at 2am is still there at 9am, and a
-crashed worker does not lose the answer a human already gave.
+This service never executes an agent. A harness does, either in its own process (it records
+the run here as `RUNNING`) or as a `trellis worker` that claims `QUEUED` runs from here under
+a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
+at 9 a.m., a crashed worker's run goes back on the queue, and a schedule fires on behalf of a
+person who is not present.
+
+Every record is a [trellis-contracts](../agent-contracts) type: a run is a `RunRecord`
+started from a `RunStart`, paused with an `Interrupt`, resumed with an
+`InterruptResolution`; a schedule is a `Schedule` created from a `ScheduleSpec`.
 
 ## The state machine
 
-The states are the contract's own `trellis.contracts.AgentStatus`, not a private vocabulary — a run
-the harness calls PAUSED and this service called SUSPENDED would be two names for one fact, and they
-would drift. `RUNNING` is the one state this service adds, because the contract describes how a turn
-*ended*, and a turn in flight has not ended.
+The contracts' `RunStatus.can_become` is the only transition check; anything else is a
+`409`.
 
 ```mermaid
 stateDiagram-v2
+  [*] --> QUEUED: POST /v1/runs {queue: true} · a schedule fires
   [*] --> RUNNING: POST /v1/runs
-  RUNNING --> PAUSED: transition(PAUSED, awaiting=…)
-  PAUSED --> RUNNING: resume(answer)
-  PAUSED --> CANCELLED
-  PAUSED --> TIMEOUT
+  QUEUED --> RUNNING: claim (a worker, under a lease)
+  RUNNING --> QUEUED: lease lapsed (ticker, attempt + 1)
+  RUNNING --> PAUSED: pause (Interrupt)
+  PAUSED --> RUNNING: resume (in-process run, attempt + 1)
+  PAUSED --> QUEUED: resume (queued run, attempt + 1)
+  PAUSED --> PAUSED: deadline passed, escalate_to (ticker)
+  PAUSED --> TIMEOUT: deadline passed, nobody to escalate to (ticker)
+  PAUSED --> CANCELLED: resume CANCEL · finish
+  QUEUED --> CANCELLED: finish
   RUNNING --> SUCCESS
   RUNNING --> PARTIAL
-  RUNNING --> ERROR
+  RUNNING --> ERROR: finish · lease lapsed MAX_ATTEMPTS times
   RUNNING --> TIMEOUT
   RUNNING --> CANCELLED
   RUNNING --> REJECTED
 ```
 
-`PAUSED` is the interesting state: it carries the question that was asked and the schema of the
-answer expected, so a UI can render an approval without knowing anything about the agent that
-raised it. A paused run cannot jump straight to a success — something has to actually run to produce
-a result — and any transition not drawn above is a `409`, which is what keeps "why did this run
-finish twice?" answerable.
+## The API
 
-## The wire the harness uses
+All routes need `X-Api-Key`. [docs/api.md](docs/api.md) has every route, body and status
+code, and the exact claim, heartbeat and resume semantics a worker implements.
 
-`trellis-harness`'s `RunStoreClient` — the contracts `RunStore` port — speaks exactly these routes.
-Every call carries `X-Api-Key` and `X-Tenant-Id`; the credential decides the tenant, and a header
-naming a different one is a `403`, not a read.
+| Route | What it does |
+|---|---|
+| `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
+| `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
+| `POST /v1/runs/{id}/heartbeat` | extend the lease; `409` = lease lost, stop |
+| `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation) |
+| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
+| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
+| `GET /v1/runs/{id}` · `GET /v1/runs/{id}/lineage` | one run · it and its ancestors |
+| `GET /v1/runs?status=PAUSED&assignee=…` | the inbox of a person or role |
+| `POST/GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | schedules |
+| `POST /v1/schedules/{id}/pause` · `/resume` · `/fire` | stop, restart, fire now |
 
-```mermaid
-sequenceDiagram
-  participant H as Harness (RunRecorder → RunStoreClient)
-  participant S as agent-runs
-  participant U as A UI / an operator
-  H->>S: POST /v1/runs {tenant_id, agent_id, run_id, parent_run_id, thread_id,<br/>user_id, on_behalf_of, idempotency_key = run_id, webhook_url?, metadata?}
-  S-->>H: 201 Run (or the existing run, for a repeated idempotency key)
-  H->>S: POST /v1/runs/{id}/transition {status: "PAUSED", awaiting: Interrupt}
-  S-->>U: webhook, when the run named one at start
-  U->>S: GET /v1/runs?status=PAUSED&limit=… — the human inbox
-  U->>H: the person answers
-  H->>S: POST /v1/runs/{id}/resume {answer: InterruptResolution}
-  S->>S: back to RUNNING, the answer on the record
-  H->>S: POST /v1/runs/{id}/transition {status: SUCCESS|PARTIAL|ERROR|TIMEOUT|CANCELLED|REJECTED, output?, error?}
-  U->>S: GET /v1/runs/{id} · GET /v1/runs/{id}/lineage
-```
+## The ticker
 
-| Route | Used for | Worth knowing |
-|---|---|---|
-| `POST /v1/runs` | open a run | the harness sends its derived `run_id` as the `idempotency_key`, so a retried turn reopens nothing |
-| `POST /v1/runs/{id}/transition` | every state change, the pause included | `awaiting` carries the contracts `Interrupt`; an illegal or repeated transition is `409`, which the harness treats as *the record protecting itself*, not as a failure |
-| `POST /v1/runs/{id}/resume` | a human's reply | the answer is in the **body** (`{"answer": …}`), never a query parameter — an answer can be an object, and a `200` that silently dropped it is the bug this shape fixes |
-| `GET /v1/runs/{id}` | one record | |
-| `GET /v1/runs?status=PAUSED` | the inbox of runs waiting on a person | also filters on `agent_id`, `thread_id`, `parent_run_id`; `limit` 1–500 |
-| `GET /v1/runs/{id}/lineage` | the run and its ancestors, nearest first | how a nested agent run is traced back to the turn that started it |
+`agent-runs-ticker` is one loop (every `TICK_SECONDS`), straight against the database:
 
-Recording is **best-effort on the harness side**: this service is a system of record, not a
-dependency of the turn, so a failed write is logged and the turn continues (`required=True` inverts
-that where an unrecorded run is worse than a failed one). Ordering is *not* best-effort — the
-harness drains its record queue in order, so `started` never arrives after `finished`.
+1. **Schedules.** Each due schedule is claimed with `FOR UPDATE SKIP LOCKED` and fired: its
+   run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
+   fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
+   (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
+2. **Leases.** A `RUNNING` run whose lease lapsed goes back to `QUEUED` as the next attempt,
+   or ends in `ERROR` after `MAX_ATTEMPTS`.
+3. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
+   (once) or ends in `TIMEOUT`, with a webhook either way.
 
-A deployment that runs Temporal instead puts its runs there behind the same port
-(`pip install "trellis-harness[temporal]"`, `runs.engine: temporal`); nothing in an agent changes.
+Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
+(the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
+check (a heartbeat file touched after every tick).
 
-## Guarantees
+## Authentication
 
-- **Idempotent starts.** A start is keyed per tenant; replaying the same key returns the
-  existing run rather than creating a second one.
-- **One writer at a time.** State transitions take `SELECT … FOR UPDATE` on the run row, so
-  two workers racing to finish the same run cannot interleave.
-- **Tenant-bound credentials.** An API key is bound to the tenant it was issued for;
-  presenting a valid key for someone else's tenant is a 403, not a read.
+One scheme. `X-Api-Key` is the caller; its credential (in `RUNS__SERVICE__API_KEYS`) names
+the tenant it speaks for, the principal recorded as `created_by`, and the principals it may
+put in `on_behalf_of`. A platform key has no tenant of its own and names the tenant it acts
+for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with itself
+(`403` otherwise).
+
+## Webhooks
+
+A run started (or scheduled) with a `webhook_url` is announced when it pauses
+(`run.paused`), is escalated (`run.escalated`) or ends (`run.finished`). The envelope and the
+signature are the Memory Service's: `X-Trellis-Signature: t=<unix seconds>,v1=<hex
+hmac-sha256 of "<t>.<body>">`, with `X-Trellis-Event` and `X-Trellis-Delivery`, so one
+receiver verifies both with `trellis.memory.webhooks.verify_signature`. Deliveries are
+retried with the service's backoff, off the request path, at least once; `event_id` is
+stable per event, so a receiver drops repeats.
 
 ## Run it
 
-```bash
-uv sync
-uv run uvicorn agent_runs.api.app:app --port 8095
-```
-
-## Tests
+Needs PostgreSQL and a checkout of `agent-contracts` next to this one (a path dependency).
 
 ```bash
-uv run pytest
+make install                 # uv sync, trellis-contracts from ../agent-contracts
+make migrate                 # alembic upgrade head (RUNS__DATABASE__URL)
+uv run agent-runs            # the API on RUNS__SERVICE__PORT
+uv run agent-runs-ticker     # the ticker
+make up                      # or all of it in docker compose: postgres, migrate, api, ticker
 ```
+
+Configuration is `RUNS__*` environment variables, each documented in
+[.env.example](.env.example); every other number is a named constant in
+`src/agent_runs/config/constants.py`.
+
+## Develop
+
+```bash
+make lint typecheck test
+```
+
+The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
+and recreated per run) and skips with a reason when there is none. Migrations live in
+`alembic/versions`; a test checks they build exactly the schema the code maps.

@@ -9,7 +9,7 @@ Every step is bounded per tick and safe to run in several replicas at once: a ro
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
 A tick that fails as a whole (the database is down) counts against a breaker, so an outage
 does not become a tight retry loop. A heartbeat file, touched after every tick, is the
-liveness probe (``agent-runs-ticker --probe``).
+liveness probe (``python -m agent_runs.heartbeat``).
 """
 
 from __future__ import annotations
@@ -17,8 +17,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,11 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from trellis.contracts.ids import now as clock
 from trellis.contracts.runs import RunStatus
 
+from agent_runs import heartbeat
 from agent_runs.config.constants import (
     BREAKER_COOLDOWN,
     BREAKER_THRESHOLD,
-    HEARTBEAT_MAX_AGE_SECONDS,
-    HEARTBEAT_PATH,
     SWEEP_BATCH,
     TICK_SECONDS,
 )
@@ -49,7 +46,7 @@ from agent_runs.webhooks import WebhookEvent, WebhookSender
 
 log = structlog.get_logger(__name__)
 
-Sessions = Callable[[], AsyncSession] | async_sessionmaker[AsyncSession]
+Sessions = Callable[[], AsyncSession]
 
 
 @dataclass(frozen=True)
@@ -65,12 +62,12 @@ class Ticker:
         sessions: Sessions,
         webhooks: WebhookSender,
         *,
-        heartbeat: Path = Path(HEARTBEAT_PATH),
+        heartbeat_path: Path = heartbeat.DEFAULT,
         interval: float = TICK_SECONDS,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
-        self._heartbeat = heartbeat
+        self._heartbeat = heartbeat_path
         self._interval = interval
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
@@ -130,9 +127,10 @@ class Ticker:
         return len(moved)
 
     def beat(self) -> None:
-        """Record that the loop came round. Never raises."""
+        """Record that the loop came round. Never raises: a full disk on the liveness file
+        must not stop work that is still going through."""
         try:
-            self._heartbeat.write_text(str(time.time()))
+            heartbeat.beat(self._heartbeat)
         except OSError as exc:
             log.warning("ticker.heartbeat_failed", error=str(exc))
 
@@ -148,15 +146,6 @@ class Ticker:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=self._interval)
         log.info("ticker.stopped")
-
-
-def alive(heartbeat: Path = Path(HEARTBEAT_PATH)) -> bool:
-    """Whether the loop came round recently enough (the container healthcheck)."""
-    try:
-        beat = float(heartbeat.read_text())
-    except (OSError, ValueError):
-        return False
-    return time.time() - beat <= HEARTBEAT_MAX_AGE_SECONDS
 
 
 async def run() -> None:
@@ -181,10 +170,7 @@ async def run() -> None:
 
 
 def main() -> None:
-    """``agent-runs-ticker`` runs the loop; ``agent-runs-ticker --probe`` exits 0 while it
-    is turning."""
-    if "--probe" in sys.argv[1:]:
-        raise SystemExit(0 if alive() else 1)
+    """``agent-runs-ticker``."""
     asyncio.run(run())
 
 

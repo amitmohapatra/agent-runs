@@ -1,9 +1,19 @@
-# The service and the one dependency it has. `make up` builds and starts both.
-#
-# Postgres is declared here so `docker compose up` is genuinely all it takes; point
-# RUNS__DATABASE__URL at your own database and remove it when you have one.
+# The whole service: its database, the one-shot migration, the API and the ticker.
+# `make up` builds and starts it. Point RUNS__DATABASE__URL at your own database and drop the
+# postgres service when you have one.
 
 name: agent-runs
+
+x-image: &image
+  build:
+    context: .
+    # trellis-contracts, a path dependency on the sibling checkout (see the Dockerfile)
+    additional_contexts:
+      contracts: ../agent-contracts
+  image: agent-runs:dev
+
+x-env: &env
+  RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
 
 services:
   postgres:
@@ -17,53 +27,56 @@ services:
     volumes:
       - runs-db:/var/lib/postgresql/data
     healthcheck:
-      # The API creates its table at startup, so it must not start before the database
-      # answers — otherwise the first boot of a clean stack fails and restarts its way in.
       test: ["CMD-SHELL", "pg_isready -U memory -d agent_runs"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   migrate:
-    # One shot, and the API waits for it to succeed. Migrating from inside the API instead
-    # would mean two replicas racing to apply the same migration on every deploy.
-    build: .
+    # One shot that the API and the ticker wait for: migrating from inside a process would
+    # have replicas racing to apply the same revision.
+    <<: *image
     command: ["alembic", "upgrade", "head"]
-    environment:
-      RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
-    env_file:
-      - path: .env
-        required: false
+    environment: *env
     depends_on:
       postgres:
         condition: service_healthy
     restart: "no"
 
   api:
-    build: .
+    <<: *image
     environment:
-      RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
+      <<: *env
       RUNS__SERVICE__PORT: "8090"
-      RUNS__SERVICE__ENVIRONMENT: dev
-      RUNS__OBSERVABILITY__LOG_JSON: "true"
-      RUNS__WEBHOOKS__SIGNING_SECRET: ${RUNS_WEBHOOK_SECRET:-}
     env_file:
-      # Optional: anything here overrides the defaults above. Never committed.
       - path: .env
         required: false
     extra_hosts:
-      # A receiver may well be on the host during development.
       - "host.docker.internal:host-gateway"
     ports:
-      # The published port is a property of the machine, not of the service: anything else
-      # may already hold 8090 there. Override with RUNS_PORT in .env — on the developer
-      # machine this was written on, a Bifrost process holds 127.0.0.1:8090 while Docker
-      # holds *:8090 on IPv6, so the host and a container reached *different services*
-      # through the same URL.
       - "${RUNS_PORT:-8090}:8090"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ticker:
+    # Schedules, lapsed leases and overdue interrupts. One is plenty; more are harmless.
+    <<: *image
+    command: ["agent-runs-ticker"]
+    environment: *env
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-m", "agent_runs.heartbeat"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    depends_on:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped

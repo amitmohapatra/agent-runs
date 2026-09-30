@@ -211,7 +211,7 @@ def scheduled(**over: Any) -> dict[str, Any]:
 @pytest.fixture
 def ticker(app: Any, tmp_path: Any) -> Ticker:
     """The real ticker over the app's database and webhook sender."""
-    return Ticker(app.state.sessions, app.state.webhooks, heartbeat=tmp_path / "beat")
+    return Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "beat")
 
 
 async def queued_runs(app: Any) -> list[dict[str, Any]]:

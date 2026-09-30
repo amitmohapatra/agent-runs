@@ -11,8 +11,9 @@ from pathlib import Path
 from sqlalchemy.exc import OperationalError
 
 from agent_runs.config.constants import BREAKER_COOLDOWN, BREAKER_THRESHOLD
+from agent_runs.heartbeat import alive
 from agent_runs.retry import Breaker, backoff
-from agent_runs.ticker import Ticker, alive
+from agent_runs.ticker import Ticker
 from tests.conftest import Receiver, arm, at, interrupt, queued_runs, scheduled, sender, started
 
 NOW = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
@@ -66,7 +67,7 @@ class DeadDatabase:
 
 def _dead_ticker(tmp_path: Path, **kwargs) -> tuple[Ticker, DeadDatabase]:
     dead = DeadDatabase()
-    ticker = Ticker(dead, sender(Receiver()), heartbeat=tmp_path / "beat", **kwargs)  # pyright: ignore[reportArgumentType]
+    ticker = Ticker(dead, sender(Receiver()), heartbeat_path=tmp_path / "beat", **kwargs)  # pyright: ignore[reportArgumentType]
     return ticker, dead
 
 
@@ -131,8 +132,8 @@ async def test_two_tickers_on_one_tick_queue_one_run(app, client, tmp_path) -> N
         "schedule_id"
     ]
     await arm(app, sid, datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5))
-    one = Ticker(app.state.sessions, app.state.webhooks, heartbeat=tmp_path / "a")
-    two = Ticker(app.state.sessions, app.state.webhooks, heartbeat=tmp_path / "b")
+    one = Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "a")
+    two = Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "b")
     reports = await asyncio.gather(one.tick(), two.tick())
     assert sum(r.fired for r in reports) == 1
     assert len(await queued_runs(app)) == 1
