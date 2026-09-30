@@ -225,13 +225,29 @@ async def test_an_ending_that_is_not_one_or_a_success_with_an_error_is_refused(c
 # ------------------------------------------------------------------ reads
 
 
-async def test_lineage_returns_the_whole_ancestor_chain(client) -> None:
-    a = (await client.post("/v1/runs", json=started(agent_id="planner"))).json()
-    b = (await client.post("/v1/runs", json=started(parent_run_id=a["run_id"]))).json()
-    c = (await client.post("/v1/runs", json=started(parent_run_id=b["run_id"]))).json()
-    chain = (await client.get(f"/v1/runs/{c['run_id']}/lineage")).json()
-    assert [r["run_id"] for r in chain] == [c["run_id"], b["run_id"], a["run_id"]]
-    assert (await client.get("/v1/runs/run_nope/lineage")).status_code == 404
+async def test_the_listing_is_summaries_and_the_record_is_one_get_away(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = pause(run["run_id"], assignee="user:u1")
+    assert (await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)).status_code == 200
+    [summary] = (await client.get("/v1/runs")).json()
+    assert set(summary) == {
+        "run_id",
+        "agent_id",
+        "status",
+        "awaiting",
+        "assignee",
+        "deadline",
+        "updated_at",
+    }
+    assert summary["status"] == "PAUSED" and summary["assignee"] == "user:u1"
+    assert summary["awaiting"]["question"] == "Approve?"
+    full = (await client.get(f"/v1/runs/{run['run_id']}")).json()
+    assert full["input"] is None and "checkpoint" in full
+
+
+async def test_there_is_no_lineage_route(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    assert (await client.get(f"/v1/runs/{run['run_id']}/lineage")).status_code in {404, 405}
 
 
 async def test_children_are_listed_by_parent(client) -> None:

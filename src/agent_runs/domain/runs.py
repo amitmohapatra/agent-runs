@@ -101,6 +101,24 @@ class Lease(BaseModel):
     expires_at: AwareDatetime
 
 
+class RunSummary(BaseModel):
+    """A run as a listing shows it: enough to tell runs apart and to work an inbox. The
+    question a paused run asks is ``awaiting``; ``assignee`` is whose inbox it is in;
+    ``deadline`` is the run's own deadline (``RunStart.deadline``), not the interrupt's
+    (that one is ``awaiting.deadline``). Input, output, error and the checkpoint are only on
+    the full record, ``GET /v1/runs/{run_id}``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    agent_id: str
+    status: RunStatus
+    awaiting: Interrupt | None = None
+    assignee: str | None = None
+    deadline: AwareDatetime | None = None
+    updated_at: AwareDatetime
+
+
 class Claimed(BaseModel):
     """What a claim hands a worker: the run (now ``RUNNING``) and its lease."""
 

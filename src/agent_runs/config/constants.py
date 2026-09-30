@@ -20,9 +20,6 @@ HEADER_DELIVERY: Final = "X-Trellis-Delivery"
 #: A page of runs or schedules.
 DEFAULT_PAGE: Final = 50
 MAX_PAGE: Final = 500
-#: How many ancestors a lineage walks before it stops: a cycle cannot exist (a parent is
-#: written before its child), but a bound keeps the one recursive query honest.
-MAX_LINEAGE: Final = 100
 
 #: The largest executor checkpoint a pause may carry, serialized as compact JSON. A resume
 #: journal and a framework's resume state fit well inside it; anything bigger belongs in an

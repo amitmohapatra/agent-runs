@@ -130,11 +130,20 @@ is `409`. Announced as `run.finished`.
 
 ### Reads
 
-- `GET /v1/runs/{id}` → `RunRecord`
-- `GET /v1/runs/{id}/lineage` → `[RunRecord]`, the run then its ancestors, nearest first
+- `GET /v1/runs/{id}` → `RunRecord`, the full record (input, output, error, checkpoint).
 - `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&limit=` →
-  `[RunRecord]`, newest first, `limit` 1–500 (default 50). The inbox is
+  `[RunSummary]`, newest first, `limit` 1–500 (default 50). The inbox is
   `status=PAUSED&assignee=role:procurement`.
+
+```json
+[{"run_id": "run_…", "agent_id": "triage", "status": "PAUSED",
+  "awaiting": {…Interrupt…}, "assignee": "role:procurement",
+  "deadline": null, "updated_at": "2026-09-30T08:00:00Z"}]
+```
+
+`awaiting` is the interrupt a paused run waits on (`null` otherwise; its own `deadline` is
+when the answer is due), `assignee` whose inbox it is in, `deadline` the run's own deadline
+(`RunStart.deadline`). Nothing else is in a summary; read the run for the rest.
 
 ## Schedules
 

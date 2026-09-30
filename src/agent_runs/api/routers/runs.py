@@ -20,6 +20,7 @@ from agent_runs.domain.runs import (
     RunCreate,
     RunFinish,
     RunPause,
+    RunSummary,
 )
 from agent_runs.store.runs import RunStore
 
@@ -105,12 +106,6 @@ async def get(run_id: str, db: Session, who: Who) -> RunRecord:
     return await RunStore(db).get(who.tenant_id, run_id)
 
 
-@router.get("/{run_id}/lineage")
-async def lineage(run_id: str, db: Session, who: Who) -> list[RunRecord]:
-    """The run and its ancestors, nearest first."""
-    return await RunStore(db).lineage(who.tenant_id, run_id)
-
-
 @router.get("")
 async def listing(
     db: Session,
@@ -121,8 +116,9 @@ async def listing(
     thread_id: str | None = None,
     parent_run_id: str | None = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
-) -> list[RunRecord]:
-    """This tenant's runs, newest first. ``status=PAUSED&assignee=…`` is an inbox."""
+) -> list[RunSummary]:
+    """This tenant's runs, newest first, as summaries; the full record is
+    ``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox."""
     return await RunStore(db).list(
         who.tenant_id,
         status=status,

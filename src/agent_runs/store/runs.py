@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, literal, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -26,7 +26,7 @@ from trellis.contracts.runs import (
     RunStatus,
 )
 
-from agent_runs.config.constants import DEFAULT_PAGE, MAX_ATTEMPTS, MAX_LINEAGE
+from agent_runs.config.constants import DEFAULT_PAGE, MAX_ATTEMPTS
 from agent_runs.domain.errors import Conflict, NotFound, Unprocessable
 from agent_runs.domain.runs import (
     Claimed,
@@ -35,6 +35,7 @@ from agent_runs.domain.runs import (
     Lease,
     RunFinish,
     RunPause,
+    RunSummary,
 )
 from agent_runs.store.tables import RunRow
 
@@ -61,6 +62,9 @@ _RECORD_FIELDS = (
     "created_at",
     "updated_at",
 )
+
+
+_SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
 
 
 def _record(row: RunRow) -> RunRecord:
@@ -345,10 +349,11 @@ class RunStore:
         thread_id: str | None = None,
         parent_run_id: str | None = None,
         limit: int = DEFAULT_PAGE,
-    ) -> list[RunRecord]:
-        """This tenant's runs, newest first. ``status=PAUSED`` with ``assignee`` is the inbox
-        of one person or role, served by ``ix_runs_inbox``."""
-        query: Select[tuple[RunRow]] = select(RunRow).where(RunRow.tenant_id == tenant_id)
+    ) -> list[RunSummary]:
+        """This tenant's runs, newest first, as summaries (only the summary's columns are
+        read). ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served
+        by ``ix_runs_inbox``."""
+        query = select(*_SUMMARY_COLUMNS).where(RunRow.tenant_id == tenant_id)
         filters: dict[Any, Any] = {
             RunRow.status: status.value if status else None,
             RunRow.assignee: assignee,
@@ -359,31 +364,8 @@ class RunStore:
         for column, value in filters.items():
             if value is not None:
                 query = query.where(column == value)
-        rows = await self._session.scalars(query.order_by(RunRow.created_at.desc()).limit(limit))
-        return [_record(row) for row in rows.all()]
-
-    async def lineage(self, tenant_id: str, run_id: str) -> list[RunRecord]:
-        """A run and its ancestors, nearest first, in one recursive query."""
-        chain = (
-            select(RunRow.run_id, RunRow.parent_run_id, literal(0).label("depth"))
-            .where(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
-            .cte("chain", recursive=True)
-        )
-        parent = RunRow.__table__.alias("parent")
-        chain = chain.union_all(
-            select(parent.c.run_id, parent.c.parent_run_id, chain.c.depth + 1).where(
-                parent.c.tenant_id == tenant_id,
-                parent.c.run_id == chain.c.parent_run_id,
-                chain.c.depth < MAX_LINEAGE,
-            )
-        )
-        rows = await self._session.scalars(
-            select(RunRow).join(chain, RunRow.run_id == chain.c.run_id).order_by(chain.c.depth)
-        )
-        found = [_record(row) for row in rows.all()]
-        if not found:
-            raise NotFound(f"no run {run_id}")
-        return found
+        rows = await self._session.execute(query.order_by(RunRow.created_at.desc()).limit(limit))
+        return [RunSummary.model_validate(dict(row._mapping)) for row in rows.all()]
 
     # ------------------------------------------------------------------ internals
     async def _one(self, *conditions: Any) -> RunRow | None:

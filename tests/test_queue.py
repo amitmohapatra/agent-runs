@@ -215,7 +215,7 @@ async def test_a_pause_keeps_the_checkpoint_for_the_worker_that_resumes(client) 
     assert paused["checkpoint"] == _JOURNAL
     assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == _JOURNAL
     [listed] = (await client.get("/v1/runs", params={"status": "PAUSED"})).json()
-    assert listed["checkpoint"] == _JOURNAL
+    assert "checkpoint" not in listed  # a listing is summaries; the record carries it
 
     resumed = (await client.post(f"/v1/runs/{rid}/resume", json=resolution(paused))).json()
     assert (resumed["status"], resumed["checkpoint"]) == ("QUEUED", _JOURNAL)

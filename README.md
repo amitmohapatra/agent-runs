@@ -53,8 +53,8 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
-| `GET /v1/runs/{id}` · `GET /v1/runs/{id}/lineage` | one run · it and its ancestors |
-| `GET /v1/runs?status=PAUSED&assignee=…` | the inbox of a person or role |
+| `GET /v1/runs/{id}` | one run, the full record |
+| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
 | `POST/GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | schedules |
 | `POST /v1/schedules/{id}/pause` · `/resume` · `/fire` | stop, restart, fire now |
 
