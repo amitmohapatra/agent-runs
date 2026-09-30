@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
+from itertools import count
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ import pytest
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import DataError, OperationalError
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
 
 from agent_runs.api.app import create_app
@@ -25,6 +27,8 @@ from agent_runs.config.settings import (
     reset_settings_cache,
 )
 from agent_runs.store.database import ALEMBIC_INI
+from agent_runs.store.runs import RunStore
+from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
 from alembic import command
 
@@ -106,7 +110,7 @@ async def app(migrated: None, receiver: Receiver) -> AsyncIterator[Any]:
     application = create_app(SETTINGS)
     async with application.router.lifespan_context(application):
         async with application.state.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE agent_runs"))
+            await conn.execute(text("TRUNCATE agent_runs, agent_schedules"))
         await application.state.webhooks.aclose()
         application.state.webhooks = sender(receiver, secret="s3cret")
         yield application
@@ -184,3 +188,74 @@ async def paused(client: AsyncClient, **over: Any) -> dict[str, Any]:
 def at(minutes: float) -> datetime:
     """An instant relative to now, for a sweep that should (or should not) find something."""
     return datetime.now(UTC) + timedelta(minutes=minutes)
+
+
+# ------------------------------------------------------------------------------ schedules
+
+_names = count(1)
+
+
+def scheduled(**over: Any) -> dict[str, Any]:
+    """A create body; the name is unique per call because (tenant, name) is unique."""
+    return {
+        "tenant_id": "acme",
+        "agent_id": "briefing",
+        "name": f"schedule-{next(_names)}",
+        "cadence": "daily",
+        "timezone": "UTC",
+        "on_behalf_of": "user_ada",
+        **over,
+    }
+
+
+@pytest.fixture
+def ticker(app: Any, tmp_path: Any) -> Ticker:
+    """The real ticker over the app's database and webhook sender."""
+    return Ticker(app.state.sessions, app.state.webhooks, heartbeat=tmp_path / "beat")
+
+
+async def queued_runs(app: Any) -> list[dict[str, Any]]:
+    """Every queued run, as rows: what the fires produced."""
+    async with app.state.engine.connect() as conn:
+        rows = await conn.execute(
+            text("SELECT * FROM agent_runs WHERE status = 'QUEUED' ORDER BY created_at")
+        )
+        return [dict(row._mapping) for row in rows]
+
+
+class BrokenQueue:
+    """Makes queueing a run fail the way the database would: ``retryable`` is an
+    OperationalError (a connection lost, a lock timeout), else a DataError (a row the
+    database will never take)."""
+
+    def __init__(self, monkeypatch: Any) -> None:
+        self._monkeypatch = monkeypatch
+        self.calls = 0
+
+    def fail(self, *, retryable: bool = True) -> None:
+        error = OperationalError if retryable else DataError
+
+        async def refuse(*args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            raise error("INSERT INTO agent_runs", {}, Exception("the database refused"))
+
+        self._monkeypatch.setattr(RunStore, "start", refuse)
+
+    def heal(self) -> None:
+        self._monkeypatch.undo()
+
+
+@pytest.fixture
+def broken(monkeypatch: Any) -> BrokenQueue:
+    return BrokenQueue(monkeypatch)
+
+
+async def arm(app: Any, schedule_id: str, due: datetime) -> datetime:
+    """Put a schedule's clock where a test needs it, straight on the row: no API moves
+    next_fire_at backwards, which is a property several tests exist to keep."""
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE agent_schedules SET next_fire_at = :due WHERE schedule_id = :sid"),
+            {"due": due, "sid": schedule_id},
+        )
+    return due

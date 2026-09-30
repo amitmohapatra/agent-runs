@@ -12,6 +12,7 @@ dependencies = [
   "psycopg[binary,pool]>=3.3,<4",
   "alembic>=1.20,<2",
   "structlog>=25.2",
+  "croniter>=6",
   "httpx>=0.28",
   "trellis-contracts>=0.4,<0.5",
 ]
@@ -21,6 +22,7 @@ dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "pyright>=1.1.400"]
 
 [project.scripts]
 agent-runs = "agent_runs.__main__:main"
+agent-runs-ticker = "agent_runs.ticker:main"
 
 [tool.uv.sources]
 # The sibling checkout, not a vendored copy. The image build gets it as a named build

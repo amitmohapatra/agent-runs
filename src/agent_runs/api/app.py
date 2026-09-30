@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent_runs.api.deps import Session
-from agent_runs.api.routers import runs
+from agent_runs.api.routers import runs, schedules
 from agent_runs.config.settings import Settings, get_settings
 from agent_runs.domain.errors import ServiceError
 from agent_runs.observability.logging import configure_logging
@@ -48,6 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="agent-runs", version=version("agent-runs"), lifespan=lifespan)
     app.state.settings = settings
     app.include_router(runs.router)
+    app.include_router(schedules.router)
 
     @app.exception_handler(ServiceError)
     async def service_error(_: Request, exc: ServiceError) -> JSONResponse:

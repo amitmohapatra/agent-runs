@@ -1,4 +1,4 @@
-"""The tables this service owns. The schema itself is the Alembic migrations; these
+"""The two tables this service owns. The schema itself is the Alembic migrations; these
 mappings must agree with them (a test compares the two)."""
 
 from __future__ import annotations
@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Index, Integer, String, UniqueConstraint, func, text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -81,4 +81,39 @@ class RunRow(Base):
             "awaiting_deadline",
             postgresql_where=text("status = 'PAUSED' AND awaiting_deadline IS NOT NULL"),
         ),
+    )
+
+
+class ScheduleRow(Base):
+    __tablename__ = "agent_schedules"
+
+    schedule_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    agent_id: Mapped[str] = mapped_column(String(128))
+    name: Mapped[str] = mapped_column(String(200))
+    cadence: Mapped[str] = mapped_column(String(128))
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    input: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    #: NOT NULL: a schedule with no identity is a run nobody authorised
+    on_behalf_of: Mapped[str] = mapped_column(String(128))
+    workspace_id: Mapped[str | None] = mapped_column(String(128))
+    webhook_url: Mapped[str | None] = mapped_column(String(2048))
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_id: Mapped[str | None] = mapped_column(String(64))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: the backoff gate after a retryable failed fire; ``next_fire_at`` stays the tick owed
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    schedule_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_schedules_tenant_name"),
+        Index("ix_schedules_tenant_created", "tenant_id", "created_at"),
+        # the ticker: enabled schedules by next fire
+        Index("ix_schedules_due", "next_fire_at", postgresql_where=text("enabled")),
     )
