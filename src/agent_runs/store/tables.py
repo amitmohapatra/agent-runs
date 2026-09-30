@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -174,4 +175,33 @@ class WebhookDeliveryRow(Base):
         # the ticker: deliveries by when they are due
         Index("ix_webhook_deliveries_due", "next_attempt_at"),
         Index("ix_webhook_deliveries_webhook", "webhook_id"),
+    )
+
+
+class ArtifactRow(Base):
+    """A run artifact: what it is and whose; the bytes are in the blob store at ``blob_key``.
+    ``expires_at`` is set when the run ends; the ticker deletes the artifact after it."""
+
+    __tablename__ = "run_artifacts"
+
+    artifact_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), ForeignKey("agent_runs.run_id"))
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    blob_key: Mapped[str] = mapped_column(String(512))
+    mime: Mapped[str] = mapped_column(String(255))
+    size: Mapped[int] = mapped_column(BigInteger)
+    #: ``sha256:<hex>`` of the bytes
+    checksum: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = _created()
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # one artifact per content per run: a retried upload is the same artifact
+        UniqueConstraint("run_id", "checksum", name="uq_run_artifacts_content"),
+        # the ticker: artifacts of ended runs, by when they go
+        Index(
+            "ix_run_artifacts_expiry",
+            "expires_at",
+            postgresql_where=text("expires_at IS NOT NULL"),
+        ),
     )

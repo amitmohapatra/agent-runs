@@ -2,7 +2,7 @@
 
 Durable agent runs, the worker queue, the human inbox, and the schedules that start runs.
 One service (it absorbed agent-schedules in 0.2.0): an API process and a ticker process over
-one PostgreSQL database.
+one PostgreSQL database, with run artifacts' bytes in blob storage (a filesystem, or GCS).
 
 This service never executes an agent. A harness does, either in its own process (it records
 the run here as `RUNNING`) or as a `trellis worker` that claims `QUEUED` runs from here under
@@ -55,6 +55,8 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
+| `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
+| `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |
 | `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
@@ -74,6 +76,8 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
    (once) or ends in `TIMEOUT`, with a webhook event either way.
 4. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
    then removed, or rescheduled with backoff.
+5. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
+   are deleted: the blob, then the record.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
 (the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
@@ -90,6 +94,17 @@ principals it may put in `on_behalf_of`. The contract is in
 for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with itself
 (`403` otherwise).
 
+## Artifacts
+
+Large review payloads never live in a run's checkpoint. The harness uploads an `ask` table
+or a diff with `POST /v1/runs/{id}/artifacts` and pauses with the returned `ArtifactRef` as
+`Interrupt.payload_ref`; a UI reads it with `GET /v1/artifacts/{id}`. The bytes are in the
+blob store (`RUNS__BLOB__PROVIDER=filesystem` under `RUNS__BLOB__ROOT`, shared by the API
+and the ticker; or `gcs` in `RUNS__BLOB__BUCKET`, with the environment's Google
+credentials), written once, never overwritten, and verified against their SHA-256 on every
+read. While a run works, only its lease holder adds artifacts; while it waits, only a
+service key. Fencing, limits and retention are in [docs/api.md](docs/api.md#artifacts).
+
 ## Webhooks
 
 A tenant subscribes URLs to run events (`POST /v1/webhooks`: `run.paused`,
@@ -103,8 +118,9 @@ receiver drops repeats.
 
 ## Run it
 
-Needs PostgreSQL, the Memory Service (the key registry, `RUNS__MEMORY__URL`) and a checkout
-of `agent-contracts` next to this one (a path dependency).
+Needs PostgreSQL, the Memory Service (the key registry, `RUNS__MEMORY__URL`), a blob store
+(a directory by default; a GCS bucket in production) and a checkout of `agent-contracts`
+next to this one (a path dependency).
 
 ```bash
 make install                 # uv sync, trellis-contracts from ../agent-contracts
@@ -126,5 +142,8 @@ make lint typecheck test
 
 The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
 and recreated per run) and skips with a reason when there is none. The key registry is a
-fake (`tests/conftest.py`, `FakeMemory`, a tiny ASGI app answering `/v1/keys/self`). Migrations live in
+fake (`tests/conftest.py`, `FakeMemory`, a tiny ASGI app answering `/v1/keys/self`); the
+blob store is a filesystem one per test. `RUNS_TEST_GCS=1` also runs the GCS adapter and an
+end-to-end artifact test against a fake GCS server (`fsouza/fake-gcs-server`, started in
+Docker on a free port and removed afterwards; needs Docker). Migrations live in
 `alembic/versions`; a test checks they build exactly the schema the code maps.

@@ -4,7 +4,9 @@
    queueing its run idempotently on ``(schedule_id, fire_time)``);
 2. put runs whose lease lapsed back on the queue (or fail them after ``MAX_ATTEMPTS``);
 3. escalate or time out interrupts past their deadline;
-4. send the webhook deliveries that are due from the outbox (one attempt each).
+4. send the webhook deliveries that are due from the outbox (one attempt each);
+5. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
+   row: a blob delete that fails leaves the row for the next tick).
 
 Steps 2 and 3 write the webhook events they cause into the outbox in their own transaction.
 
@@ -32,6 +34,7 @@ from trellis.contracts.ids import now as clock
 from trellis.contracts.runs import RunStatus
 
 from agent_runs import heartbeat
+from agent_runs.blob import BlobStore, open_blob_store
 from agent_runs.config.constants import (
     BREAKER_COOLDOWN,
     BREAKER_THRESHOLD,
@@ -44,6 +47,7 @@ from agent_runs.domain.webhooks import WebhookEvent
 from agent_runs.firing import Firing
 from agent_runs.observability.logging import configure_logging
 from agent_runs.retry import Breaker
+from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.database import connect
 from agent_runs.store.runs import RunStore
 from agent_runs.store.webhooks import WebhookStore
@@ -60,6 +64,7 @@ class TickReport:
     requeued: int = 0
     escalated: int = 0
     sent: int = 0
+    purged: int = 0
 
 
 class Ticker:
@@ -67,12 +72,14 @@ class Ticker:
         self,
         sessions: Sessions,
         webhooks: WebhookSender,
+        blobs: BlobStore,
         *,
         heartbeat_path: Path,
         interval: float = TICK_SECONDS,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
+        self._blobs = blobs
         self._heartbeat = heartbeat_path
         self._interval = interval
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
@@ -89,6 +96,7 @@ class Ticker:
                 requeued=await self._requeue_lapsed(now),
                 escalated=await self._escalate_overdue(now),
                 sent=await self._send_webhooks(now),
+                purged=await self._purge_artifacts(now),
             )
         except (DBAPIError, OSError) as exc:
             self.breaker.record_failure(now)
@@ -150,6 +158,25 @@ class Ticker:
             await db.commit()
         return retries.count(False)
 
+    async def _purge_artifacts(self, now: datetime) -> int:
+        """Delete expired artifacts: each blob, then the rows whose blob is gone."""
+        async with self._sessions() as db:
+            store = ArtifactStore(db)
+            expired = await store.expired(now=now, limit=SWEEP_BATCH)
+            gone: list[str] = []
+            for row in expired:
+                try:
+                    await self._blobs.delete(row.blob_key)
+                except Exception as exc:  # the store's own errors vary by provider
+                    log.warning(
+                        "artifact.delete_failed", artifact_id=row.artifact_id, error=str(exc)
+                    )
+                    continue
+                gone.append(row.artifact_id)
+            await store.remove(gone)
+            await db.commit()
+        return len(gone)
+
     def beat(self) -> None:
         """Record that the loop came round. Never raises: a full disk on the liveness file
         must not stop work that is still going through."""
@@ -179,6 +206,7 @@ async def run() -> None:
     )
     engine = await connect(settings.database)
     webhooks = WebhookSender(allow_http=settings.service.is_dev)
+    blobs = open_blob_store(settings.blob)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -187,11 +215,15 @@ async def run() -> None:
         beat = heartbeat.path_for(settings.ticker.heartbeat_file)
         log.info("ticker.heartbeat", path=str(beat))
         ticker = Ticker(
-            async_sessionmaker(engine, expire_on_commit=False), webhooks, heartbeat_path=beat
+            async_sessionmaker(engine, expire_on_commit=False),
+            webhooks,
+            blobs,
+            heartbeat_path=beat,
         )
         await ticker.run_forever(stop)
     finally:
         await webhooks.aclose()
+        await blobs.aclose()
         await engine.dispose()
 
 

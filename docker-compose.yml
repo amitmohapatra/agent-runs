@@ -14,6 +14,8 @@ x-image: &image
 
 x-env: &env
   RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@postgres:5432/agent_runs
+  # run artifacts: a volume the API writes and the ticker deletes from
+  RUNS__BLOB__ROOT: /data/blobs
 
 services:
   postgres:
@@ -55,6 +57,8 @@ services:
         required: false
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - runs-blobs:/data/blobs
     ports:
       - "${RUNS_PORT:-8090}:8090"
     depends_on:
@@ -70,6 +74,8 @@ services:
       <<: *env
       # one ticker per container: the probe below reads this file
       RUNS__TICKER__HEARTBEAT_FILE: /tmp/agent-runs-ticker.heartbeat
+    volumes:
+      - runs-blobs:/data/blobs
     env_file:
       - path: .env
         required: false
@@ -88,3 +94,4 @@ services:
 
 volumes:
   runs-db:
+  runs-blobs:

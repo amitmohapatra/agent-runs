@@ -26,8 +26,13 @@ from trellis.contracts.runs import (
     RunStatus,
 )
 
-from agent_runs.config.constants import DEFAULT_PAGE, MAX_ATTEMPTS
-from agent_runs.domain.errors import Conflict, NotFound, Unprocessable
+from agent_runs.config.constants import (
+    ARTIFACT_RETENTION,
+    DEFAULT_PAGE,
+    MAX_ATTEMPTS,
+    PAUSED_ARTIFACT_ROLE,
+)
+from agent_runs.domain.errors import Conflict, Forbidden, NotFound, Unprocessable
 from agent_runs.domain.runs import (
     Claimed,
     ClaimRequest,
@@ -37,6 +42,7 @@ from agent_runs.domain.runs import (
     RunPause,
     RunSummary,
 )
+from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.tables import RunRow
 
 _RECORD_FIELDS = (
@@ -197,6 +203,7 @@ class RunStore:
         else:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
+        await self._ended([row], now)
         return await self._flushed(row)
 
     async def finish(
@@ -212,6 +219,7 @@ class RunStore:
         _move(row, ending.status, now)
         row.output = ending.output
         row.error = _json(ending.error)
+        await self._ended([row], now)
         return await self._flushed(row)
 
     # ------------------------------------------------------------------ the queue
@@ -281,6 +289,7 @@ class RunStore:
                 )
             else:
                 _requeue(row, now)
+        await self._ended(rows, now)
         await self._session.flush()
         return [_record(row) for row in rows]
 
@@ -317,6 +326,7 @@ class RunStore:
                         source="agent-runs",
                     )
                 )
+        await self._ended(rows, now)
         await self._session.flush()
         return [_record(row) for row in rows]
 
@@ -329,6 +339,43 @@ class RunStore:
             .with_for_update(skip_locked=True)
         )
         return (await self._session.scalars(query)).all()
+
+    # ------------------------------------------------------------------ artifacts
+    async def check_artifact_writer(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str | None,
+        role: str,
+        lock: bool,
+    ) -> None:
+        """May this caller add an artifact to the run now? While ``RUNNING``, only the
+        worker holding the lease (``worker_id``) when the run is leased; a run in the
+        caller's own process has no lease and takes no ``worker_id``. While ``PAUSED``, only
+        the tenant's service principal (``PAUSED_ARTIFACT_ROLE``), e.g. a reviewer's
+        corrected table uploaded by the UI backend. Never otherwise (409). ``lock`` holds
+        the row until the transaction ends, so the run cannot end between this check and
+        the artifact's insert."""
+        query = select(RunRow).where(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
+        row = await self._session.scalar(query.with_for_update() if lock else query)
+        if row is None:
+            raise NotFound(f"no run {run_id}")
+        if row.status == RunStatus.RUNNING:
+            if (row.lease_owner is not None or worker_id is not None) and (
+                worker_id != row.lease_owner
+            ):
+                raise Conflict(f"worker {worker_id} does not hold the lease on run {run_id}")
+        elif row.status == RunStatus.PAUSED:
+            if role != PAUSED_ARTIFACT_ROLE:
+                raise Forbidden(f"only a {PAUSED_ARTIFACT_ROLE} key adds to a paused run")
+        else:
+            raise Conflict(f"run {run_id} is {row.status}; artifacts are added while it runs")
+
+    async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
+        """Runs that just ended start their artifacts' retention."""
+        ended = [row.run_id for row in rows if RunStatus(row.status).final]
+        await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
 
     # ------------------------------------------------------------------ reads
     async def get(self, tenant_id: str, run_id: str) -> RunRecord:

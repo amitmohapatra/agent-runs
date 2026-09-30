@@ -20,3 +20,4 @@ htmlcov/
 secrets*
 *.pem
 
+.blob/

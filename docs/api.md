@@ -11,9 +11,9 @@ Errors answer `{"detail": ...}`.
 | `400` | a platform key named no tenant |
 | `401` | missing `X-Api-Key`, or one the key registry does not know (or revoked, expired) |
 | `403` | the registry refuses the key (a suspended tenant), the body or header names another tenant, or `on_behalf_of` the key may not act as |
-| `404` | no such run, schedule or webhook in this tenant |
+| `404` | no such run, schedule, webhook or artifact in this tenant |
 | `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
-| `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON |
+| `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON, or an artifact larger than 50 MiB |
 | `422` | the body is invalid (including the contracts' own validators) |
 | `503` | the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule) |
 
@@ -185,6 +185,54 @@ is `409`. Announced as `run.finished`.
 `awaiting` is the interrupt a paused run waits on (`null` otherwise; its own `deadline` is
 when the answer is due), `assignee` whose inbox it is in, `deadline` the run's own deadline
 (`RunStart.deadline`). Nothing else is in a summary; read the run for the rest.
+
+## Artifacts
+
+A payload too large for a checkpoint or an interrupt (an `ask` table, a diff, a report) is
+uploaded as a **run artifact**: its bytes go to blob storage (`RUNS__BLOB__PROVIDER`:
+filesystem or GCS), its record to PostgreSQL, and the run carries only the returned
+`ArtifactRef`, typically as `Interrupt.payload_ref`. Checkpoints stay small.
+
+### `POST /v1/runs/{id}/artifacts?worker_id=&checksum=` → `201 ArtifactRef` (`200` for a repeat)
+
+The body is the artifact's raw bytes; `Content-Type` is its mime type (`application/json`
+for an `ask` table; `application/octet-stream` when absent). At most 50 MiB
+(`MAX_ARTIFACT_BYTES`), `413` past it, counted as the body arrives when there is no
+`Content-Length`; an empty body is `422`. `checksum` (optional, `sha256:<hex>`) is what the
+caller computed: `422` unless the bytes that arrived match.
+
+```json
+{"artifact_id": "art_…", "type": "blob", "uri": "/v1/artifacts/art_…",
+ "mime_type": "application/json", "checksum": "sha256:9f86d0…", "size_bytes": 48213,
+ "created_at": "2026-09-30T08:00:00Z", "metadata": {"run_id": "run_…"}}
+```
+
+Who may add one:
+
+- the run is `RUNNING`: a leased run (claimed from the queue) only with its lease holder's
+  `worker_id` (`409` without it, or with another worker's); a run recorded in the caller's
+  process has no lease and takes no `worker_id` (`409` with one);
+- the run is `PAUSED`: only a key whose registry role is `service` (a harness, or the UI
+  backend uploading a reviewer's corrected table); any other key is `403`;
+- any other status: `409`. An unknown run (or another tenant's) is `404`.
+
+The same bytes uploaded to the same run again return the first artifact with `200` (a
+retried upload stores nothing twice).
+
+### `GET /v1/artifacts/{artifact_id}` → `200` the bytes
+
+Streams the bytes with the artifact's `Content-Type`, `Content-Length` and
+`ETag: "sha256:<hex>"`. The bytes are verified against the recorded SHA-256 as they are
+read, and the last chunk is held back until they match: corrupted bytes are `500` (or a
+response cut short), never served whole. `404` for another tenant's artifact, or one
+already deleted.
+
+### Retention
+
+When a run ends (`finish`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` after `MAX_ATTEMPTS`),
+its artifacts get `expires_at = ended + 7 days` (`ARTIFACT_RETENTION`); until then they are
+still readable. The ticker deletes each expired artifact's blob, then its record; a blob
+that cannot be deleted keeps its record for the next tick.
 
 ## Schedules
 

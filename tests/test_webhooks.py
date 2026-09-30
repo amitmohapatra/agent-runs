@@ -145,7 +145,7 @@ async def test_a_tenant_has_a_bounded_number_of_subscriptions(client, monkeypatc
 
 async def test_webhook_url_is_refused_on_runs_and_schedules(client) -> None:
     run = await client.post("/v1/runs", json=started(webhook_url=HOOK))
-    assert run.status_code == 422 and "/v1/webhooks" in run.text
+    assert run.status_code == 422 and "webhook_url" in run.text
     schedule = {
         "tenant_id": "acme",
         "agent_id": "a",
@@ -219,7 +219,7 @@ async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
     hooks = WebhookSender(
         allow_http=False, client=httpx.AsyncClient(transport=httpx.MockTransport(failing))
     )
-    ticker = Ticker(app.state.sessions, hooks, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "ERROR"})
@@ -243,7 +243,7 @@ async def test_a_receiver_that_recovers_is_told_once(app, client, tmp_path) -> N
             transport=httpx.MockTransport(lambda _: httpx.Response(next(answers)))
         ),
     )
-    ticker = Ticker(app.state.sessions, hooks, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})

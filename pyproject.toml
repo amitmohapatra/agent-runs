@@ -15,6 +15,7 @@ dependencies = [
   "croniter>=6",
   "httpx>=0.28",
   "trellis-contracts>=0.4,<0.5",
+  "google-cloud-storage>=3.4",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +52,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 # PLR0913/PLR0917: FastAPI expresses query parameters as function arguments, and the list
 # filters are keyword-only and optional in the store.
 "src/agent_runs/api/routers/runs.py" = ["PLR0913", "PLR0917"]
+"src/agent_runs/api/routers/artifacts.py" = ["PLR0913", "PLR0917"]
 "src/agent_runs/store/runs.py" = ["PLR0913"]
+"src/agent_runs/store/artifacts.py" = ["PLR0913"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -5,10 +5,12 @@ decisions are constants in ``constants.py``.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
+from typing import Self
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEV = "dev"
@@ -35,6 +37,26 @@ class DatabaseSettings(BaseModel):
     pool_size: int = 10
 
 
+class BlobProvider(StrEnum):
+    FILESYSTEM = "filesystem"
+    GCS = "gcs"
+
+
+class BlobSettings(BaseModel):
+    """Where run artifacts' bytes live. ``filesystem`` writes under ``root`` (the API and the
+    ticker must share it); ``gcs`` writes to ``bucket`` with the environment's credentials."""
+
+    provider: BlobProvider = BlobProvider.FILESYSTEM
+    root: Path = Path(".blob")
+    bucket: str | None = None
+
+    @model_validator(mode="after")
+    def _gcs_names_a_bucket(self) -> Self:
+        if self.provider is BlobProvider.GCS and not self.bucket:
+            raise ValueError("RUNS__BLOB__BUCKET is required when RUNS__BLOB__PROVIDER=gcs")
+        return self
+
+
 class TickerSettings(BaseModel):
     #: The file the ticker touches every tick and ``python -m agent_runs.heartbeat`` reads.
     #: Unset: a per-process file in the temp directory (and no probe).
@@ -54,6 +76,7 @@ class Settings(BaseSettings):
     service: ServiceSettings = ServiceSettings()
     memory: MemorySettings = MemorySettings()
     database: DatabaseSettings = DatabaseSettings()
+    blob: BlobSettings = BlobSettings()
     ticker: TickerSettings = TickerSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
 

@@ -35,6 +35,19 @@ MAX_PAGE: Final = 500
 #: artifact the checkpoint refers to.
 MAX_CHECKPOINT_BYTES: Final = 1024 * 1024
 
+# --------------------------------------------------------------------------- artifacts
+
+#: The largest artifact one upload may carry (an ``ask`` table, a diff, a report).
+MAX_ARTIFACT_BYTES: Final = 50 * 1024 * 1024
+#: How long a run's artifacts outlive the run: a reviewer can still open what a finished run
+#: asked about; after that the ticker deletes them.
+ARTIFACT_RETENTION: Final = timedelta(days=7)
+#: The role of the key (the Memory Service's registry) that may add an artifact to a paused
+#: run: the tenant's service principal (a harness or its UI backend), not a user or admin.
+PAUSED_ARTIFACT_ROLE: Final = "service"
+#: The unit a blob is read and streamed in.
+BLOB_CHUNK_BYTES: Final = 1024 * 1024
+
 # --------------------------------------------------------------------------- the queue
 
 #: A lease a worker may ask for. Short enough that a dead worker's run is back on the queue

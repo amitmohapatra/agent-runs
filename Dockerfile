@@ -31,7 +31,9 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-RUN useradd --create-home --uid 10001 app && chown -R app:app /app
+# /data/blobs: the filesystem blob store's volume, owned by the app user
+RUN useradd --create-home --uid 10001 app && mkdir -p /data/blobs \
+    && chown -R app:app /app /data/blobs
 USER app
 
 EXPOSE 8090

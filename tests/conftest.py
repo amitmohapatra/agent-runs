@@ -19,6 +19,7 @@ from sqlalchemy.exc import DataError, OperationalError
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
 
 from agent_runs.api.app import create_app
+from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.config.settings import DatabaseSettings, Settings, reset_settings_cache
 from agent_runs.keys import KeyRegistry
 from agent_runs.store.database import ALEMBIC_INI
@@ -171,14 +172,24 @@ def receiver() -> Receiver:
 
 
 @pytest.fixture
-async def app(migrated: None, memory: FakeMemory) -> AsyncIterator[Any]:
+def blobs(tmp_path: Any) -> FilesystemBlobStore:
+    """The filesystem blob store, in this test's own directory."""
+    return FilesystemBlobStore(tmp_path / "blobs")
+
+
+@pytest.fixture
+async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) -> AsyncIterator[Any]:
     application = create_app(SETTINGS)
     async with application.router.lifespan_context(application):
         await application.state.keys.aclose()
         application.state.keys = memory.registry()
+        application.state.blobs = blobs
         async with application.state.engine.begin() as conn:
             await conn.execute(
-                text("TRUNCATE agent_runs, agent_schedules, webhooks, webhook_deliveries")
+                text(
+                    "TRUNCATE run_artifacts, agent_runs, agent_schedules, webhooks, "
+                    "webhook_deliveries"
+                )
             )
         yield application
 
@@ -289,7 +300,7 @@ def scheduled(**over: Any) -> dict[str, Any]:
 async def ticker(app: Any, receiver: Receiver, tmp_path: Any) -> AsyncIterator[Ticker]:
     """The real ticker over the app's database, sending webhooks to ``receiver``."""
     hooks = sender(receiver)
-    yield Ticker(app.state.sessions, hooks, heartbeat_path=tmp_path / "beat")
+    yield Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
     await hooks.aclose()
 
 

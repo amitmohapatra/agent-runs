@@ -19,7 +19,7 @@ from agent_runs.config.constants import (
     MAX_LEASE_SECONDS,
     MIN_LEASE_SECONDS,
 )
-from agent_runs.domain.errors import WEBHOOK_URL_REFUSED, TooLarge
+from agent_runs.domain.errors import TooLarge
 
 WorkerId = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
 LeaseSeconds = Annotated[int, Field(ge=MIN_LEASE_SECONDS, le=MAX_LEASE_SECONDS)]
@@ -30,12 +30,6 @@ class RunCreate(RunStart):
     instead of recording it as already ``RUNNING`` in the caller's process."""
 
     queue: bool = False
-
-    @model_validator(mode="after")
-    def _no_webhook_url(self) -> Self:
-        if self.webhook_url is not None:
-            raise ValueError(WEBHOOK_URL_REFUSED)
-        return self
 
     def start(self) -> RunStart:
         return RunStart.model_validate(self.model_dump(exclude={"queue"}))

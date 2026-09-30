@@ -15,11 +15,6 @@ _TOO_LARGE = 413
 _UNPROCESSABLE = 422
 _UNAVAILABLE = 503
 
-#: Why a ``webhook_url`` (a field the contracts still carry) is refused.
-WEBHOOK_URL_REFUSED = (
-    "webhook_url is not supported: notifications are tenant subscriptions, POST /v1/webhooks"
-)
-
 
 class ServiceError(Exception):
     status_code = 500

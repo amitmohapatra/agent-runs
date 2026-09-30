@@ -1,0 +1,196 @@
+"""The blob port, against both adapters: create-only puts, reads verified against the
+recorded checksum as they stream, idempotent deletes. The GCS adapter runs against a local
+fake GCS server (``fsouza/fake-gcs-server`` in Docker, on a free port, removed afterwards)
+when ``RUNS_TEST_GCS=1``; the end-to-end test drives the API and the ticker on it."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import socket
+import subprocess
+import time
+from collections.abc import AsyncIterator, Iterator
+from datetime import timedelta
+from typing import Any
+
+import httpx
+import pytest
+from pydantic import ValidationError
+from trellis.contracts.ids import now
+
+from agent_runs.blob import (
+    BlobCorrupt,
+    BlobExists,
+    BlobNotFound,
+    BlobStore,
+    open_blob_store,
+    read,
+)
+from agent_runs.blob.filesystem import FilesystemBlobStore
+from agent_runs.blob.gcs import GCSBlobStore
+from agent_runs.config.constants import ARTIFACT_RETENTION
+from agent_runs.config.settings import BlobProvider, BlobSettings
+from tests.conftest import started
+
+GCS_OPT_IN = os.environ.get("RUNS_TEST_GCS") == "1"
+FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:latest"
+BUCKET = "runs-artifacts-test"
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def fake_gcs() -> Iterator[str]:
+    """A fake GCS server for this session, and its URL; stopped and removed afterwards."""
+    if not GCS_OPT_IN:
+        pytest.skip("set RUNS_TEST_GCS=1 to run the GCS adapter against a fake GCS server")
+    port = _free_port()
+    name = f"agent-runs-fake-gcs-{port}"
+    url = f"http://127.0.0.1:{port}"
+    subprocess.run(
+        ["docker", "run", "-d", "--rm", "--name", name, "-p", f"127.0.0.1:{port}:4443",
+         FAKE_GCS_IMAGE, "-scheme", "http", "-port", "4443", "-external-url", url],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                if httpx.get(f"{url}/storage/v1/b", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError("the fake GCS server did not start")
+            time.sleep(0.2)
+        httpx.post(f"{url}/storage/v1/b", json={"name": BUCKET}).raise_for_status()
+        yield url
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
+
+
+@pytest.fixture
+def gcs(fake_gcs: str, monkeypatch: pytest.MonkeyPatch) -> GCSBlobStore:
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", fake_gcs)
+    return GCSBlobStore(BUCKET)
+
+
+@pytest.fixture(params=["filesystem", "gcs"])
+def store(request: pytest.FixtureRequest, tmp_path: Any) -> BlobStore:
+    if request.param == "gcs":
+        return request.getfixturevalue("gcs")
+    return FilesystemBlobStore(tmp_path)
+
+
+async def _all(chunks: AsyncIterator[bytes]) -> bytes:
+    return b"".join([chunk async for chunk in chunks])
+
+
+def _key() -> str:
+    return f"artifacts/art_{time.monotonic_ns()}"
+
+
+# ------------------------------------------------------------------ the port, both adapters
+
+
+async def test_a_put_is_read_back_verified_in_chunks(store, monkeypatch) -> None:
+    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 7)
+    monkeypatch.setattr("agent_runs.blob.gcs.BLOB_CHUNK_BYTES", 7)
+    data = b"the quick brown fox jumps over the lazy dog" * 3
+    key = _key()
+    stored = await store.put(key, data, content_type="text/plain")
+    assert (stored.key, stored.size) == (key, len(data))
+    assert stored.sha256 == hashlib.sha256(data).hexdigest()
+    assert await _all(read(store, key, sha256=stored.sha256, size=stored.size)) == data
+
+
+async def test_an_object_is_never_overwritten(store) -> None:
+    key = _key()
+    await store.put(key, b"first", content_type="text/plain")
+    with pytest.raises(BlobExists):
+        await store.put(key, b"second", content_type="text/plain")
+    assert await _all(store.chunks(key)) == b"first"
+
+
+async def test_a_delete_is_idempotent_and_a_missing_key_is_not_found(store) -> None:
+    key = _key()
+    await store.put(key, b"bytes", content_type="text/plain")
+    await store.delete(key)
+    await store.delete(key)
+    with pytest.raises(BlobNotFound):
+        await _all(store.chunks(key))
+
+
+async def test_bytes_that_do_not_match_never_arrive_whole(store, monkeypatch) -> None:
+    """The last chunk is held back until the hash checks, so a reader that gets every byte
+    of a corrupted object does not exist."""
+    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 4)
+    monkeypatch.setattr("agent_runs.blob.gcs.BLOB_CHUNK_BYTES", 4)
+    data = b"0123456789abcdef"
+    key = _key()
+    await store.put(key, data, content_type="text/plain")
+    got: list[bytes] = []
+    with pytest.raises(BlobCorrupt):
+        async for chunk in read(store, key, sha256=hashlib.sha256(b"other").hexdigest(), size=16):
+            got.append(chunk)
+    assert b"".join(got) == data[:-4]
+    with pytest.raises(BlobCorrupt):
+        await _all(read(store, key, sha256=hashlib.sha256(data).hexdigest(), size=17))
+
+
+def test_the_filesystem_store_refuses_keys_that_leave_its_root(tmp_path) -> None:
+    store = FilesystemBlobStore(tmp_path)
+    for key in ("../escape", "a//b", "", "a/./b"):
+        with pytest.raises(ValueError, match="invalid blob key"):
+            store._path(key)
+
+
+# ------------------------------------------------------------------ settings
+
+
+def test_the_provider_is_chosen_by_settings(tmp_path) -> None:
+    assert isinstance(open_blob_store(BlobSettings(root=tmp_path)), FilesystemBlobStore)
+    with pytest.raises(ValidationError, match="RUNS__BLOB__BUCKET"):
+        BlobSettings(provider=BlobProvider.GCS)
+
+
+def test_gcs_is_chosen_with_a_bucket(fake_gcs, monkeypatch) -> None:
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", fake_gcs)
+    settings = BlobSettings(provider=BlobProvider.GCS, bucket=BUCKET)
+    assert isinstance(open_blob_store(settings), GCSBlobStore)
+
+
+# ------------------------------------------------------------------ end to end on GCS
+
+
+async def test_artifacts_live_in_gcs_end_to_end(app, client, ticker, gcs) -> None:
+    """Upload through the API, read back, then the ticker deletes the object from the bucket
+    once the run has been over for the retention."""
+    app.state.blobs = gcs
+    ticker._blobs = gcs
+    run = (await client.post("/v1/runs", json=started())).json()
+    table = b'{"columns": ["sku"], "rows": [["A-1"]]}'
+    response = await client.post(
+        f"/v1/runs/{run['run_id']}/artifacts",
+        content=table,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 201, response.text
+    ref = response.json()
+    got = await client.get(ref["uri"])
+    assert got.content == table and got.headers["content-type"] == "application/json"
+    key = f"artifacts/{ref['artifact_id']}"
+    blob = gcs._bucket.get_blob(key)
+    assert blob is not None and blob.metadata == {"sha256": ref["checksum"][len("sha256:") :]}
+
+    await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})
+    report = await ticker.tick(now=now() + ARTIFACT_RETENTION + timedelta(minutes=1))
+    assert report.purged == 1
+    assert gcs._bucket.get_blob(key) is None
+    assert (await client.get(ref["uri"])).status_code == 404

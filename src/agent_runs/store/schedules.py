@@ -35,13 +35,12 @@ from agent_runs.config.constants import (
     MAX_CONSECUTIVE_FAILURES,
 )
 from agent_runs.domain.cadence import next_fire_at, validate_cadence
-from agent_runs.domain.errors import WEBHOOK_URL_REFUSED, NotFound, Unprocessable
+from agent_runs.domain.errors import NotFound, Unprocessable
 from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
 from agent_runs.store.tables import ScheduleRow
 
-#: ``webhook_url`` is refused: notifications are tenant subscriptions (``/v1/webhooks``)
-_UNKEPT = frozenset({"metadata", "webhook_url"})
+_UNKEPT = frozenset({"metadata"})
 _SPEC_FIELDS = tuple(name for name in ScheduleSpec.model_fields if name not in _UNKEPT)
 _RECORD_FIELDS = tuple(name for name in Schedule.model_fields if name not in _UNKEPT)
 
@@ -57,8 +56,6 @@ def _checked(fields: dict[str, Any]) -> ScheduleSpec:
         spec = ScheduleSpec.model_validate(fields)
     except ValidationError as exc:
         raise Unprocessable(str(exc)) from exc
-    if spec.webhook_url is not None:
-        raise Unprocessable(WEBHOOK_URL_REFUSED)
     return spec.model_copy(update={"cadence": validate_cadence(spec.cadence)})
 
 
