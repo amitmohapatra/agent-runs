@@ -58,7 +58,6 @@ _RECORD_FIELDS = (
     "attempt",
     "deadline",
     "idempotency_key",
-    "webhook_url",
     "created_at",
     "updated_at",
 )
@@ -130,7 +129,6 @@ class RunStore:
                 input=record.input,
                 deadline=record.deadline,
                 idempotency_key=record.idempotency_key,
-                webhook_url=record.webhook_url,
                 run_metadata=record.metadata or None,
                 attempt=1,
                 queued_at=now if queue else None,

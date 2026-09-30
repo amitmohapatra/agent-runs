@@ -36,7 +36,6 @@ class ScheduleUpdate(BaseModel):
     input: Any = None
     workspace_id: str | None = None
     enabled: bool | None = None
-    webhook_url: str | None = None
     metadata: dict[str, Any] | None = None
 
 

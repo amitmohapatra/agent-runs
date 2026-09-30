@@ -13,12 +13,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent_runs.api.deps import Session
-from agent_runs.api.routers import runs, schedules
+from agent_runs.api.routers import runs, schedules, webhooks
 from agent_runs.config.settings import Settings, get_settings
 from agent_runs.domain.errors import ServiceError
 from agent_runs.observability.logging import configure_logging
 from agent_runs.store.database import connect
-from agent_runs.webhooks import WebhookSender
 
 log = structlog.get_logger(__name__)
 
@@ -34,14 +33,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = await connect(settings.database)
         app.state.engine = engine
         app.state.sessions = async_sessionmaker(engine, expire_on_commit=False)
-        app.state.webhooks = WebhookSender(
-            secret=settings.webhooks.signing_secret, allow_http=settings.service.is_dev
-        )
         log.info("agent_runs.started", environment=settings.service.environment)
         try:
             yield
         finally:
-            await app.state.webhooks.aclose()
             await engine.dispose()
             log.info("agent_runs.stopped")
 
@@ -49,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.include_router(runs.router)
     app.include_router(schedules.router)
+    app.include_router(webhooks.router)
 
     @app.exception_handler(ServiceError)
     async def service_error(_: Request, exc: ServiceError) -> JSONResponse:

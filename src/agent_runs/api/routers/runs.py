@@ -10,7 +10,7 @@ from fastapi import APIRouter, Query, Response
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
-from agent_runs.api.deps import Session, Webhooks, Who
+from agent_runs.api.deps import Session, Who
 from agent_runs.config.constants import DEFAULT_PAGE, MAX_PAGE
 from agent_runs.domain.runs import (
     Claimed,
@@ -23,6 +23,7 @@ from agent_runs.domain.runs import (
     RunSummary,
 )
 from agent_runs.store.runs import RunStore
+from agent_runs.store.webhooks import WebhookStore
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
@@ -67,37 +68,38 @@ async def heartbeat(run_id: str, body: HeartbeatRequest, db: Session, who: Who) 
 
 @router.post("/{run_id}/pause")
 async def pause(
-    run_id: str, body: RunPause, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
+    run_id: str, body: RunPause, db: Session, who: Who, worker_id: WorkerId = None
 ) -> RunRecord:
     """The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that
     inbox. ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound)."""
-    run = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
+    at = now()
+    run = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
+    await WebhookStore(db).announce(run, now=at)
     await db.commit()
-    hooks.notify(run)
     return run
 
 
 @router.post("/{run_id}/resume")
-async def resume(
-    run_id: str, body: InterruptResolution, db: Session, who: Who, hooks: Webhooks
-) -> RunRecord:
+async def resume(run_id: str, body: InterruptResolution, db: Session, who: Who) -> RunRecord:
     """Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it
     as the next attempt: ``QUEUED`` for a worker when the run came from the queue, else
     ``RUNNING``. The resolution is kept as ``last_resolution``."""
-    run = await RunStore(db).resume(who.tenant_id, run_id, body, now=now())
+    at = now()
+    run = await RunStore(db).resume(who.tenant_id, run_id, body, now=at)
+    await WebhookStore(db).announce(run, now=at)
     await db.commit()
-    hooks.notify(run)
     return run
 
 
 @router.post("/{run_id}/finish")
 async def finish(
-    run_id: str, body: RunFinish, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
+    run_id: str, body: RunFinish, db: Session, who: Who, worker_id: WorkerId = None
 ) -> RunRecord:
     """End the run. Cancelling a queued or paused run is a finish with ``CANCELLED``."""
-    run = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
+    at = now()
+    run = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
+    await WebhookStore(db).announce(run, now=at)
     await db.commit()
-    hooks.notify(run)
     return run
 
 

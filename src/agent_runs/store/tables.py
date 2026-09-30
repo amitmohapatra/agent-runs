@@ -1,4 +1,4 @@
-"""The two tables this service owns. The schema itself is the Alembic migrations; these
+"""The tables this service owns. The schema itself is the Alembic migrations; these
 mappings must agree with them (a test compares the two)."""
 
 from __future__ import annotations
@@ -6,8 +6,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, UniqueConstraint, func, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -47,7 +57,6 @@ class RunRow(Base):
     #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
-    webhook_url: Mapped[str | None] = mapped_column(String(2048))
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -101,7 +110,6 @@ class ScheduleRow(Base):
     #: NOT NULL: a schedule with no identity is a run nobody authorised
     on_behalf_of: Mapped[str] = mapped_column(String(128))
     workspace_id: Mapped[str | None] = mapped_column(String(128))
-    webhook_url: Mapped[str | None] = mapped_column(String(2048))
     created_by: Mapped[str | None] = mapped_column(String(128))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -128,4 +136,42 @@ class ScheduleRow(Base):
         Index("ix_schedules_tenant_created", "tenant_id", "created_at"),
         # the ticker: enabled schedules by next fire
         Index("ix_schedules_due", "next_fire_at", postgresql_where=text("enabled")),
+    )
+
+
+class WebhookRow(Base):
+    """A tenant's subscription: a URL, the events it wants, the secret that signs them."""
+
+    __tablename__ = "webhooks"
+
+    webhook_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    url: Mapped[str] = mapped_column(String(2048))
+    events: Mapped[list[str]] = mapped_column(ARRAY(String(32)))
+    secret: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_webhooks_tenant", "tenant_id"),)
+
+
+class WebhookDeliveryRow(Base):
+    """The outbox: one event owed to one subscription, until it is accepted or given up."""
+
+    __tablename__ = "webhook_deliveries"
+
+    #: derived from the event and the subscription, so a repeated write is one row
+    delivery_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    webhook_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("webhooks.webhook_id", ondelete="CASCADE")
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(Integer)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        # the ticker: deliveries by when they are due
+        Index("ix_webhook_deliveries_due", "next_attempt_at"),
+        Index("ix_webhook_deliveries_webhook", "webhook_id"),
     )

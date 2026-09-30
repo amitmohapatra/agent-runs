@@ -64,10 +64,15 @@ MAX_FIRE_SKEW: Final = timedelta(minutes=1)
 
 # --------------------------------------------------------------------------- webhooks
 
+#: Subscriptions per tenant: the fan-out of one event is bounded.
+MAX_WEBHOOKS_PER_TENANT: Final = 20
 WEBHOOK_TIMEOUT_SECONDS: Final = 10.0
-#: Attempts per notification, including the first, spaced by the one backoff helper.
-WEBHOOK_ATTEMPTS: Final = 4
-WEBHOOK_RETRY_BASE: Final = timedelta(seconds=1)
-WEBHOOK_RETRY_CAP: Final = timedelta(seconds=30)
+#: How long a ticker holds a delivery it is sending; past it another ticker may send it.
+WEBHOOK_LEASE: Final = timedelta(seconds=2 * WEBHOOK_TIMEOUT_SECONDS)
+#: Attempts per delivery, including the first, spaced by the one backoff helper (15 s,
+#: 30 s, 1 min, 2 min, 4 min, 8 min): about a quarter of an hour of receiver downtime.
+WEBHOOK_ATTEMPTS: Final = 7
+WEBHOOK_RETRY_BASE: Final = timedelta(seconds=15)
+WEBHOOK_RETRY_CAP: Final = timedelta(minutes=10)
 #: Receiver answers worth another attempt: a 5xx, or the receiver asking for time.
 WEBHOOK_RETRYABLE: Final = frozenset({408, 429, 500, 502, 503, 504})

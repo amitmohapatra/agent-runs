@@ -10,8 +10,8 @@ Errors answer `{"detail": ...}`.
 | `400` | a platform key named no tenant |
 | `401` | unknown or missing `X-Api-Key` |
 | `403` | the body or header names another tenant, or `on_behalf_of` the key may not act as |
-| `404` | no such run or schedule in this tenant |
-| `409` | the record is not in a state that allows it: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
+| `404` | no such run, schedule or webhook in this tenant |
+| `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
 | `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON |
 | `422` | the body is invalid (including the contracts' own validators) |
 | `503` | a schedule fire could not queue its run (recorded on the schedule) |
@@ -25,8 +25,7 @@ Body: `RunStart` plus `queue`.
 ```json
 {"tenant_id": "acme", "agent_id": "triage", "run_id": "run_…", "parent_run_id": null,
  "thread_id": null, "user_id": null, "workspace_id": null, "on_behalf_of": null,
- "input": {}, "deadline": null, "idempotency_key": null, "webhook_url": null,
- "metadata": {}, "queue": false}
+ "input": {}, "deadline": null, "idempotency_key": null, "metadata": {}, "queue": false}
 ```
 
 Only `tenant_id` and `agent_id` are required; `run_id` is minted when absent. `queue: false`
@@ -210,18 +209,56 @@ A repeat for the same instant returns the same run. `409` when the schedule is p
 
 ## Webhooks
 
-`POST <webhook_url>` with
+Notifications are **tenant subscriptions**: a URL and the run events it wants. There is no
+per-run or per-schedule URL (`webhook_url` in a `RunStart` or `ScheduleSpec` is `422`).
+
+### `POST /v1/webhooks` → `201 WebhookCreated`
+
+```json
+{"url": "https://ui.example/hooks/trellis", "events": ["run.paused", "run.finished"]}
+```
+
+`events` is a non-empty subset of `run.paused`, `run.escalated`, `run.finished` (duplicates
+dropped, answered sorted). `url` is absolute `https` (`http` too when
+`RUNS__SERVICE__ENVIRONMENT=dev`), else `422`. At most 20 subscriptions per tenant (`409`).
+
+```json
+{"webhook_id": "wh_…", "url": "https://ui.example/hooks/trellis",
+ "events": ["run.finished", "run.paused"], "created_by": "user_ada",
+ "created_at": "2026-09-30T08:00:00Z", "secret": "whsec_…"}
+```
+
+`secret` signs every delivery to this subscription. **It is in this answer only**; a lost
+secret means deleting the subscription and creating a new one.
+
+### `GET /v1/webhooks` → `[Webhook]` · `DELETE /v1/webhooks/{id}` → `204`
+
+The listing is the same shape without `secret`, oldest first. Deleting drops the
+deliveries still owed to the subscription. Another tenant's id is `404`.
+
+### Events and delivery
+
+| Event | When |
+|---|---|
+| `run.paused` | a run pauses (`/pause`) |
+| `run.escalated` | the ticker moves an overdue interrupt to `escalate_to` |
+| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a lease lapsed `MAX_ATTEMPTS` times |
+
+The event is written to an outbox in the same transaction as the run change, one row per
+subscription of the tenant that wants it, and the ticker sends it (so within one tick,
+5 s): `POST <url>` with
 
 ```json
 {"event_id": "whd_…", "type": "run.paused", "tenant_id": "acme", "workspace_id": null,
- "occurred_at": "…", "data": {"run": {…RunRecord…}}}
+ "occurred_at": "…", "data": {"run": {…RunSummary…}}}
 ```
 
 and headers `X-Trellis-Event: <type>`, `X-Trellis-Delivery: <event_id>`,
-`X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 over "<t>.<raw body>">` (with
-`RUNS__WEBHOOKS__SIGNING_SECRET`). Types: `run.paused`, `run.escalated`, `run.finished`. A
-`2xx` accepts; `408`, `429` and `5xx` are retried (4 attempts, doubling backoff); any other
-answer is final. `https` only outside dev.
+`X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 keyed by the subscription's
+secret over "<t>.<raw body>">` (the Memory Service's scheme). `event_id` is the same on every
+retry. A `2xx` accepts; `408`, `429`, `5xx` and an unreachable receiver are retried (7
+attempts, 15 s doubling to at most 10 min); any other answer is final. At least once:
+receivers drop repeats by `event_id` and read the run for anything the summary lacks.
 
 ## Ops
 

@@ -69,7 +69,6 @@ class Firing:
             on_behalf_of=schedule.on_behalf_of,
             input=schedule.input,
             idempotency_key=key,
-            webhook_url=schedule.webhook_url,
             metadata={
                 "schedule_id": schedule.schedule_id,
                 "schedule_name": schedule.name,

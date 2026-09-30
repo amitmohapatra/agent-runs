@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_runs.config.settings import Credential, ServiceSettings, Settings, WebhookSettings
+from agent_runs.config.settings import Credential, ServiceSettings, Settings
 from tests.conftest import started
 
 
@@ -61,20 +61,7 @@ def test_a_deployment_with_no_keys_is_refused() -> None:
 
 def test_the_development_key_cannot_survive_into_production() -> None:
     with pytest.raises(ValueError, match="development credential"):
-        Settings(
-            service=ServiceSettings(environment="prod"),
-            webhooks=WebhookSettings(signing_secret="x"),
-        ).check()
-
-
-def test_unsigned_webhooks_are_refused_outside_dev() -> None:
-    keys = {"k": Credential(tenant_id="acme", principal="svc")}
-    with pytest.raises(ValueError, match="signing_secret"):
-        Settings(service=ServiceSettings(environment="prod", api_keys=keys)).check()
-    Settings(
-        service=ServiceSettings(environment="prod", api_keys=keys),
-        webhooks=WebhookSettings(signing_secret="s3cret"),
-    ).check()
+        Settings(service=ServiceSettings(environment="prod")).check()
 
 
 def test_credentials_parse_from_the_environment(monkeypatch) -> None:

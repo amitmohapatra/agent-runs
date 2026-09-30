@@ -58,6 +58,7 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
+| `POST/GET /v1/webhooks` · `DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
 
 ## The ticker
 
@@ -70,7 +71,9 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 2. **Leases.** A `RUNNING` run whose lease lapsed goes back to `QUEUED` as the next attempt,
    or ends in `ERROR` after `MAX_ATTEMPTS`.
 3. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
-   (once) or ends in `TIMEOUT`, with a webhook either way.
+   (once) or ends in `TIMEOUT`, with a webhook event either way.
+4. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
+   then removed, or rescheduled with backoff.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
 (the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
@@ -86,13 +89,14 @@ for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with 
 
 ## Webhooks
 
-A run started (or scheduled) with a `webhook_url` is announced when it pauses
-(`run.paused`), is escalated (`run.escalated`) or ends (`run.finished`). The envelope and the
-signature are the Memory Service's: `X-Trellis-Signature: t=<unix seconds>,v1=<hex
-hmac-sha256 of "<t>.<body>">`, with `X-Trellis-Event` and `X-Trellis-Delivery`, so one
-receiver verifies both with `trellis.memory.webhooks.verify_signature`. Deliveries are
-retried with the service's backoff, off the request path, at least once; `event_id` is
-stable per event, so a receiver drops repeats.
+A tenant subscribes URLs to run events (`POST /v1/webhooks`: `run.paused`,
+`run.escalated`, `run.finished`); each subscription has its own secret, shown once. An event
+is written to an outbox in the transaction of the run change that caused it and the ticker
+sends it, retried with the service's backoff, at least once. The envelope and the signature
+are the Memory Service's: `X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of
+"<t>.<body>">`, with `X-Trellis-Event` and `X-Trellis-Delivery`, so one receiver verifies
+both with `trellis.memory.webhooks.verify_signature`; `event_id` is stable per event, so a
+receiver drops repeats.
 
 ## Run it
 

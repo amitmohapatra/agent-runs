@@ -3,7 +3,10 @@
 1. fire every due schedule (one ``SKIP LOCKED`` claim at a time, each in its own transaction,
    queueing its run idempotently on ``(schedule_id, fire_time)``);
 2. put runs whose lease lapsed back on the queue (or fail them after ``MAX_ATTEMPTS``);
-3. escalate or time out interrupts past their deadline.
+3. escalate or time out interrupts past their deadline;
+4. send the webhook deliveries that are due from the outbox (one attempt each).
+
+Steps 2 and 3 write the webhook events they cause into the outbox in their own transaction.
 
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
@@ -37,12 +40,14 @@ from agent_runs.config.constants import (
 )
 from agent_runs.config.settings import get_settings
 from agent_runs.domain.schedules import FireFailed
+from agent_runs.domain.webhooks import WebhookEvent
 from agent_runs.firing import Firing
 from agent_runs.observability.logging import configure_logging
 from agent_runs.retry import Breaker
 from agent_runs.store.database import connect
 from agent_runs.store.runs import RunStore
-from agent_runs.webhooks import WebhookEvent, WebhookSender
+from agent_runs.store.webhooks import WebhookStore
+from agent_runs.webhooks import WebhookSender
 
 log = structlog.get_logger(__name__)
 
@@ -54,6 +59,7 @@ class TickReport:
     fired: int = 0
     requeued: int = 0
     escalated: int = 0
+    sent: int = 0
 
 
 class Ticker:
@@ -82,6 +88,7 @@ class Ticker:
                 fired=await self._fire_due(now),
                 requeued=await self._requeue_lapsed(now),
                 escalated=await self._escalate_overdue(now),
+                sent=await self._send_webhooks(now),
             )
         except (DBAPIError, OSError) as exc:
             self.breaker.record_failure(now)
@@ -111,20 +118,37 @@ class Ticker:
     async def _requeue_lapsed(self, now: datetime) -> int:
         async with self._sessions() as db:
             moved = await RunStore(db).requeue_lapsed(now=now, limit=SWEEP_BATCH)
+            for run in moved:
+                await WebhookStore(db).announce(run, now=now)
             await db.commit()
-        for run in moved:
-            self._webhooks.notify(run)
         return len(moved)
 
     async def _escalate_overdue(self, now: datetime) -> int:
         async with self._sessions() as db:
             moved = await RunStore(db).escalate_overdue(now=now, limit=SWEEP_BATCH)
+            for run in moved:
+                event = WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
+                await WebhookStore(db).announce(run, event, now=now)
             await db.commit()
-        for run in moved:
-            self._webhooks.notify(
-                run, WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
-            )
         return len(moved)
+
+    async def _send_webhooks(self, now: datetime) -> int:
+        """Hold the due deliveries (a short transaction), send them concurrently with no
+        transaction open, then settle each: gone once accepted or given up, else backing
+        off. Returns how many were accepted."""
+        async with self._sessions() as db:
+            due = await WebhookStore(db).claim_due(now=now, limit=SWEEP_BATCH)
+            await db.commit()
+        if not due:
+            return 0
+        retries = await self._webhooks.send_all(due)
+        async with self._sessions() as db:
+            store = WebhookStore(db)
+            for delivery, retry in zip(due, retries, strict=True):
+                if not await store.settle(delivery, retry=retry, now=now) and retry:
+                    log.warning("webhook.gave_up", event_id=delivery.payload["event_id"])
+            await db.commit()
+        return retries.count(False)
 
     def beat(self) -> None:
         """Record that the loop came round. Never raises: a full disk on the liveness file
@@ -154,9 +178,7 @@ async def run() -> None:
         level=settings.observability.log_level, json_output=settings.observability.log_json
     )
     engine = await connect(settings.database)
-    webhooks = WebhookSender(
-        secret=settings.webhooks.signing_secret, allow_http=settings.service.is_dev
-    )
+    webhooks = WebhookSender(allow_http=settings.service.is_dev)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

@@ -132,8 +132,8 @@ async def test_two_tickers_on_one_tick_queue_one_run(app, client, tmp_path) -> N
         "schedule_id"
     ]
     await arm(app, sid, datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5))
-    one = Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "a")
-    two = Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "b")
+    one = Ticker(app.state.sessions, sender(Receiver()), heartbeat_path=tmp_path / "a")
+    two = Ticker(app.state.sessions, sender(Receiver()), heartbeat_path=tmp_path / "b")
     reports = await asyncio.gather(one.tick(), two.tick())
     assert sum(r.fired for r in reports) == 1
     assert len(await queued_runs(app)) == 1
@@ -156,21 +156,19 @@ async def test_a_fire_repeated_for_the_same_tick_finds_the_same_run(app, client,
 async def test_one_tick_requeues_lapsed_leases_and_escalates_with_webhooks(
     app, client, ticker, receiver
 ) -> None:
-    hook = {"webhook_url": "https://ui.example/h"}
-    await client.post("/v1/runs", json=started(queue=True, **hook))
+    hook = {"url": "https://ui.example/h", "events": ["run.escalated", "run.finished"]}
+    assert (await client.post("/v1/webhooks", json=hook)).status_code == 201
+    await client.post("/v1/runs", json=started(queue=True))
     claim = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 5}
     leased = (await client.post("/v1/runs/claim", json=claim)).json()["run"]["run_id"]
 
-    waiting = (await client.post("/v1/runs", json=started(**hook))).json()["run_id"]
+    waiting = (await client.post("/v1/runs", json=started())).json()["run_id"]
     body = pause(
         waiting, assignee="user:u1", deadline=at(1).isoformat(), escalate_to="role:managers"
     )
     await client.post(f"/v1/runs/{waiting}/pause", json=body)
-    receiver.received.clear()
 
     report = await ticker.tick(now=at(2))
-    assert (report.requeued, report.escalated) == (1, 1)
+    assert (report.requeued, report.escalated, report.sent) == (1, 1, 1)
     assert (await client.get(f"/v1/runs/{leased}")).json()["status"] == "QUEUED"
-
-    await app.state.webhooks.aclose()
     assert [e["type"] for e in receiver.events()] == ["run.escalated"]

@@ -1,4 +1,4 @@
-"""Request-scoped dependencies: a session, who is calling, and the webhook sender."""
+"""Request-scoped dependencies: a session, and who is calling."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent_runs.config.constants import HEADER_API_KEY, HEADER_TENANT
 from agent_runs.config.settings import Credential, Settings
 from agent_runs.domain.errors import BadRequest, Forbidden, Unauthorized
-from agent_runs.webhooks import WebhookSender
 
 
 @dataclass(frozen=True)
@@ -64,10 +63,5 @@ def caller(
     return Caller(credential, credential.tenant_id)
 
 
-def webhooks(request: Request) -> WebhookSender:
-    return request.app.state.webhooks
-
-
 Session = Annotated[AsyncSession, Depends(session)]
 Who = Annotated[Caller, Depends(caller)]
-Webhooks = Annotated[WebhookSender, Depends(webhooks)]

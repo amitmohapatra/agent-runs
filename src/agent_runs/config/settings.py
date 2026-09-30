@@ -41,7 +41,7 @@ def _dev_credentials() -> dict[str, Credential]:
 class ServiceSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8090
-    #: Anything but "dev" refuses the dev credential, unsigned webhooks and plain-http hooks.
+    #: Anything but "dev" refuses the dev credential and plain-http webhook URLs.
     environment: str = DEV
     api_keys: dict[str, Credential] = Field(default_factory=_dev_credentials)
 
@@ -53,11 +53,6 @@ class ServiceSettings(BaseModel):
 class DatabaseSettings(BaseModel):
     url: str = "postgresql+psycopg://memory:memory@localhost:5432/agent_runs"
     pool_size: int = 10
-
-
-class WebhookSettings(BaseModel):
-    #: Signs every delivery (``X-Trellis-Signature``). Required outside dev.
-    signing_secret: str = ""
 
 
 class ObservabilitySettings(BaseModel):
@@ -72,7 +67,6 @@ class Settings(BaseSettings):
 
     service: ServiceSettings = ServiceSettings()
     database: DatabaseSettings = DatabaseSettings()
-    webhooks: WebhookSettings = WebhookSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
 
     def check(self) -> None:
@@ -85,11 +79,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "the development credential is still configured outside dev: "
                 "issue real keys in service.api_keys"
-            )
-        if not self.webhooks.signing_secret:
-            raise ValueError(
-                "webhooks.signing_secret is empty outside dev: a receiver could not tell a "
-                "notification from this service from anything else that reaches its URL"
             )
 
 

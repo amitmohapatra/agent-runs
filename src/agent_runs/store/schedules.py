@@ -35,13 +35,15 @@ from agent_runs.config.constants import (
     MAX_CONSECUTIVE_FAILURES,
 )
 from agent_runs.domain.cadence import next_fire_at, validate_cadence
-from agent_runs.domain.errors import NotFound, Unprocessable
+from agent_runs.domain.errors import WEBHOOK_URL_REFUSED, NotFound, Unprocessable
 from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
 from agent_runs.store.tables import ScheduleRow
 
-_SPEC_FIELDS = tuple(ScheduleSpec.model_fields)
-_RECORD_FIELDS = tuple(name for name in Schedule.model_fields if name != "metadata")
+#: ``webhook_url`` is refused: notifications are tenant subscriptions (``/v1/webhooks``)
+_UNKEPT = frozenset({"metadata", "webhook_url"})
+_SPEC_FIELDS = tuple(name for name in ScheduleSpec.model_fields if name not in _UNKEPT)
+_RECORD_FIELDS = tuple(name for name in Schedule.model_fields if name not in _UNKEPT)
 
 
 def _schedule(row: ScheduleRow) -> Schedule:
@@ -55,6 +57,8 @@ def _checked(fields: dict[str, Any]) -> ScheduleSpec:
         spec = ScheduleSpec.model_validate(fields)
     except ValidationError as exc:
         raise Unprocessable(str(exc)) from exc
+    if spec.webhook_url is not None:
+        raise Unprocessable(WEBHOOK_URL_REFUSED)
     return spec.model_copy(update={"cadence": validate_cadence(spec.cadence)})
 
 
@@ -63,8 +67,7 @@ _IDENTITY = ("tenant_id", "agent_id", "on_behalf_of", "cadence", "input_sha256")
 
 def _apply(row: ScheduleRow, spec: ScheduleSpec) -> None:
     for name in _SPEC_FIELDS:
-        if name != "metadata":
-            setattr(row, name, getattr(spec, name))
+        setattr(row, name, getattr(spec, name))
     row.schedule_metadata = spec.metadata or None
     row.input_sha256 = input_sha256(spec.input)
 
@@ -162,7 +165,7 @@ class ScheduleStore:
         changes = change.model_dump(exclude_unset=True)
         if "metadata" in changes:
             changes["metadata"] = {**(row.schedule_metadata or {}), **(changes["metadata"] or {})}
-        current = {name: getattr(row, name) for name in _SPEC_FIELDS if name != "metadata"}
+        current = {name: getattr(row, name) for name in _SPEC_FIELDS}
         spec = _checked({**current, "metadata": row.schedule_metadata or {}, **changes})
         retimed = (spec.cadence, spec.timezone) != (row.cadence, row.timezone)
         re_enabled = spec.enabled and not row.enabled

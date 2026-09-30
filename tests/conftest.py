@@ -110,17 +110,16 @@ async def app(migrated: None, receiver: Receiver) -> AsyncIterator[Any]:
     application = create_app(SETTINGS)
     async with application.router.lifespan_context(application):
         async with application.state.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE agent_runs, agent_schedules"))
-        await application.state.webhooks.aclose()
-        application.state.webhooks = sender(receiver, secret="s3cret")
+            await conn.execute(
+                text("TRUNCATE agent_runs, agent_schedules, webhooks, webhook_deliveries")
+            )
         yield application
 
 
-def sender(receiver: Receiver, **kwargs: Any) -> WebhookSender:
-    """The service's sender, delivering to ``receiver`` without waiting between retries."""
+def sender(receiver: Receiver, *, allow_http: bool = True) -> WebhookSender:
+    """The ticker's sender, delivering to ``receiver``."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle))
-    options = {"secret": "", "allow_http": True, "retry_base": timedelta(0), **kwargs}
-    return WebhookSender(client=client, **options)
+    return WebhookSender(client=client, allow_http=allow_http)
 
 
 def _client(app: Any, key: str, **headers: str) -> AsyncClient:
@@ -220,9 +219,11 @@ def scheduled(**over: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def ticker(app: Any, tmp_path: Any) -> Ticker:
-    """The real ticker over the app's database and webhook sender."""
-    return Ticker(app.state.sessions, app.state.webhooks, heartbeat_path=tmp_path / "beat")
+async def ticker(app: Any, receiver: Receiver, tmp_path: Any) -> AsyncIterator[Ticker]:
+    """The real ticker over the app's database, sending webhooks to ``receiver``."""
+    hooks = sender(receiver)
+    yield Ticker(app.state.sessions, hooks, heartbeat_path=tmp_path / "beat")
+    await hooks.aclose()
 
 
 async def queued_runs(app: Any) -> list[dict[str, Any]]:
