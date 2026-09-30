@@ -8,10 +8,10 @@ from datetime import timedelta
 
 from trellis.contracts.ids import now
 
-from agent_runs.config.constants import MAX_ATTEMPTS
+from agent_runs.config.constants import MAX_ATTEMPTS, MAX_CHECKPOINT_BYTES
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore
-from tests.conftest import interrupt, resolution, started
+from tests.conftest import pause, resolution, started
 
 
 def claim(worker: str = "w1", agents: tuple[str, ...] = ("triage",), lease: int = 30) -> dict:
@@ -171,7 +171,7 @@ async def test_a_durable_run_resumes_onto_the_queue(client) -> None:
     await queued(client)
     rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
     paused = (
-        await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=interrupt(rid))
+        await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=pause(rid))
     ).json()
     assert paused["status"] == "PAUSED"
 
@@ -186,3 +186,103 @@ async def test_a_queued_run_can_be_cancelled_before_anyone_claims_it(client) -> 
     cancelled = await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "CANCELLED"})
     assert cancelled.status_code == 200
     assert (await client.post("/v1/runs/claim", json=claim())).status_code == 204
+
+
+# ------------------------------------------------------------------ the executor's checkpoint
+
+_JOURNAL = {
+    "asks": {"ask_1": "yes"},
+    "tools": {"sha256:9f2c": {"output": {"po": "PO-7"}}},
+    "framework": {"langgraph": {"interrupt_id": "lg_1"}},
+}
+
+
+async def _claimed_and_paused(client, checkpoint=_JOURNAL) -> dict:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    response = await client.post(
+        f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=pause(rid, checkpoint)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def test_a_pause_keeps_the_checkpoint_for_the_worker_that_resumes(client) -> None:
+    """Paused by one worker, resumed by another: the second gets the first's journal, so it
+    repeats no side effect."""
+    paused = await _claimed_and_paused(client)
+    rid = paused["run_id"]
+    assert paused["checkpoint"] == _JOURNAL
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == _JOURNAL
+    [listed] = (await client.get("/v1/runs", params={"status": "PAUSED"})).json()
+    assert listed["checkpoint"] == _JOURNAL
+
+    resumed = (await client.post(f"/v1/runs/{rid}/resume", json=resolution(paused))).json()
+    assert (resumed["status"], resumed["checkpoint"]) == ("QUEUED", _JOURNAL)
+    again = (await client.post("/v1/runs/claim", json=claim("w2"))).json()
+    assert again["run"]["checkpoint"] == _JOURNAL
+    assert again["run"]["last_resolution"]["decision"] == "APPROVE"
+
+
+async def test_a_later_pause_replaces_the_checkpoint(client) -> None:
+    paused = await _claimed_and_paused(client)
+    rid = paused["run_id"]
+    await client.post(f"/v1/runs/{rid}/resume", json=resolution(paused))
+    await client.post("/v1/runs/claim", json=claim("w2"))
+    newer = {"asks": {"ask_1": "yes", "ask_2": "no"}}
+    repaused = await client.post(
+        f"/v1/runs/{rid}/pause", params={"worker_id": "w2"}, json=pause(rid, newer)
+    )
+    assert repaused.json()["checkpoint"] == newer
+
+
+async def test_finishing_clears_the_checkpoint(client) -> None:
+    paused = await _claimed_and_paused(client)
+    rid = paused["run_id"]
+    await client.post(f"/v1/runs/{rid}/resume", json=resolution(paused))
+    await client.post("/v1/runs/claim", json=claim("w2"))
+    done = await client.post(
+        f"/v1/runs/{rid}/finish", params={"worker_id": "w2"}, json={"status": "SUCCESS"}
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["checkpoint"] is None
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] is None
+
+
+async def test_cancelling_a_paused_run_clears_the_checkpoint(client) -> None:
+    paused = await _claimed_and_paused(client)
+    cancelled = await client.post(
+        f"/v1/runs/{paused['run_id']}/resume", json=resolution(paused, "CANCEL")
+    )
+    assert (cancelled.json()["status"], cancelled.json()["checkpoint"]) == ("CANCELLED", None)
+
+
+async def test_a_checkpoint_past_the_bound_is_refused_and_nothing_moves(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    huge = {"blob": "x" * MAX_CHECKPOINT_BYTES}
+    refused = await client.post(
+        f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=pause(rid, huge)
+    )
+    assert refused.status_code == 413
+    run = (await client.get(f"/v1/runs/{rid}")).json()
+    assert (run["status"], run["checkpoint"]) == ("RUNNING", None)
+
+
+async def test_a_worker_without_the_lease_cannot_write_a_checkpoint(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    fenced = await client.post(
+        f"/v1/runs/{rid}/pause", params={"worker_id": "w2"}, json=pause(rid, _JOURNAL)
+    )
+    assert fenced.status_code == 409
+    run = (await client.get(f"/v1/runs/{rid}")).json()
+    assert (run["status"], run["checkpoint"]) == ("RUNNING", None)
+
+
+async def test_a_bare_interrupt_is_no_longer_a_pause_body(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    bare = pause(rid)["interrupt"]
+    response = await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=bare)
+    assert response.status_code == 422

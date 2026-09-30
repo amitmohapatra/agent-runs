@@ -38,6 +38,8 @@ class RunRow(Base):
     awaiting: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the InterruptResolution the last resume carried
     last_resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: the executor's opaque resume state, written at pause and cleared when the run finishes
+    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: denormalised from ``awaiting`` for the inbox and the escalation sweep
     assignee: Mapped[str | None] = mapped_column(String(256))
     awaiting_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

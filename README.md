@@ -25,7 +25,7 @@ stateDiagram-v2
   [*] --> RUNNING: POST /v1/runs
   QUEUED --> RUNNING: claim (a worker, under a lease)
   RUNNING --> QUEUED: lease lapsed (ticker, attempt + 1)
-  RUNNING --> PAUSED: pause (Interrupt)
+  RUNNING --> PAUSED: pause (Interrupt, checkpoint)
   PAUSED --> RUNNING: resume (in-process run, attempt + 1)
   PAUSED --> QUEUED: resume (queued run, attempt + 1)
   PAUSED --> PAUSED: deadline passed, escalate_to (ticker)
@@ -50,7 +50,7 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
 | `POST /v1/runs/{id}/heartbeat` | extend the lease; `409` = lease lost, stop |
-| `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation) |
+| `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
 | `GET /v1/runs/{id}` · `GET /v1/runs/{id}/lineage` | one run · it and its ancestors |

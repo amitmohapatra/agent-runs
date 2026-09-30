@@ -10,7 +10,7 @@ from sqlalchemy import text
 from trellis.contracts.runs import RunStart
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import interrupt, paused, resolution, started
+from tests.conftest import interrupt, pause, paused, resolution, started
 
 
 async def test_a_run_starts_running_and_comes_back_by_id(client) -> None:
@@ -89,7 +89,7 @@ async def test_concurrent_starts_on_one_key_make_one_run_and_no_error(app) -> No
 
 async def test_a_run_pauses_on_a_typed_interrupt_and_lands_in_the_assignees_inbox(client) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
-    body = interrupt(run["run_id"], assignee="role:procurement", ui="table")
+    body = pause(run["run_id"], assignee="role:procurement", ui="table")
     response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)
     assert response.status_code == 200, response.text
     record = response.json()
@@ -108,13 +108,13 @@ async def test_a_run_pauses_on_a_typed_interrupt_and_lands_in_the_assignees_inbo
 async def test_an_interrupt_for_another_run_is_refused(client) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
     other = (await client.post("/v1/runs", json=started())).json()
-    refused = await client.post(f"/v1/runs/{run['run_id']}/pause", json=interrupt(other["run_id"]))
+    refused = await client.post(f"/v1/runs/{run['run_id']}/pause", json=pause(other["run_id"]))
     assert refused.status_code == 422
 
 
 async def test_an_invalid_interrupt_is_refused_by_the_contract(client) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
-    body = {**interrupt(run["run_id"]), "reason": "CHOICE"}  # CHOICE needs options
+    body = {"interrupt": {**interrupt(run["run_id"]), "reason": "CHOICE"}}  # needs options
     assert (await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)).status_code == 422
 
 

@@ -8,7 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Response
 from trellis.contracts.ids import now
-from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStatus
+from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
 from agent_runs.api.deps import Session, Webhooks, Who
 from agent_runs.config.constants import DEFAULT_PAGE, MAX_PAGE
@@ -19,6 +19,7 @@ from agent_runs.domain.runs import (
     Lease,
     RunCreate,
     RunFinish,
+    RunPause,
 )
 from agent_runs.store.runs import RunStore
 
@@ -65,9 +66,10 @@ async def heartbeat(run_id: str, body: HeartbeatRequest, db: Session, who: Who) 
 
 @router.post("/{run_id}/pause")
 async def pause(
-    run_id: str, body: Interrupt, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
+    run_id: str, body: RunPause, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
 ) -> RunRecord:
-    """The run waits on ``body`` (``awaiting``); its ``assignee`` puts it in that inbox."""
+    """The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that
+    inbox. ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound)."""
     run = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
     await db.commit()
     hooks.notify(run)

@@ -14,7 +14,7 @@ from agent_runs.config.constants import BREAKER_COOLDOWN, BREAKER_THRESHOLD
 from agent_runs.heartbeat import alive
 from agent_runs.retry import Breaker, backoff
 from agent_runs.ticker import Ticker
-from tests.conftest import Receiver, arm, at, interrupt, queued_runs, scheduled, sender, started
+from tests.conftest import Receiver, arm, at, pause, queued_runs, scheduled, sender, started
 
 NOW = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
 
@@ -162,7 +162,7 @@ async def test_one_tick_requeues_lapsed_leases_and_escalates_with_webhooks(
     leased = (await client.post("/v1/runs/claim", json=claim)).json()["run"]["run_id"]
 
     waiting = (await client.post("/v1/runs", json=started(**hook))).json()["run_id"]
-    body = interrupt(
+    body = pause(
         waiting, assignee="user:u1", deadline=at(1).isoformat(), escalate_to="role:managers"
     )
     await client.post(f"/v1/runs/{waiting}/pause", json=body)

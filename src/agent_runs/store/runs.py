@@ -28,7 +28,14 @@ from trellis.contracts.runs import (
 
 from agent_runs.config.constants import DEFAULT_PAGE, MAX_ATTEMPTS, MAX_LINEAGE
 from agent_runs.domain.errors import Conflict, NotFound, Unprocessable
-from agent_runs.domain.runs import Claimed, ClaimRequest, HeartbeatRequest, Lease, RunFinish
+from agent_runs.domain.runs import (
+    Claimed,
+    ClaimRequest,
+    HeartbeatRequest,
+    Lease,
+    RunFinish,
+    RunPause,
+)
 from agent_runs.store.tables import RunRow
 
 _RECORD_FIELDS = (
@@ -46,6 +53,7 @@ _RECORD_FIELDS = (
     "error",
     "awaiting",
     "last_resolution",
+    "checkpoint",
     "attempt",
     "deadline",
     "idempotency_key",
@@ -65,7 +73,8 @@ def _json(model: Any) -> dict[str, Any] | None:
 
 
 def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
-    """The one transition check. Leaving RUNNING or PAUSED clears what belonged to it."""
+    """The one transition check. Leaving RUNNING or PAUSED clears what belonged to it; an
+    ending clears the checkpoint, which only a run that may still continue needs."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
     row.status = to.value
@@ -74,6 +83,8 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
         row.lease_owner = row.lease_expires_at = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.assignee = row.awaiting_deadline = None
+    if to.final:
+        row.checkpoint = None
 
 
 def _requeue(row: RunRow, now: datetime) -> None:
@@ -145,15 +156,18 @@ class RunStore:
         self,
         tenant_id: str,
         run_id: str,
-        interrupt: Interrupt,
+        pause: RunPause,
         *,
         worker_id: str | None,
         now: datetime,
     ) -> RunRecord:
+        interrupt = pause.interrupt
         if (interrupt.tenant_id, interrupt.run_id) != (tenant_id, run_id):
             raise Unprocessable("the interrupt belongs to another run")
+        checkpoint = pause.bounded_checkpoint()
         row = await self._locked(tenant_id, run_id, worker_id=worker_id)
         _move(row, RunStatus.PAUSED, now)
+        row.checkpoint = checkpoint
         row.awaiting = interrupt.awaiting()
         row.assignee = interrupt.assignee
         row.awaiting_deadline = interrupt.deadline

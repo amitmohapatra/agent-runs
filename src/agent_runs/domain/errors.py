@@ -11,6 +11,7 @@ _UNAUTHORIZED = 401
 _FORBIDDEN = 403
 _NOT_FOUND = 404
 _CONFLICT = 409
+_TOO_LARGE = 413
 _UNPROCESSABLE = 422
 _UNAVAILABLE = 503
 
@@ -45,6 +46,10 @@ class Conflict(ServiceError):
     Usually a lost race or a repeat."""
 
     status_code = _CONFLICT
+
+
+class TooLarge(ServiceError):
+    status_code = _TOO_LARGE
 
 
 class Unprocessable(ServiceError):

@@ -177,10 +177,18 @@ def resolution(run: dict[str, Any], decision: str = "APPROVE", **over: Any) -> d
     ).model_dump(mode="json")
 
 
+def pause(run_id: str, checkpoint: dict[str, Any] | None = None, **over: Any) -> dict[str, Any]:
+    """A pause body: the interrupt, and the executor's checkpoint when there is one."""
+    body: dict[str, Any] = {"interrupt": interrupt(run_id, **over)}
+    if checkpoint is not None:
+        body["checkpoint"] = checkpoint
+    return body
+
+
 async def paused(client: AsyncClient, **over: Any) -> dict[str, Any]:
     """A run that is waiting on a person."""
     run = (await client.post("/v1/runs", json=started(**over))).json()
-    response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=interrupt(run["run_id"]))
+    response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=pause(run["run_id"]))
     assert response.status_code == 200, response.text
     return response.json()
 

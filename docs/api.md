@@ -12,6 +12,7 @@ Errors answer `{"detail": ...}`.
 | `403` | the body or header names another tenant, or `on_behalf_of` the key may not act as |
 | `404` | no such run or schedule in this tenant |
 | `409` | the record is not in a state that allows it: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken name or run id |
+| `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON |
 | `422` | the body is invalid (including the contracts' own validators) |
 | `503` | a schedule fire could not queue its run (recorded on the schedule) |
 
@@ -65,18 +66,29 @@ write to it**. Heartbeat well inside the lease (every third of it).
 
 ### `POST /v1/runs/{id}/pause?worker_id=` → `200 RunRecord`
 
-Body: an `Interrupt` whose `tenant_id` and `run_id` are this run's (`422` otherwise):
+Body: the `Interrupt` the run waits on, whose `tenant_id` and `run_id` are this run's (`422`
+otherwise), and optionally the executor's `checkpoint`:
 
 ```json
-{"interrupt_id": "int_…", "tenant_id": "acme", "run_id": "run_…", "reason": "APPROVAL",
- "question": "Create PO for 12 000 EUR?", "ui": "approve", "expects": null, "options": [],
- "payload": null, "payload_ref": null, "tool_call": {…}, "assignee": "role:procurement",
- "deadline": "2026-10-01T09:00:00Z", "escalate_to": "role:finance-leads"}
+{"interrupt": {"interrupt_id": "int_…", "tenant_id": "acme", "run_id": "run_…",
+               "reason": "APPROVAL", "question": "Create PO for 12 000 EUR?", "ui": "approve",
+               "expects": null, "options": [], "payload": null, "payload_ref": null,
+               "tool_call": {…}, "assignee": "role:procurement",
+               "deadline": "2026-10-01T09:00:00Z", "escalate_to": "role:finance-leads"},
+ "checkpoint": {"asks": {…}, "tools": {…}, "framework": {…}}}
 ```
 
 `RUNNING → PAUSED`. The interrupt is kept as `awaiting`; `assignee` and `deadline` are
 indexed for the inbox and the escalation sweep. Announced as `run.paused`. The lease ends:
 a worker pausing a run lets go of it.
+
+`checkpoint` is any JSON object, opaque to the service: the executor's resume journal
+(answered asks, completed tool outputs) and the framework's own resume state (a LangGraph
+interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.checkpoint` on
+every read, resume and claim, so whichever worker resumes the run repeats no side effect.
+Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` answer, a
+`TIMEOUT`, a run failed after `MAX_ATTEMPTS`) clears it. Larger than 1 MiB as compact JSON
+(`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. Heartbeats do not carry one.
 
 `worker_id` (query, optional, also on `finish`) fences the write: when given, the write is
 refused with `409` unless that worker still holds the run's lease. Workers always send it,

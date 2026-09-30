@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import at, interrupt, started
+from tests.conftest import at, pause, started
 
 
 async def _paused(client, **fields) -> dict:
     run = (await client.post("/v1/runs", json=started())).json()
-    body = interrupt(run["run_id"], **fields)
+    body = pause(run["run_id"], **fields)
     return (await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)).json()
 
 

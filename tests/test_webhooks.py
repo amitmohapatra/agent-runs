@@ -13,7 +13,7 @@ import pytest
 from trellis.contracts.runs import RunRecord, RunStatus
 
 from agent_runs.webhooks import WebhookEvent, WebhookSender, envelope, event_of, sign
-from tests.conftest import Receiver, interrupt, sender, started
+from tests.conftest import Receiver, pause, sender, started
 
 
 def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
@@ -126,7 +126,7 @@ async def test_plain_http_is_refused_outside_dev() -> None:
 async def test_a_pause_through_the_api_notifies_the_start_url(client, receiver) -> None:
     run = (await client.post("/v1/runs", json=started(webhook_url="https://ui.example/h"))).json()
     await client.post(
-        f"/v1/runs/{run['run_id']}/pause", json=interrupt(run["run_id"], assignee="user:u1")
+        f"/v1/runs/{run['run_id']}/pause", json=pause(run["run_id"], assignee="user:u1")
     )
     for _ in range(50):
         if receiver.received:

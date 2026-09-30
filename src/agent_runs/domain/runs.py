@@ -1,22 +1,25 @@
 """The run requests the contracts cannot express. A run *is* the contracts' ``RunRecord``,
 started from a ``RunStart``, paused with an ``Interrupt`` and resumed with an
-``InterruptResolution``; what is here is only the service's own verbs: queueing, finishing,
-claiming and heartbeating a lease.
+``InterruptResolution``; what is here is only the service's own verbs: queueing, pausing with
+a checkpoint, finishing, claiming and heartbeating a lease.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from trellis.contracts.errors import AgentError
-from trellis.contracts.runs import RunRecord, RunStart, RunStatus
+from trellis.contracts.runs import Interrupt, RunRecord, RunStart, RunStatus
 
 from agent_runs.config.constants import (
     DEFAULT_LEASE_SECONDS,
+    MAX_CHECKPOINT_BYTES,
     MAX_LEASE_SECONDS,
     MIN_LEASE_SECONDS,
 )
+from agent_runs.domain.errors import TooLarge
 
 WorkerId = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
 LeaseSeconds = Annotated[int, Field(ge=MIN_LEASE_SECONDS, le=MAX_LEASE_SECONDS)]
@@ -30,6 +33,28 @@ class RunCreate(RunStart):
 
     def start(self) -> RunStart:
         return RunStart.model_validate(self.model_dump(exclude={"queue"}))
+
+
+class RunPause(BaseModel):
+    """What a run waits on, and the executor's opaque ``checkpoint`` (its resume journal and
+    the framework's own resume state) for whichever worker resumes it. The checkpoint
+    replaces any earlier one and is cleared when the run finishes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interrupt: Interrupt
+    checkpoint: dict[str, Any] | None = None
+
+    def bounded_checkpoint(self) -> dict[str, Any] | None:
+        """The checkpoint, refused (413) past ``MAX_CHECKPOINT_BYTES`` of compact JSON."""
+        if self.checkpoint is None:
+            return None
+        size = len(json.dumps(self.checkpoint, separators=(",", ":"), ensure_ascii=False).encode())
+        if size > MAX_CHECKPOINT_BYTES:
+            raise TooLarge(
+                f"checkpoint is {size} bytes; the most a pause carries is {MAX_CHECKPOINT_BYTES}"
+            )
+        return self.checkpoint
 
 
 class RunFinish(BaseModel):
