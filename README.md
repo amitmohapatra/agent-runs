@@ -81,9 +81,11 @@ check (a heartbeat file touched after every tick).
 
 ## Authentication
 
-One scheme. `X-Api-Key` is the caller; its credential (in `RUNS__SERVICE__API_KEYS`) names
-the tenant it speaks for, the principal recorded as `created_by`, and the principals it may
-put in `on_behalf_of`. A platform key has no tenant of its own and names the tenant it acts
+One scheme, one key system. `X-Api-Key` is a key issued by the Memory Service; agent-runs
+introspects it there (`GET {RUNS__MEMORY__URL}/v1/keys/self`, cached 60 s, refusals 10 s)
+and learns the tenant it speaks for, the principal recorded as `created_by`, and the
+principals it may put in `on_behalf_of`. The contract is in
+[docs/api.md](docs/api.md#authentication). A platform key has no tenant of its own and names the tenant it acts
 for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with itself
 (`403` otherwise).
 
@@ -100,7 +102,8 @@ receiver drops repeats.
 
 ## Run it
 
-Needs PostgreSQL and a checkout of `agent-contracts` next to this one (a path dependency).
+Needs PostgreSQL, the Memory Service (the key registry, `RUNS__MEMORY__URL`) and a checkout
+of `agent-contracts` next to this one (a path dependency).
 
 ```bash
 make install                 # uv sync, trellis-contracts from ../agent-contracts
@@ -121,5 +124,6 @@ make lint typecheck test
 ```
 
 The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
-and recreated per run) and skips with a reason when there is none. Migrations live in
+and recreated per run) and skips with a reason when there is none. The key registry is a
+fake (`tests/conftest.py`, `FakeMemory`, a tiny ASGI app answering `/v1/keys/self`). Migrations live in
 `alembic/versions`; a test checks they build exactly the schema the code maps.

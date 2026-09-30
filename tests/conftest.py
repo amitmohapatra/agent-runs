@@ -19,13 +19,8 @@ from sqlalchemy.exc import DataError, OperationalError
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
 
 from agent_runs.api.app import create_app
-from agent_runs.config.settings import (
-    Credential,
-    DatabaseSettings,
-    ServiceSettings,
-    Settings,
-    reset_settings_cache,
-)
+from agent_runs.config.settings import DatabaseSettings, Settings, reset_settings_cache
+from agent_runs.keys import KeyRegistry
 from agent_runs.store.database import ALEMBIC_INI
 from agent_runs.store.runs import RunStore
 from agent_runs.ticker import Ticker
@@ -38,18 +33,88 @@ ADMIN_URL = os.environ.get(
 DB_NAME = os.environ.get("RUNS_TEST_DB", "agent_runs_tests")
 DB_URL = f"postgresql+psycopg://memory:memory@localhost:5432/{DB_NAME}"
 
-#: Each credential a different shape: a tenant service key that may act as anyone in acme,
-#: the same for globex (a different secret: one key for both tenants would let isolation
-#: tests pass by impersonation), an ordinary acme user, and a platform key with no tenant.
-CREDENTIALS = {
-    "dev-key": Credential(tenant_id="acme", principal="user_ada", may_act_as=("*",)),
-    "other-key": Credential(tenant_id="globex", principal="user_ada", may_act_as=("*",)),
-    "narrow-key": Credential(tenant_id="acme", principal="user_bob"),
-    "platform-key": Credential(tenant_id=None, principal="svc_worker", may_act_as=("*",)),
+#: What the fake key registry knows, as ``GET /v1/keys/self`` answers it. Each a different
+#: shape: a tenant service key that may act as anyone in acme, the same for globex (a
+#: different secret: one key for both tenants would let isolation tests pass by
+#: impersonation), an ordinary acme user, and a platform key with no tenant.
+KEYS: dict[str, dict[str, Any]] = {
+    "dev-key": {
+        "key_id": "key_dev",
+        "tenant_id": "acme",
+        "principal": "user_ada",
+        "role": "service",
+        "may_act_as": ["*"],
+    },
+    "other-key": {
+        "key_id": "key_other",
+        "tenant_id": "globex",
+        "principal": "user_ada",
+        "role": "service",
+        "may_act_as": ["*"],
+    },
+    "narrow-key": {
+        "key_id": "key_narrow",
+        "tenant_id": "acme",
+        "principal": "user_bob",
+        "role": "service",
+        "may_act_as": [],
+    },
+    "platform-key": {
+        "key_id": "key_platform",
+        "tenant_id": None,
+        "principal": "svc_worker",
+        "role": "platform",
+        "may_act_as": ["*"],
+    },
 }
-SETTINGS = Settings(
-    database=DatabaseSettings(url=DB_URL), service=ServiceSettings(api_keys=CREDENTIALS)
-)
+#: A key the registry knows but refuses (its tenant is suspended).
+SUSPENDED_KEY = "suspended-key"
+SETTINGS = Settings(database=DatabaseSettings(url=DB_URL))
+
+
+class FakeMemory:
+    """The Memory Service's key registry, as a tiny ASGI app: ``GET /v1/keys/self``
+    answers the ``X-Api-Key`` it is sent, and counts what it was asked."""
+
+    def __init__(self, keys: dict[str, dict[str, Any]] | None = None) -> None:
+        self.keys = dict(KEYS if keys is None else keys)
+        self.asked: list[str] = []
+        self.status: int | None = None  # force an answer (a registry that is down)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        import json
+
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        key = headers.get("x-api-key", "")
+        self.asked.append(key)
+        if scope["path"] != "/v1/keys/self" or scope["method"] != "GET":
+            status, body = 404, {"detail": "not found"}
+        elif self.status is not None:
+            status, body = self.status, {"detail": "forced"}
+        elif key == SUSPENDED_KEY:
+            status, body = 403, {"detail": "tenant is suspended"}
+        elif key in self.keys:
+            status, body = 200, self.keys[key]
+        else:
+            status, body = 401, {"detail": "unknown key"}
+        payload = json.dumps(body).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    def registry(self, **kwargs: Any) -> KeyRegistry:
+        client = httpx.AsyncClient(transport=ASGITransport(app=self), base_url="http://memory")
+        return KeyRegistry("http://memory", client=client, **kwargs)
+
+
+@pytest.fixture
+def memory() -> FakeMemory:
+    return FakeMemory()
 
 
 def _fresh_database() -> bool:
@@ -106,9 +171,11 @@ def receiver() -> Receiver:
 
 
 @pytest.fixture
-async def app(migrated: None, receiver: Receiver) -> AsyncIterator[Any]:
+async def app(migrated: None, memory: FakeMemory) -> AsyncIterator[Any]:
     application = create_app(SETTINGS)
     async with application.router.lifespan_context(application):
+        await application.state.keys.aclose()
+        application.state.keys = memory.registry()
         async with application.state.engine.begin() as conn:
             await conn.execute(
                 text("TRUNCATE agent_runs, agent_schedules, webhooks, webhook_deliveries")

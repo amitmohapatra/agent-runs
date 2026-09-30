@@ -1,6 +1,7 @@
 # agent-runs API (0.2.0)
 
-Every route needs `X-Api-Key`. A platform key (credential with `tenant_id: null`) also sends
+Every route needs `X-Api-Key`, a key issued by the Memory Service (the one key registry; see
+[Authentication](#authentication)). A platform key (`tenant_id: null`) also sends
 `X-Trellis-Tenant: <tenant>`; a tenant key may send it only with its own tenant. Bodies are
 JSON; the record types are `trellis.contracts.runs` models, serialised as pydantic does.
 Errors answer `{"detail": ...}`.
@@ -8,13 +9,54 @@ Errors answer `{"detail": ...}`.
 | Status | Means |
 |---|---|
 | `400` | a platform key named no tenant |
-| `401` | unknown or missing `X-Api-Key` |
-| `403` | the body or header names another tenant, or `on_behalf_of` the key may not act as |
+| `401` | missing `X-Api-Key`, or one the key registry does not know (or revoked, expired) |
+| `403` | the registry refuses the key (a suspended tenant), the body or header names another tenant, or `on_behalf_of` the key may not act as |
 | `404` | no such run, schedule or webhook in this tenant |
 | `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
 | `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON |
 | `422` | the body is invalid (including the contracts' own validators) |
-| `503` | a schedule fire could not queue its run (recorded on the schedule) |
+| `503` | the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule) |
+
+## Authentication
+
+agent-runs keeps no keys. It asks the Memory Service who a key is and caches the answer.
+
+### The introspection contract: `GET {RUNS__MEMORY__URL}/v1/keys/self`
+
+Request: the caller's key, unchanged, as the Memory Service authenticates any call:
+
+```
+GET /v1/keys/self
+X-Api-Key: <the key agent-runs was sent>
+```
+
+Answers (anything else, a timeout of 3 s or an unreachable service is `503` here, not cached):
+
+| Status | Body | agent-runs answers |
+|---|---|---|
+| `200` | `KeyInfo` (below) | the request proceeds as that key |
+| `401` | any | `401`: unknown, revoked or expired key |
+| `403` | any | `403`: a key the registry refuses (a suspended tenant) |
+
+```json
+{"key_id": "key_…", "tenant_id": "acme", "principal": "svc:harness", "role": "service",
+ "may_act_as": ["*"]}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `key_id` | string | the key's id (never the secret) |
+| `tenant_id` | string or `null` | the tenant the key speaks for; `null` for a platform key, which then names the tenant per request in `X-Trellis-Tenant` |
+| `principal` | string | who the caller is: recorded as `created_by` on schedules and webhooks, and a principal the key may always act as |
+| `role` | string | the registry's role (`platform`, `admin`, `service`, …); carried, not interpreted here |
+| `may_act_as` | array of strings | the principals the key may put in `on_behalf_of` (a run then executes as them); `"*"` is any principal of the tenant; empty means only `principal` |
+
+Other fields are ignored. A missing required field is a malformed answer (`503`).
+
+Caching (per process, keyed by the SHA-256 of the key; the key itself is not kept): a `200`
+answer for 60 s (`KEY_CACHE_SECONDS`, so a revocation takes effect here within a minute), a
+`401`/`403` answer for 10 s (`KEY_NEGATIVE_CACHE_SECONDS`), at most 10 000 keys (least
+recently used evicted).
 
 ## Runs
 

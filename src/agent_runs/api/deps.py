@@ -10,15 +10,15 @@ from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_runs.config.constants import HEADER_API_KEY, HEADER_TENANT
-from agent_runs.config.settings import Credential, Settings
 from agent_runs.domain.errors import BadRequest, Forbidden, Unauthorized
+from agent_runs.keys import KeyInfo, KeyRegistry
 
 
 @dataclass(frozen=True)
 class Caller:
     """The authenticated caller and the one tenant this request acts in."""
 
-    credential: Credential
+    credential: KeyInfo
     tenant_id: str
 
     @property
@@ -42,18 +42,19 @@ async def session(request: Request) -> AsyncIterator[AsyncSession]:
         yield s
 
 
-def caller(
+async def caller(
     request: Request,
     api_key: Annotated[str | None, Header(alias=HEADER_API_KEY)] = None,
     tenant: Annotated[str | None, Header(alias=HEADER_TENANT)] = None,
 ) -> Caller:
     """One scheme: ``X-Api-Key`` is the caller and names its tenant. A platform key (no
     tenant of its own) names the tenant it acts for in ``X-Trellis-Tenant``; a tenant key may
-    send that header only to agree with itself."""
-    settings: Settings = request.app.state.settings
-    credential = settings.service.api_keys.get(api_key) if api_key else None
-    if credential is None:
-        raise Unauthorized("unknown api key")
+    send that header only to agree with itself. The key is introspected at the Memory
+    Service's key registry (cached)."""
+    if not api_key:
+        raise Unauthorized(f"missing {HEADER_API_KEY}")
+    keys: KeyRegistry = request.app.state.keys
+    credential = await keys.resolve(api_key)
     if credential.tenant_id is None:
         if not tenant:
             raise BadRequest(f"a platform key names the tenant in {HEADER_TENANT}")

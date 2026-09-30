@@ -12,6 +12,15 @@ from typing import Final
 HEADER_API_KEY: Final = "X-Api-Key"
 #: The tenant a platform key acts for. A tenant key may send it only to agree with itself.
 HEADER_TENANT: Final = "X-Trellis-Tenant"
+
+#: How long an introspected key is trusted before the registry is asked again: the longest
+#: a revoked key keeps working here.
+KEY_CACHE_SECONDS: Final = 60.0
+#: How long a refused key stays refused without asking again.
+KEY_NEGATIVE_CACHE_SECONDS: Final = 10.0
+KEY_INTROSPECTION_TIMEOUT_SECONDS: Final = 3.0
+#: Keys cached per process (least recently used goes first).
+MAX_CACHED_KEYS: Final = 10_000
 #: Webhook headers, spelled as the Memory Service spells them so one receiver verifies both.
 HEADER_SIGNATURE: Final = "X-Trellis-Signature"
 HEADER_EVENT: Final = "X-Trellis-Event"

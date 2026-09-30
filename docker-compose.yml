@@ -48,6 +48,8 @@ services:
     environment:
       <<: *env
       RUNS__SERVICE__PORT: "8090"
+      # the key registry: the Memory Service on the host
+      RUNS__MEMORY__URL: http://host.docker.internal:8080
     env_file:
       - path: .env
         required: false

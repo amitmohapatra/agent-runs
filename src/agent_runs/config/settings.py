@@ -7,47 +7,26 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEV = "dev"
 
 
-class Credential(BaseModel):
-    """What one API key is. The key *is* the caller: it names the tenant it speaks for (or
-    none, for a platform key, which then names the tenant in ``X-Trellis-Tenant``), the
-    principal recorded as ``created_by``, and the principals it may make runs execute as
-    (``on_behalf_of``). ``"*"`` is the service grant a platform worker or an admin UI holds.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    tenant_id: str | None
-    principal: str
-    may_act_as: tuple[str, ...] = ()
-
-    @property
-    def platform(self) -> bool:
-        return self.tenant_id is None
-
-    def may_act_for(self, principal: str) -> bool:
-        return principal == self.principal or "*" in self.may_act_as or principal in self.may_act_as
-
-
-def _dev_credentials() -> dict[str, Credential]:
-    return {"dev-key": Credential(tenant_id="acme", principal="dev", may_act_as=("*",))}
-
-
 class ServiceSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8090
-    #: Anything but "dev" refuses the dev credential and plain-http webhook URLs.
+    #: "dev" also accepts plain-http webhook URLs (a receiver on a laptop).
     environment: str = DEV
-    api_keys: dict[str, Credential] = Field(default_factory=_dev_credentials)
 
     @property
     def is_dev(self) -> bool:
         return self.environment == DEV
+
+
+class MemorySettings(BaseModel):
+    #: The Memory Service, the one key registry: every X-Api-Key is introspected there.
+    url: str = "http://localhost:8080"
 
 
 class DatabaseSettings(BaseModel):
@@ -66,27 +45,14 @@ class Settings(BaseSettings):
     )
 
     service: ServiceSettings = ServiceSettings()
+    memory: MemorySettings = MemorySettings()
     database: DatabaseSettings = DatabaseSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
-
-    def check(self) -> None:
-        """Refuse configurations that only look like they work."""
-        if not self.service.api_keys:
-            raise ValueError("service.api_keys is empty: no caller could reach this service")
-        if self.service.is_dev:
-            return
-        if set(self.service.api_keys) & set(_dev_credentials()):
-            raise ValueError(
-                "the development credential is still configured outside dev: "
-                "issue real keys in service.api_keys"
-            )
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    settings = Settings()
-    settings.check()
-    return settings
+    return Settings()
 
 
 def reset_settings_cache() -> None:

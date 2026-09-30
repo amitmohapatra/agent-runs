@@ -16,6 +16,7 @@ from agent_runs.api.deps import Session
 from agent_runs.api.routers import runs, schedules, webhooks
 from agent_runs.config.settings import Settings, get_settings
 from agent_runs.domain.errors import ServiceError
+from agent_runs.keys import KeyRegistry
 from agent_runs.observability.logging import configure_logging
 from agent_runs.store.database import connect
 
@@ -33,10 +34,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = await connect(settings.database)
         app.state.engine = engine
         app.state.sessions = async_sessionmaker(engine, expire_on_commit=False)
+        app.state.keys = KeyRegistry(settings.memory.url)
         log.info("agent_runs.started", environment=settings.service.environment)
         try:
             yield
         finally:
+            await app.state.keys.aclose()
             await engine.dispose()
             log.info("agent_runs.stopped")
 
