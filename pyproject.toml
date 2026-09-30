@@ -1,7 +1,7 @@
 [project]
 name = "agent-runs"
-version = "0.1.0"
-description = "Durable agent runs: start, pause for a human, resume, cancel, replay."
+version = "0.2.0"
+description = "Durable agent runs, the worker queue, the human inbox and the schedules that start runs."
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.141,<1",
@@ -12,25 +12,21 @@ dependencies = [
   "psycopg[binary,pool]>=3.3,<4",
   "alembic>=1.20,<2",
   "structlog>=25.2",
-  # Webhook delivery. Present transitively through the test client, which is how it went
-  # missing from the image while every local test passed.
   "httpx>=0.28",
-  "trellis-contracts>=0.2",
+  "trellis-contracts>=0.4,<0.5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.28", "ruff>=0.6"]
-otel = ["opentelemetry-sdk>=1.44", "opentelemetry-exporter-otlp-proto-http>=1.44",
-        "opentelemetry-instrumentation-fastapi>=0.65b0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "pyright>=1.1.400"]
 
 [project.scripts]
 agent-runs = "agent_runs.__main__:main"
 
 [tool.uv.sources]
-# Vendored by `make vendor`, not referenced as ../agent-contracts: a path outside the
-# repository is outside the Docker build context, so `uv sync --frozen` in an image
-# build fails with "Distribution not found" for a dependency that resolves fine locally.
-trellis-contracts = { path = "vendor/agent-contracts", editable = true }
+# The sibling checkout, not a vendored copy. The image build gets it as a named build
+# context (`contracts`, see docker-compose.yml and the Makefile), placed at /agent-contracts
+# next to /app, so this relative path resolves the same way inside and outside Docker.
+trellis-contracts = { path = "../agent-contracts", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runs"]
@@ -46,15 +42,19 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 
+[tool.ruff.lint.per-file-ignores]
+# PLR2004: in a test the literal IS the assertion. PLC0415: conftest imports psycopg inside
+# the probe so collection still works (and skips with a reason) without PostgreSQL.
+"tests/**" = ["PLR2004", "PLC0415"]
+# PLR0913/PLR0917: FastAPI expresses query parameters as function arguments, and the list
+# filters are keyword-only and optional in the store.
+"src/agent_runs/api/routers/runs.py" = ["PLR0913", "PLR0917"]
+"src/agent_runs/store/runs.py" = ["PLR0913"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLR2004", "PLC0415"]
-# PLR0913: the list filters are keyword-only and optional. Collapsing them into a filter
-# object would make the common call ("this tenant's paused runs") harder to write, which is
-# the opposite of what the rule is protecting.
-"src/agent_runs/store/runs.py" = ["PLR0913"]
-# PLR0913/PLR0917: FastAPI expresses query parameters as function arguments. Collapsing the
-# list filters into an object would change the public API to please a linter.
-"src/agent_runs/api/routers/runs.py" = ["PLR0913", "PLR0917"]
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["src", "tests"]
+typeCheckingMode = "standard"

@@ -1,10 +1,12 @@
-"""The one table this service owns."""
+"""The tables this service owns. The schema itself is the Alembic migrations; these
+mappings must agree with them (a test compares the two)."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import DateTime, Index, Integer, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Index, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -13,40 +15,70 @@ class Base(DeclarativeBase):
     pass
 
 
+def _created() -> Mapped[datetime]:
+    return mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class RunRow(Base):
     __tablename__ = "agent_runs"
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    agent_id: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32))
     parent_run_id: Mapped[str | None] = mapped_column(String(64))
     thread_id: Mapped[str | None] = mapped_column(String(128))
     user_id: Mapped[str | None] = mapped_column(String(128))
+    workspace_id: Mapped[str | None] = mapped_column(String(128))
     on_behalf_of: Mapped[str | None] = mapped_column(String(128))
-    input: Mapped[dict | None] = mapped_column(JSONB)
-    output: Mapped[dict | None] = mapped_column(JSONB)
-    error: Mapped[dict | None] = mapped_column(JSONB)
-    awaiting: Mapped[dict | None] = mapped_column(JSONB)
-    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    input: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    output: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: the Interrupt a PAUSED run waits on
+    awaiting: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: the InterruptResolution the last resume carried
+    last_resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: denormalised from ``awaiting`` for the inbox and the escalation sweep
+    assignee: Mapped[str | None] = mapped_column(String(256))
+    awaiting_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
     webhook_url: Mapped[str | None] = mapped_column(String(2048))
-    run_metadata: Mapped[dict | None] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
-    )
+    run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: when it last entered the queue; set once a run is durable (queued at least once)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _created()
 
     __table_args__ = (
-        # Idempotent starts are scoped to a tenant: two tenants may legitimately use the
-        # same key, and a global unique index would let one of them hijack the other's run.
         UniqueConstraint("tenant_id", "idempotency_key", name="uq_runs_tenant_idempotency"),
-        # The three queries this service actually serves: a tenant's recent runs, everything
-        # waiting on a human, and the children of a run.
         Index("ix_runs_tenant_created", "tenant_id", "created_at"),
-        Index("ix_runs_tenant_status", "tenant_id", "status"),
         Index("ix_runs_parent", "parent_run_id"),
+        # the inbox: this tenant's PAUSED runs for an assignee, newest first
+        Index("ix_runs_inbox", "tenant_id", "status", "assignee", "created_at"),
+        # the claim: the oldest QUEUED run of the worker's agents
+        Index(
+            "ix_runs_queue",
+            "tenant_id",
+            "agent_id",
+            "queued_at",
+            postgresql_where=text("status = 'QUEUED'"),
+        ),
+        # the lease sweep: RUNNING runs whose lease lapsed
+        Index(
+            "ix_runs_lease",
+            "status",
+            "lease_expires_at",
+            postgresql_where=text("lease_expires_at IS NOT NULL"),
+        ),
+        # the escalation sweep: PAUSED runs past the interrupt's deadline
+        Index(
+            "ix_runs_escalation",
+            "awaiting_deadline",
+            postgresql_where=text("status = 'PAUSED' AND awaiting_deadline IS NOT NULL"),
+        ),
     )

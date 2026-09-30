@@ -1,1 +1,1 @@
-"""Logging and tracing bootstrap."""
+"""Logging."""

@@ -1,20 +1,31 @@
-"""Fixtures. A real PostgreSQL when one is reachable, skipped with a reason when not —
-never silently passed against a stand-in that cannot reproduce a race."""
+"""Fixtures. A real PostgreSQL (the local one, in a database of its own that this suite
+drops and recreates), skipped with a reason when there is none: a race or a ``SKIP LOCKED``
+claim cannot be reproduced against a stand-in."""
 
 from __future__ import annotations
 
-import asyncio
 import os
-from collections.abc import AsyncIterator
-from pathlib import Path
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import httpx
 import pytest
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
 
 from agent_runs.api.app import create_app
-from agent_runs.config.settings import Credential, DatabaseSettings, ServiceSettings, Settings
+from agent_runs.config.settings import (
+    Credential,
+    DatabaseSettings,
+    ServiceSettings,
+    Settings,
+    reset_settings_cache,
+)
+from agent_runs.store.database import ALEMBIC_INI
+from agent_runs.webhooks import WebhookSender
 from alembic import command
 
 ADMIN_URL = os.environ.get(
@@ -23,99 +34,153 @@ ADMIN_URL = os.environ.get(
 DB_NAME = os.environ.get("RUNS_TEST_DB", "agent_runs_tests")
 DB_URL = f"postgresql+psycopg://memory:memory@localhost:5432/{DB_NAME}"
 
-H = {"X-Api-Key": "dev-key", "X-Tenant-Id": "acme"}
+#: Each credential a different shape: a tenant service key that may act as anyone in acme,
+#: the same for globex (a different secret: one key for both tenants would let isolation
+#: tests pass by impersonation), an ordinary acme user, and a platform key with no tenant.
+CREDENTIALS = {
+    "dev-key": Credential(tenant_id="acme", principal="user_ada", may_act_as=("*",)),
+    "other-key": Credential(tenant_id="globex", principal="user_ada", may_act_as=("*",)),
+    "narrow-key": Credential(tenant_id="acme", principal="user_bob"),
+    "platform-key": Credential(tenant_id=None, principal="svc_worker", may_act_as=("*",)),
+}
+SETTINGS = Settings(
+    database=DatabaseSettings(url=DB_URL), service=ServiceSettings(api_keys=CREDENTIALS)
+)
 
 
-def _pg_ready() -> bool:
+def _fresh_database() -> bool:
     import psycopg
+    from psycopg import sql
 
+    database = sql.Identifier(DB_NAME)
     try:
         with psycopg.connect(ADMIN_URL, autocommit=True, connect_timeout=2) as conn:
-            # Dropped and recreated, not reused. The schema comes from migrations, and a
-            # database left over from an older build carries its tables *and* no alembic
-            # version — so the first migration tries to create a table that is already
-            # there and every test errors on a DuplicateTable that has nothing to do with
-            # the code under test.
             conn.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
                 (DB_NAME,),
             )
-            conn.execute(f'DROP DATABASE IF EXISTS "{DB_NAME}"')
-            conn.execute(f'CREATE DATABASE "{DB_NAME}"')
-        return True
-    except Exception:
+            conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(database))
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(database))
+    except psycopg.OperationalError:
         return False
+    return True
 
 
-PG = _pg_ready()
+PG = _fresh_database()
 
 
-#: Resolved at import: touching the filesystem inside an async fixture blocks the loop.
-ROOT = Path(__file__).resolve().parents[1]
-
-
-async def _migrate(url: str) -> None:
-    """Bring the test database to head. Runs in a thread: alembic is synchronous."""
-
-    def upgrade() -> None:
-        config = Config(str(ROOT / "alembic.ini"))
-        config.set_main_option("script_location", str(ROOT / "alembic"))
-        os.environ["RUNS__DATABASE__URL"] = url
-        from agent_runs.config.settings import reset_settings_cache
-
-        reset_settings_cache()
-        command.upgrade(config, "head")
-
-    await asyncio.to_thread(upgrade)
-
-
-@pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
+@pytest.fixture(scope="session")
+def migrated() -> Iterator[None]:
+    """The schema comes from the migrations, exactly as in a deployment."""
     if not PG:
         pytest.skip(f"no PostgreSQL at {ADMIN_URL}")
-    # Two credentials, each bound to its own tenant. A single key with the tenant taken
-    # from a header is not authentication: the isolation tests below would pass by
-    # impersonation rather than by isolation, which is how they passed before.
-    settings = Settings(
-        database=DatabaseSettings(url=DB_URL),
-        service=ServiceSettings(
-            api_keys={
-                "dev-key": Credential(tenant_id="acme", name="tests"),
-                "other-key": Credential(tenant_id="globex", name="tests: second tenant"),
-            }
-        ),
-    )
-    # The schema comes from migrations now, exactly as it does in production: a fixture
-    # that built tables with create_all would test a schema no deployment ever has.
-    await _migrate(DB_URL)
-    app = create_app(settings)
-    async with app.router.lifespan_context(app):
-        # Each test starts from an empty table: a state-machine test that inherits another
-        # test's paused run passes for the wrong reason.
-        async with app.state.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE agent_runs"))
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://runs", headers=H) as c:
-            yield c
+    os.environ["RUNS__DATABASE__URL"] = DB_URL
+    reset_settings_cache()
+    command.upgrade(Config(str(ALEMBIC_INI)), "head")
+    yield
 
 
-def started(**over):
-    body = {"tenant_id": "acme", "agent_id": "triage", **over}
-    return body
+class Receiver:
+    """A webhook receiver behind ``httpx.MockTransport``: records what it is sent."""
+
+    def __init__(self) -> None:
+        self.received: list[httpx.Request] = []
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.received.append(request)
+        return httpx.Response(200)
+
+    def events(self) -> list[dict[str, Any]]:
+        import json
+
+        return [json.loads(r.content) for r in self.received]
 
 
 @pytest.fixture
-async def other_tenant(client: AsyncClient) -> AsyncIterator[AsyncClient]:
-    """A second tenant against the same app.
+def receiver() -> Receiver:
+    return Receiver()
 
-    A whole client rather than per-request headers: httpx merges request headers *into* the
-    client's defaults, so an override arrives as a second spelling of the same header and
-    the server reads whichever comes first. Tenant isolation is the thing under test here,
-    so the test must not depend on that resolution order.
-    """
-    async with AsyncClient(
-        transport=ASGITransport(app=client._transport.app),
+
+@pytest.fixture
+async def app(migrated: None, receiver: Receiver) -> AsyncIterator[Any]:
+    application = create_app(SETTINGS)
+    async with application.router.lifespan_context(application):
+        async with application.state.engine.begin() as conn:
+            await conn.execute(text("TRUNCATE agent_runs"))
+        await application.state.webhooks.aclose()
+        application.state.webhooks = sender(receiver, secret="s3cret")
+        yield application
+
+
+def sender(receiver: Receiver, **kwargs: Any) -> WebhookSender:
+    """The service's sender, delivering to ``receiver`` without waiting between retries."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle))
+    options = {"secret": "", "allow_http": True, "retry_base": timedelta(0), **kwargs}
+    return WebhookSender(client=client, **options)
+
+
+def _client(app: Any, key: str, **headers: str) -> AsyncClient:
+    return AsyncClient(
+        transport=ASGITransport(app=app),
         base_url="http://runs",
-        headers={"X-Api-Key": "other-key", "X-Tenant-Id": "globex"},
-    ) as c:
+        headers={"X-Api-Key": key, **headers},
+    )
+
+
+@pytest.fixture
+async def client(app: Any) -> AsyncIterator[AsyncClient]:
+    async with _client(app, "dev-key") as c:
         yield c
+
+
+@pytest.fixture
+async def other_tenant(app: Any) -> AsyncIterator[AsyncClient]:
+    async with _client(app, "other-key") as c:
+        yield c
+
+
+@pytest.fixture
+async def narrow(app: Any) -> AsyncIterator[AsyncClient]:
+    """An ordinary acme user: may act only as themself."""
+    async with _client(app, "narrow-key") as c:
+        yield c
+
+
+@pytest.fixture
+async def platform(app: Any) -> AsyncIterator[AsyncClient]:
+    """A platform key acting for acme."""
+    async with _client(app, "platform-key", **{"X-Trellis-Tenant": "acme"}) as c:
+        yield c
+
+
+# ------------------------------------------------------------------------------ builders
+
+
+def started(**over: Any) -> dict[str, Any]:
+    return {"tenant_id": "acme", "agent_id": "triage", **over}
+
+
+def interrupt(run_id: str, **over: Any) -> dict[str, Any]:
+    return Interrupt(tenant_id="acme", run_id=run_id, question="Approve?", **over).awaiting()
+
+
+def resolution(run: dict[str, Any], decision: str = "APPROVE", **over: Any) -> dict[str, Any]:
+    return InterruptResolution(
+        interrupt_id=run["awaiting"]["interrupt_id"],
+        run_id=run["run_id"],
+        decision=InterruptDecision(decision),
+        **over,
+    ).model_dump(mode="json")
+
+
+async def paused(client: AsyncClient, **over: Any) -> dict[str, Any]:
+    """A run that is waiting on a person."""
+    run = (await client.post("/v1/runs", json=started(**over))).json()
+    response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=interrupt(run["run_id"]))
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def at(minutes: float) -> datetime:
+    """An instant relative to now, for a sweep that should (or should not) find something."""
+    return datetime.now(UTC) + timedelta(minutes=minutes)

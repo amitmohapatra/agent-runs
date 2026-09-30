@@ -1,127 +1,132 @@
-"""Run routes. Recording what happened to a run — never executing one."""
+"""Run routes: recording runs, the worker queue and the human inbox. This service never
+executes an agent; a harness (in process, or a ``trellis worker`` claiming from the queue)
+does, and records here what happened."""
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
-import structlog
-from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Query, Response
+from trellis.contracts.ids import now
+from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStatus
 
-from agent_runs.api.deps import Session, Tenant
-from agent_runs.domain.models import RUNNING, InvalidTransition, Run, RunCreate, RunTransition
+from agent_runs.api.deps import Session, Webhooks, Who
+from agent_runs.config.constants import DEFAULT_PAGE, MAX_PAGE
+from agent_runs.domain.runs import (
+    Claimed,
+    ClaimRequest,
+    HeartbeatRequest,
+    Lease,
+    RunCreate,
+    RunFinish,
+)
 from agent_runs.store.runs import RunStore
-
-log = structlog.get_logger(__name__)
-
-_CONFLICT = 409
-_NOT_FOUND = 404
-_FORBIDDEN = 403
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
+_CREATED = 201
+_NO_CONTENT = 204
 
-class ResumeRequest(BaseModel):
-    """A human's reply to a paused run.
-
-    ``answer`` is deliberately ``Any``: what a pause asked for is the agent's business — a
-    yes/no, a chosen option, a filled-in form — and this service records it rather than
-    interpreting it.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    answer: Any = None
+#: A worker fencing its write: refused (409) unless it still holds the run's lease.
+WorkerId = Annotated[str | None, Query(max_length=200)]
 
 
-@router.post("", status_code=201)
-async def start(spec: RunCreate, db: Session, tenant_id: Tenant) -> Run:
-    """Start a run, or return the existing one for a repeated idempotency key."""
-    if spec.tenant_id != tenant_id:
-        raise HTTPException(_FORBIDDEN, "tenant_id does not match the authenticated tenant")
-    run, created = await RunStore(db).start(spec)
+@router.post("", status_code=_CREATED, responses={200: {"model": RunRecord}})
+async def start(body: RunCreate, db: Session, who: Who, response: Response) -> RunRecord:
+    """Record a run (``RUNNING``), or queue it for a worker (``queue: true`` → ``QUEUED``).
+    A repeated run id or ``idempotency_key`` answers 200 with the run the first start made."""
+    who.require_tenant(body.tenant_id)
+    who.require_may_act_for(body.on_behalf_of)
+    run, created = await RunStore(db).start(body.start(), queue=body.queue, now=now())
     await db.commit()
-    log.info("run.started", run_id=run.run_id, agent_id=run.agent_id, created=created)
+    if not created:
+        response.status_code = 200
     return run
 
 
-@router.get("/{run_id}")
-async def get(run_id: str, db: Session, tenant_id: Tenant) -> Run:
-    run = await RunStore(db).get(tenant_id, run_id)
-    if run is None:
-        raise HTTPException(_NOT_FOUND, f"no run {run_id}")
-    return run
-
-
-@router.post("/{run_id}/transition")
-async def transition(
-    run_id: str, change: RunTransition, db: Session, tenant_id: Tenant, request: Request
-) -> Run:
-    try:
-        run = await RunStore(db).transition(tenant_id, run_id, change)
-    except InvalidTransition as exc:
-        # 409, not 400: the request is well formed, it lost a race or arrived twice.
-        raise HTTPException(_CONFLICT, str(exc)) from exc
-    if run is None:
-        raise HTTPException(_NOT_FOUND, f"no run {run_id}")
+@router.post(
+    "/claim", response_model=Claimed, responses={_NO_CONTENT: {"description": "nothing queued"}}
+)
+async def claim(body: ClaimRequest, db: Session, who: Who) -> Claimed | Response:
+    """Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
+    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``."""
+    claimed = await RunStore(db).claim(who.tenant_id, body, now=now())
     await db.commit()
-    log.info("run.transitioned", run_id=run_id, status=run.status)
-    # After the commit, never before: a notification for a state that failed to persist is
-    # worse than a late one. Scheduling is non-blocking, so a slow receiver cannot turn
-    # "your run finished" into a timeout on the call that finished it.
-    request.app.state.webhooks.schedule(run)
+    return claimed if claimed is not None else Response(status_code=_NO_CONTENT)
+
+
+@router.post("/{run_id}/heartbeat")
+async def heartbeat(run_id: str, body: HeartbeatRequest, db: Session, who: Who) -> Lease:
+    """Extend the lease. 409 means it is no longer the worker's; stop working the run."""
+    lease = await RunStore(db).heartbeat(who.tenant_id, run_id, body, now=now())
+    await db.commit()
+    return lease
+
+
+@router.post("/{run_id}/pause")
+async def pause(
+    run_id: str, body: Interrupt, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
+) -> RunRecord:
+    """The run waits on ``body`` (``awaiting``); its ``assignee`` puts it in that inbox."""
+    run = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
+    await db.commit()
+    hooks.notify(run)
     return run
 
 
 @router.post("/{run_id}/resume")
 async def resume(
-    run_id: str,
-    db: Session,
-    tenant_id: Tenant,
-    request: Request,
-    body: ResumeRequest | None = None,
-) -> Run:
-    """What a human reply does to a paused run.
+    run_id: str, body: InterruptResolution, db: Session, who: Who, hooks: Webhooks
+) -> RunRecord:
+    """Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it
+    as the next attempt: ``QUEUED`` for a worker when the run came from the queue, else
+    ``RUNNING``. The resolution is kept as ``last_resolution``."""
+    run = await RunStore(db).resume(who.tenant_id, run_id, body, now=now())
+    await db.commit()
+    hooks.notify(run)
+    return run
 
-    The answer arrives in the **body**. It used to be declared ``answer: Any = None``, which
-    FastAPI reads as a *query* parameter for a non-model type — so every UI that posted
-    ``{"answer": ...}`` as JSON resumed the run with no answer at all, and got a 200 saying
-    so. An answer is the whole point of a pause, and it can be an object; a query string is
-    the wrong place for it either way.
-    """
-    answer = body.answer if body is not None else None
-    # ``is not None`` rather than truthiness: False is a decision, and a rejection must not
-    # be indistinguishable from no reply at all.
-    metadata = {"answer": answer} if answer is not None else {}
-    change = RunTransition(status=RUNNING, metadata=metadata)
-    return await transition(run_id, change, db, tenant_id, request)
+
+@router.post("/{run_id}/finish")
+async def finish(
+    run_id: str, body: RunFinish, db: Session, who: Who, hooks: Webhooks, worker_id: WorkerId = None
+) -> RunRecord:
+    """End the run. Cancelling a queued or paused run is a finish with ``CANCELLED``."""
+    run = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
+    await db.commit()
+    hooks.notify(run)
+    return run
+
+
+@router.get("/{run_id}")
+async def get(run_id: str, db: Session, who: Who) -> RunRecord:
+    return await RunStore(db).get(who.tenant_id, run_id)
+
+
+@router.get("/{run_id}/lineage")
+async def lineage(run_id: str, db: Session, who: Who) -> list[RunRecord]:
+    """The run and its ancestors, nearest first."""
+    return await RunStore(db).lineage(who.tenant_id, run_id)
 
 
 @router.get("")
 async def listing(
     db: Session,
-    tenant_id: Tenant,
-    status: str | None = None,
+    who: Who,
+    status: RunStatus | None = None,
+    assignee: str | None = None,
     agent_id: str | None = None,
     thread_id: str | None = None,
     parent_run_id: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=500)] = 50,
-) -> list[Run]:
-    """Runs for this tenant, newest first. ``status=PAUSED`` is the human-inbox query."""
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
+) -> list[RunRecord]:
+    """This tenant's runs, newest first. ``status=PAUSED&assignee=…`` is an inbox."""
     return await RunStore(db).list(
-        tenant_id,
+        who.tenant_id,
         status=status,
+        assignee=assignee,
         agent_id=agent_id,
         thread_id=thread_id,
         parent_run_id=parent_run_id,
         limit=limit,
     )
-
-
-@router.get("/{run_id}/lineage")
-async def lineage(run_id: str, db: Session, tenant_id: Tenant) -> list[Run]:
-    """The run and its ancestors, nearest first."""
-    chain = await RunStore(db).lineage(tenant_id, run_id)
-    if not chain:
-        raise HTTPException(_NOT_FOUND, f"no run {run_id}")
-    return chain

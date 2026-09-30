@@ -1,146 +1,149 @@
-"""Telling someone a run paused or finished.
+"""Telling whoever started a run that it paused, was escalated or finished.
 
-A person who starts a run at 9am and a schedule that fires at 3am have the same problem:
-something happens later and nobody is watching. A UI can poll — and should still be able
-to — but polling every run of every tenant to notice one approval request is the wrong
-shape for a product where most runs do nothing interesting for minutes at a time.
+The envelope and the signature are the Memory Service's (ADR 0023), so one receiver verifies
+both with ``trellis.memory.webhooks.verify_signature``: ``X-Trellis-Signature: t=<unix
+seconds>,v1=<hex hmac-sha256 of "<t>.<body>">`` over the exact bytes sent, with
+``X-Trellis-Event`` and ``X-Trellis-Delivery`` beside it. ``event_id`` is derived from the
+run, the attempt and the event, so a retried delivery carries the same id and a receiver
+drops the repeat.
 
-Three properties are deliberate:
-
-* **Off the request path.** Delivery never blocks the transition that caused it. A slow or
-  dead receiver must not turn "your run finished" into a 504 on the call that finished it.
-* **At-least-once, not exactly-once.** Retries can duplicate; the ``delivery_id`` is stable
-  per (run, status) so a receiver can discard a repeat. The run row stays the source of
-  truth, so a client that missed every attempt reconciles by reading the run.
-* **Signed.** ``X-Run-Signature: sha256=<hmac>`` over the exact bytes sent, so a receiver
-  can tell a real notification from anything else that can reach its URL.
+Delivery is off the request path and at-least-once; the run row stays the source of truth,
+so a receiver that missed one reconciles by reading the run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import hmac
 import json
+import time
+from datetime import timedelta
+from enum import StrEnum
+from hashlib import sha256
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 import structlog
+from trellis.contracts.ids import stable_id
+from trellis.contracts.runs import RunRecord, RunStatus
 
-from agent_runs.config.settings import WebhookSettings
-from agent_runs.domain.models import NOTIFIABLE, TERMINAL, Run
+from agent_runs.config.constants import (
+    HEADER_DELIVERY,
+    HEADER_EVENT,
+    HEADER_SIGNATURE,
+    WEBHOOK_ATTEMPTS,
+    WEBHOOK_RETRY_BASE,
+    WEBHOOK_RETRY_CAP,
+    WEBHOOK_RETRYABLE,
+    WEBHOOK_TIMEOUT_SECONDS,
+)
+from agent_runs.retry import backoff
 
 log = structlog.get_logger(__name__)
 
-#: Statuses where the same delivery may succeed later. A 4xx means the receiver understood
-#: and refused, and repeating it only spends the budget — with one exception: 408 and 429
-#: are the receiver asking for time, not declining.
-RETRYABLE = frozenset({408, 429, 500, 502, 503, 504})
+SIGNATURE_VERSION = "v1"
 
 
-def signature(secret: str, body: bytes) -> str:
-    """``sha256=<hex>`` over the exact bytes sent.
-
-    Over the bytes, not over a re-serialised dict: a receiver that recomputes the digest
-    from re-encoded JSON gets a different one the moment key order or spacing differs.
-    """
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+class WebhookEvent(StrEnum):
+    PAUSED = "run.paused"
+    ESCALATED = "run.escalated"
+    FINISHED = "run.finished"
 
 
-def payload(run: Run) -> dict[str, Any]:
-    """What a receiver is told. Enough to act on; not a copy of the run.
+def event_of(run: RunRecord) -> WebhookEvent | None:
+    """What a run's current status announces, if anything: a pause or an ending."""
+    if run.status is RunStatus.PAUSED:
+        return WebhookEvent.PAUSED
+    return WebhookEvent.FINISHED if run.final else None
 
-    ``delivery_id`` is derived from the run and the status rather than random, so the two
-    attempts of one notification carry the same id and a receiver can tell a retry from a
-    second event.
-    """
+
+def sign(secret: str, timestamp: int, body: bytes) -> str:
+    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, sha256).hexdigest()
+    return f"t={timestamp},{SIGNATURE_VERSION}={digest}"
+
+
+def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
+    """The Memory Service's event envelope, with the run as the data."""
+    assignee = run.awaiting.assignee if run.awaiting else None
     return {
-        "delivery_id": f"{run.run_id}:{run.status}:{run.attempt}",
-        "event": "run.paused" if run.status not in TERMINAL else "run.finished",
-        "run_id": run.run_id,
+        "event_id": stable_id(run.run_id, run.attempt, run.status, event, assignee, prefix="whd_"),
+        "type": event.value,
         "tenant_id": run.tenant_id,
-        "agent_id": run.agent_id,
-        "status": run.status,
-        "attempt": run.attempt,
-        "thread_id": run.thread_id,
-        "parent_run_id": run.parent_run_id,
-        # What the UI renders: the question on a pause, the result on a finish.
-        "awaiting": run.awaiting,
-        "output": run.output,
-        "error": run.error,
+        "workspace_id": run.workspace_id,
         "occurred_at": run.updated_at.isoformat(),
+        "data": {"run": run.model_dump(mode="json", exclude_none=True)},
     }
 
 
 class WebhookSender:
-    """Delivers notifications, with retries, outside the request that triggered them."""
+    """Signs and delivers notifications, retried, in tasks the caller never waits on."""
 
-    def __init__(self, config: WebhookSettings, *, client: httpx.AsyncClient | None = None) -> None:
-        self._config = config
-        self._client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
+    def __init__(
+        self,
+        *,
+        secret: str,
+        allow_http: bool,
+        client: httpx.AsyncClient | None = None,
+        retry_base: timedelta = WEBHOOK_RETRY_BASE,
+    ) -> None:
+        self._secret = secret
+        self._schemes = {"https", "http"} if allow_http else {"https"}
+        self._client = client or httpx.AsyncClient(
+            timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False
+        )
         self._owns_client = client is None
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._retry_base = retry_base
+        #: strong references: asyncio keeps only weak ones, and a collected task is a
+        #: delivery that silently never happens
+        self._tasks: set[asyncio.Task[bool]] = set()
 
-    def should_notify(self, run: Run) -> bool:
-        return bool(self._config.enabled and run.webhook_url and run.status in NOTIFIABLE)
-
-    def schedule(self, run: Run) -> None:
-        """Queue a notification. Returns immediately; failures are logged, never raised.
-
-        The task is kept in a set because asyncio only holds a weak reference to a running
-        task: without this, a delivery can be garbage collected mid-flight and simply not
-        happen, which is the kind of bug that looks like a flaky receiver.
-        """
-        if not self.should_notify(run):
+    def notify(self, run: RunRecord, event: WebhookEvent | None = None) -> None:
+        """Queue the notification ``run`` warrants (``event`` overrides the one its status
+        announces). Returns at once; failures are logged, never raised."""
+        event = event or event_of(run)
+        if event is None or not run.webhook_url:
             return
-        task = asyncio.create_task(self.deliver(run))
+        task = asyncio.create_task(self.deliver(run.webhook_url, envelope(run, event)))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def deliver(self, run: Run) -> bool:
-        """One notification, retried. True if the receiver accepted it."""
-        url = run.webhook_url or ""
-        if urlparse(url).scheme not in self._config.allowed_schemes:
-            log.warning("webhook.refused_scheme", run_id=run.run_id, url=url)
+    async def deliver(self, url: str, payload: dict[str, Any]) -> bool:
+        """One notification, retried with the service's backoff. True once accepted."""
+        if urlparse(url).scheme not in self._schemes:
+            log.warning("webhook.refused_scheme", url=url)
             return False
-
-        body = json.dumps(payload(run), separators=(",", ":")).encode()
-        headers = {"Content-Type": "application/json", "X-Run-Event": run.status}
-        if self._config.signing_secret:
-            headers["X-Run-Signature"] = signature(self._config.signing_secret, body)
-
-        for attempt in range(self._config.max_attempts):
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        headers = {
+            "Content-Type": "application/json",
+            HEADER_EVENT: payload["type"],
+            HEADER_DELIVERY: payload["event_id"],
+        }
+        for attempt in range(1, WEBHOOK_ATTEMPTS + 1):
+            if self._secret:
+                headers[HEADER_SIGNATURE] = sign(self._secret, int(time.time()), body)
             try:
                 response = await self._client.post(url, content=body, headers=headers)
             except httpx.HTTPError as exc:
-                log.warning(
-                    "webhook.unreachable", run_id=run.run_id, attempt=attempt + 1, error=str(exc)
-                )
+                log.warning("webhook.unreachable", url=url, attempt=attempt, error=str(exc))
             else:
                 if response.is_success:
-                    log.info("webhook.delivered", run_id=run.run_id, status=run.status)
                     return True
-                if response.status_code not in RETRYABLE:
-                    # The receiver understood and refused. Repeating it changes nothing.
-                    log.warning("webhook.refused", run_id=run.run_id, status=response.status_code)
+                if response.status_code not in WEBHOOK_RETRYABLE:
+                    log.warning("webhook.refused", url=url, status=response.status_code)
                     return False
-                log.warning(
-                    "webhook.failed",
-                    run_id=run.run_id,
-                    attempt=attempt + 1,
-                    status=response.status_code,
-                )
-            if attempt < self._config.max_attempts - 1:
-                await asyncio.sleep(self._config.backoff_seconds * (2**attempt))
-        log.warning("webhook.gave_up", run_id=run.run_id, attempts=self._config.max_attempts)
+                log.warning("webhook.failed", url=url, attempt=attempt, status=response.status_code)
+            if attempt < WEBHOOK_ATTEMPTS:
+                wait = backoff(self._retry_base, attempt, cap=WEBHOOK_RETRY_CAP)
+                await asyncio.sleep(wait.total_seconds())
+        log.warning("webhook.gave_up", url=url, event_id=payload["event_id"])
         return False
 
     async def aclose(self) -> None:
-        """Let deliveries in flight finish before the process goes away."""
+        """Let deliveries in flight finish (bounded), then close."""
         if self._tasks:
-            await asyncio.wait(set(self._tasks), timeout=self._config.timeout_seconds)
+            await asyncio.wait(set(self._tasks), timeout=WEBHOOK_TIMEOUT_SECONDS)
         for task in list(self._tasks):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

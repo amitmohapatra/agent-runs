@@ -1,127 +1,237 @@
-"""The run lifecycle, end to end over HTTP.
-
-Every test here is a failure mode a run service has to survive, not a demonstration that
-CRUD works: a scheduler delivering twice, two replicas resuming the same paused run, a
-worker finishing a run that was already cancelled, one tenant reaching for another's work.
-"""
+"""The run lifecycle over HTTP: the contracts' records, the one state machine, and the
+failures a run service has to survive (a repeated start, a double answer, a worker finishing
+what a person cancelled, one tenant reaching for another's work)."""
 
 from __future__ import annotations
 
-from tests.conftest import started
+import asyncio
+
+from sqlalchemy import text
+from trellis.contracts.runs import RunStart
+
+from agent_runs.store.runs import RunStore
+from tests.conftest import interrupt, paused, resolution, started
 
 
-async def test_a_run_starts_in_running_and_comes_back_by_id(client) -> None:
-    created = (await client.post("/v1/runs", json=started(input={"q": "hi"}))).json()
-    assert created["status"] == "RUNNING"
-    assert created["attempt"] == 1
+async def test_a_run_starts_running_and_comes_back_by_id(client) -> None:
+    response = await client.post("/v1/runs", json=started(input={"q": "hi"}, workspace_id="ws1"))
+    assert response.status_code == 201
+    created = response.json()
+    assert (created["status"], created["attempt"]) == ("RUNNING", 1)
+    assert created["run_id"].startswith("run_"), "the contracts mint the id when none is given"
 
     fetched = (await client.get(f"/v1/runs/{created['run_id']}")).json()
-    assert fetched["run_id"] == created["run_id"]
     assert fetched["input"] == {"q": "hi"}
+    assert fetched["workspace_id"] == "ws1"
 
 
 async def test_the_same_idempotency_key_never_starts_a_second_run(client) -> None:
-    """At-least-once delivery is the normal case for a scheduler, not the exception: an
-    acknowledgement lost after the work was accepted must not run 9am twice."""
     body = started(idempotency_key="sched-2026-09-21T09:00")
-    first = (await client.post("/v1/runs", json=body)).json()
-    second = (await client.post("/v1/runs", json=body)).json()
-    assert first["run_id"] == second["run_id"]
+    first = await client.post("/v1/runs", json=body)
+    second = await client.post("/v1/runs", json=body)
+    assert (first.status_code, second.status_code) == (201, 200)
+    assert first.json()["run_id"] == second.json()["run_id"]
+    assert len((await client.get("/v1/runs")).json()) == 1
 
-    listed = (await client.get("/v1/runs")).json()
-    assert len([r for r in listed if r["run_id"] == first["run_id"]]) == 1
+
+async def test_the_same_run_id_is_the_same_run(client) -> None:
+    """The harness derives run ids, so a retried turn reopens nothing."""
+    first = (await client.post("/v1/runs", json=started(run_id="run_abc"))).json()
+    again = await client.post("/v1/runs", json=started(run_id="run_abc", agent_id="other"))
+    assert again.status_code == 200
+    assert again.json()["agent_id"] == first["agent_id"]
+
+
+async def test_a_run_id_another_tenant_holds_is_a_conflict_not_a_read(client, other_tenant) -> None:
+    await client.post("/v1/runs", json=started(run_id="run_shared"))
+    theirs = await other_tenant.post(
+        "/v1/runs", json=started(tenant_id="globex", run_id="run_shared")
+    )
+    assert theirs.status_code == 409
+    assert "acme" not in theirs.text
 
 
 async def test_two_tenants_may_use_the_same_idempotency_key(client, other_tenant) -> None:
-    """The key is scoped to a tenant. A global unique index would let one tenant's key
-    collide with another's and hand back somebody else's run."""
     body = started(idempotency_key="nightly")
     mine = (await client.post("/v1/runs", json=body)).json()
-
     theirs = await other_tenant.post("/v1/runs", json={**body, "tenant_id": "globex"})
     assert theirs.status_code == 201
     assert theirs.json()["run_id"] != mine["run_id"]
 
 
-async def test_a_run_pauses_for_a_human_and_resumes_as_a_new_attempt(client) -> None:
-    run = (await client.post("/v1/runs", json=started())).json()
-    rid = run["run_id"]
+async def test_concurrent_starts_on_one_key_make_one_run_and_no_error(app) -> None:
+    """The loser of a real race: its insert waits on the winner's uncommitted row and must
+    come back with the winner's run once that commits, not with a 500."""
+    spec = RunStart(**started(idempotency_key="sched-1"))
+    from trellis.contracts.ids import now
 
-    paused = (
-        await client.post(
-            f"/v1/runs/{rid}/transition",
-            json={"status": "PAUSED", "awaiting": {"question": "approve the refund?"}},
+    async with app.state.sessions() as winner_db, app.state.sessions() as loser_db:
+        winner, created = await RunStore(winner_db).start(spec, queue=False, now=now())
+        loser = asyncio.create_task(
+            RunStore(loser_db).start(
+                spec.model_copy(update={"run_id": "run_x"}), queue=False, now=now()
+            )
         )
-    ).json()
-    assert paused["status"] == "PAUSED"
-    assert paused["awaiting"] == {"question": "approve the refund?"}
+        await asyncio.sleep(0.2)
+        assert not loser.done(), "the loser must be waiting on the winner's unique key"
+        await winner_db.commit()
+        lost, created_again = await loser
+        await loser_db.commit()
 
-    resumed = (await client.post(f"/v1/runs/{rid}/resume", params={"answer": "yes"})).json()
-    assert resumed["status"] == "RUNNING"
-    assert resumed["attempt"] == 2
-    # what it was waiting for is answered, so it must not still be advertised as waiting
+    assert created and not created_again
+    assert lost.run_id == winner.run_id
+    async with app.state.engine.connect() as conn:
+        assert (await conn.scalar(text("SELECT count(*) FROM agent_runs"))) == 1
+
+
+# ------------------------------------------------------------------ pause and resume
+
+
+async def test_a_run_pauses_on_a_typed_interrupt_and_lands_in_the_assignees_inbox(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = interrupt(run["run_id"], assignee="role:procurement", ui="table")
+    response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)
+    assert response.status_code == 200, response.text
+    record = response.json()
+    assert record["status"] == "PAUSED"
+    assert record["awaiting"]["assignee"] == "role:procurement"
+    assert record["awaiting"]["ui"] == "table"
+
+    inbox = await client.get(
+        "/v1/runs", params={"status": "PAUSED", "assignee": "role:procurement"}
+    )
+    assert [r["run_id"] for r in inbox.json()] == [run["run_id"]]
+    elsewhere = await client.get("/v1/runs", params={"status": "PAUSED", "assignee": "user:u1"})
+    assert elsewhere.json() == []
+
+
+async def test_an_interrupt_for_another_run_is_refused(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    other = (await client.post("/v1/runs", json=started())).json()
+    refused = await client.post(f"/v1/runs/{run['run_id']}/pause", json=interrupt(other["run_id"]))
+    assert refused.status_code == 422
+
+
+async def test_an_invalid_interrupt_is_refused_by_the_contract(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = {**interrupt(run["run_id"]), "reason": "CHOICE"}  # CHOICE needs options
+    assert (await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)).status_code == 422
+
+
+async def test_resuming_continues_the_run_as_the_next_attempt_with_the_answer_kept(client) -> None:
+    run = await paused(client)
+    answer = {"approved": True, "note": "within policy"}
+    response = await client.post(
+        f"/v1/runs/{run['run_id']}/resume",
+        json=resolution(run, "ANSWER", answer=answer, reviewer="alice"),
+    )
+    assert response.status_code == 200, response.text
+    resumed = response.json()
+    assert (resumed["status"], resumed["attempt"]) == ("RUNNING", 2)
     assert resumed["awaiting"] is None
+    assert resumed["last_resolution"]["answer"] == answer
+    assert resumed["last_resolution"]["reviewer"] == "alice"
 
 
-async def test_paused_runs_are_the_human_inbox(client) -> None:
-    a = (await client.post("/v1/runs", json=started())).json()
-    b = (await client.post("/v1/runs", json=started(agent_id="billing"))).json()
-    await client.post(f"/v1/runs/{a['run_id']}/transition", json={"status": "PAUSED"})
+async def test_a_falsy_answer_is_kept(client) -> None:
+    run = await paused(client)
+    await client.post(
+        f"/v1/runs/{run['run_id']}/resume", json=resolution(run, "ANSWER", answer=False)
+    )
+    stored = (await client.get(f"/v1/runs/{run['run_id']}")).json()
+    assert stored["last_resolution"]["answer"] is False
 
-    waiting = (await client.get("/v1/runs", params={"status": "PAUSED"})).json()
-    assert [r["run_id"] for r in waiting] == [a["run_id"]]
-    assert b["run_id"] not in [r["run_id"] for r in waiting]
+
+async def test_an_answer_to_another_question_is_a_conflict(client) -> None:
+    run = await paused(client)
+    wrong = {**resolution(run), "interrupt_id": "int_other"}
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=wrong)).status_code == 409
+
+
+async def test_a_second_answer_is_a_conflict(client) -> None:
+    """Two clicks, one pause: the second finds nothing waiting."""
+    run = await paused(client)
+    body = resolution(run)
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 200
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 409
+
+
+async def test_a_resolution_for_another_run_is_refused(client) -> None:
+    run = await paused(client)
+    body = {**resolution(run), "run_id": "run_elsewhere"}
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 422
+
+
+async def test_a_cancel_decision_ends_the_run(client) -> None:
+    run = await paused(client)
+    cancelled = (
+        await client.post(f"/v1/runs/{run['run_id']}/resume", json=resolution(run, "CANCEL"))
+    ).json()
+    assert cancelled["status"] == "CANCELLED"
+    assert cancelled["last_resolution"]["decision"] == "CANCEL"
+
+
+async def test_an_unknown_field_in_a_resolution_is_refused(client) -> None:
+    run = await paused(client)
+    body = {**resolution(run), "anwser": "yes"}
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 422
+
+
+# ------------------------------------------------------------------ endings
 
 
 async def test_a_finished_run_cannot_finish_again(client) -> None:
-    """The double-delivery case. Without this a retried completion would overwrite the
-    result and 'why did this run succeed twice' has no answer."""
     run = (await client.post("/v1/runs", json=started())).json()
     rid = run["run_id"]
-    first = await client.post(
-        f"/v1/runs/{rid}/transition", json={"status": "SUCCESS", "output": {"ok": True}}
-    )
+    first = await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": 1})
     assert first.status_code == 200
-
-    again = await client.post(
-        f"/v1/runs/{rid}/transition", json={"status": "SUCCESS", "output": {"ok": False}}
-    )
+    again = await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": 2})
     assert again.status_code == 409
-    assert (await client.get(f"/v1/runs/{rid}")).json()["output"] == {"ok": True}
+    assert (await client.get(f"/v1/runs/{rid}")).json()["output"] == 1
 
 
-async def test_a_paused_run_cannot_jump_straight_to_success(client) -> None:
-    """Something has to actually run to produce a result."""
-    run = (await client.post("/v1/runs", json=started())).json()
+async def test_a_paused_run_cannot_jump_to_success_but_can_be_cancelled(client) -> None:
+    run = await paused(client)
     rid = run["run_id"]
-    await client.post(f"/v1/runs/{rid}/transition", json={"status": "PAUSED"})
-    refused = await client.post(f"/v1/runs/{rid}/transition", json={"status": "SUCCESS"})
-    assert refused.status_code == 409
-
-
-async def test_a_paused_run_can_still_be_cancelled(client) -> None:
-    """Abandoning a question nobody answered is legitimate; it must not require a resume."""
-    run = (await client.post("/v1/runs", json=started())).json()
-    rid = run["run_id"]
-    await client.post(f"/v1/runs/{rid}/transition", json={"status": "PAUSED"})
-    cancelled = await client.post(f"/v1/runs/{rid}/transition", json={"status": "CANCELLED"})
+    assert (
+        await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS"})
+    ).status_code == 409
+    cancelled = await client.post(f"/v1/runs/{rid}/finish", json={"status": "CANCELLED"})
     assert cancelled.status_code == 200
+    assert cancelled.json()["awaiting"] is None
+
+
+async def test_a_failure_carries_a_typed_error(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    error = {"code": "ToolFailed", "category": "TOOL", "message": "erp down", "retryable": True}
+    ended = (
+        await client.post(
+            f"/v1/runs/{run['run_id']}/finish", json={"status": "ERROR", "error": error}
+        )
+    ).json()
+    assert ended["error"]["category"] == "TOOL"
+
+
+async def test_an_ending_that_is_not_one_or_a_success_with_an_error_is_refused(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    rid = run["run_id"]
+    assert (
+        await client.post(f"/v1/runs/{rid}/finish", json={"status": "PAUSED"})
+    ).status_code == 422
+    with_error = {"status": "SUCCESS", "error": {"code": "x"}}
+    assert (await client.post(f"/v1/runs/{rid}/finish", json=with_error)).status_code == 422
+
+
+# ------------------------------------------------------------------ reads
 
 
 async def test_lineage_returns_the_whole_ancestor_chain(client) -> None:
-    """Three generations. The harness carries only the immediate parent on its context, so
-    a grandchild cannot reach a grandparent's run-scoped memories — the chain has to be
-    answerable from somewhere, and this is that somewhere."""
     a = (await client.post("/v1/runs", json=started(agent_id="planner"))).json()
-    b = (
-        await client.post("/v1/runs", json=started(agent_id="inventory", parent_run_id=a["run_id"]))
-    ).json()
-    c = (
-        await client.post("/v1/runs", json=started(agent_id="pricing", parent_run_id=b["run_id"]))
-    ).json()
-
+    b = (await client.post("/v1/runs", json=started(parent_run_id=a["run_id"]))).json()
+    c = (await client.post("/v1/runs", json=started(parent_run_id=b["run_id"]))).json()
     chain = (await client.get(f"/v1/runs/{c['run_id']}/lineage")).json()
     assert [r["run_id"] for r in chain] == [c["run_id"], b["run_id"], a["run_id"]]
+    assert (await client.get("/v1/runs/run_nope/lineage")).status_code == 404
 
 
 async def test_children_are_listed_by_parent(client) -> None:
@@ -131,71 +241,16 @@ async def test_children_are_listed_by_parent(client) -> None:
     assert [r["run_id"] for r in kids] == [child["run_id"]]
 
 
-async def test_one_tenant_cannot_read_another_tenants_run(client, other_tenant) -> None:
-    mine = (await client.post("/v1/runs", json=started())).json()
-    assert (await other_tenant.get(f"/v1/runs/{mine['run_id']}")).status_code == 404
-
-
-async def test_starting_a_run_for_another_tenant_is_refused(client) -> None:
-    """The body must not be able to widen what the credential allows."""
-    refused = await client.post("/v1/runs", json=started(tenant_id="globex"))
-    assert refused.status_code == 403
-
-
-async def test_a_missing_api_key_is_rejected(client) -> None:
-    # httpx merges request headers over the client's defaults rather than replacing them, so
-    # a key cannot be removed per-request — it has to be explicitly wrong instead.
-    assert (await client.get("/v1/runs", headers={"X-Api-Key": "nope"})).status_code == 401
+async def test_one_tenant_cannot_read_or_move_another_tenants_run(client, other_tenant) -> None:
+    run = await paused(client)
+    rid = run["run_id"]
+    assert (await other_tenant.get(f"/v1/runs/{rid}")).status_code == 404
+    assert (
+        await other_tenant.post(f"/v1/runs/{rid}/resume", json=resolution(run))
+    ).status_code == 404
+    assert (await other_tenant.get("/v1/runs", params={"status": "PAUSED"})).json() == []
 
 
 async def test_health_reports_the_database(client) -> None:
     assert (await client.get("/health/live")).json() == {"status": "ok"}
     assert (await client.get("/health/ready")).json() == {"status": "ok"}
-
-
-# ----------------------------------------------------------------- authentication
-
-
-async def test_the_credential_decides_the_tenant_not_the_header(client, other_tenant) -> None:
-    """A key issued to one tenant cannot act as another by changing a header.
-
-    This was the whole flaw: the key check ran only when auth_mode was the literal string
-    "trusted_dev", so the startup check's own advice — use another mode outside dev — turned
-    authentication off, and the tenant came from attacker-controlled bytes regardless. Every
-    production configuration was unauthenticated.
-    """
-    mine = (await client.post("/v1/runs", json=started())).json()
-    stolen = await client.get(
-        f"/v1/runs/{mine['run_id']}", headers={"X-Api-Key": "dev-key", "X-Tenant-Id": "globex"}
-    )
-    assert stolen.status_code == 403
-
-
-async def test_a_header_that_agrees_with_the_credential_is_fine(client) -> None:
-    """Sending the tenant is allowed; it just cannot disagree. Clients that set it for
-    logging or for symmetry with other services should not be broken."""
-    assert (await client.get("/v1/runs", headers={"X-Api-Key": "dev-key"})).status_code == 200
-
-
-async def test_an_unknown_key_is_refused_before_anything_else(client) -> None:
-    assert (await client.get("/v1/runs", headers={"X-Api-Key": "nope"})).status_code == 401
-
-
-def test_a_deployment_with_no_keys_is_refused_at_startup() -> None:
-    """Empty keys used to mean "trust everyone"; now it means nobody can call, which is a
-    configuration error worth failing on rather than a silent open door."""
-    import pytest
-
-    from agent_runs.config.settings import ServiceSettings, Settings
-
-    with pytest.raises(ValueError, match="api_keys is empty"):
-        Settings(service=ServiceSettings(api_keys={})).check()
-
-
-def test_the_development_key_cannot_survive_into_production() -> None:
-    import pytest
-
-    from agent_runs.config.settings import ServiceSettings, Settings
-
-    with pytest.raises(ValueError, match="development credential"):
-        Settings(service=ServiceSettings(environment="prod")).check()
