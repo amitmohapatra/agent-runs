@@ -11,7 +11,7 @@ from typing import Annotated, Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from trellis.contracts.errors import AgentError
-from trellis.contracts.runs import Interrupt, RunRecord, RunStart, RunStatus
+from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStart, RunStatus
 
 from agent_runs.config.constants import (
     DEFAULT_LEASE_SECONDS,
@@ -126,3 +126,14 @@ class Claimed(BaseModel):
 
     run: RunRecord
     lease: Lease
+
+
+class ResolutionEntry(BaseModel):
+    """One answered interrupt: what was asked, how it was answered, on which attempt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    interrupt: Interrupt
+    resolution: InterruptResolution
+    attempt: int
+    recorded_at: AwareDatetime

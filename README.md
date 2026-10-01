@@ -54,6 +54,7 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
 | `GET /v1/runs/{id}` | one run, the full record |
+| `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
 | `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
 | `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
 | `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |

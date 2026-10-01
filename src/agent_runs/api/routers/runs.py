@@ -17,6 +17,7 @@ from agent_runs.domain.runs import (
     ClaimRequest,
     HeartbeatRequest,
     Lease,
+    ResolutionEntry,
     RunCreate,
     RunFinish,
     RunPause,
@@ -83,7 +84,8 @@ async def pause(
 async def resume(run_id: str, body: InterruptResolution, db: Session, who: Who) -> RunRecord:
     """Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it
     as the next attempt: ``QUEUED`` for a worker when the run came from the queue, else
-    ``RUNNING``. The resolution is kept as ``last_resolution``."""
+    ``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's
+    ``resolutions``, in the same transaction."""
     at = now()
     run = await RunStore(db).resume(who.tenant_id, run_id, body, now=at)
     await WebhookStore(db).announce(run, now=at)
@@ -106,6 +108,13 @@ async def finish(
 @router.get("/{run_id}")
 async def get(run_id: str, db: Session, who: Who) -> RunRecord:
     return await RunStore(db).get(who.tenant_id, run_id)
+
+
+@router.get("/{run_id}/resolutions")
+async def resolutions(run_id: str, db: Session, who: Who) -> list[ResolutionEntry]:
+    """Every interrupt the run paused on and how a person answered it, oldest first: the
+    audit trail ``last_resolution`` is only the end of."""
+    return await RunStore(db).resolutions(who.tenant_id, run_id)
 
 
 @router.get("")
