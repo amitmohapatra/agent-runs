@@ -187,8 +187,8 @@ async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) ->
         async with application.state.engine.begin() as conn:
             await conn.execute(
                 text(
-                    "TRUNCATE run_artifacts, agent_runs, agent_schedules, webhooks, "
-                    "webhook_deliveries"
+                    "TRUNCATE run_resolutions, run_artifacts, agent_runs, agent_schedules, "
+                    "webhooks, webhook_deliveries"
                 )
             )
         yield application

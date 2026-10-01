@@ -135,6 +135,14 @@ Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` 
 refused with `409` unless that worker still holds the run's lease. Workers always send it,
 so a worker whose lease lapsed cannot write over the run another worker has since claimed.
 
+### `GET /v1/runs/{id}/resolutions` → `200 [ResolutionEntry]`
+
+Every interrupt the run paused on and how it was answered, oldest first:
+`{"interrupt": Interrupt, "resolution": InterruptResolution, "attempt": 1, "recorded_at": "…"}`.
+Append-only: `last_resolution` is only the latest of these. A row exists exactly when the
+resume took effect; a refused resume (`409`, `422`) leaves none. `404` for a run the caller's
+tenant does not hold.
+
 ### `POST /v1/runs/{id}/resume` → `200 RunRecord`
 
 Body: an `InterruptResolution` for the interrupt the run waits on:
@@ -145,7 +153,8 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
 ```
 
 `decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`). The
-resolution is kept as `last_resolution`, and:
+resolution is kept as `last_resolution`, appended to the run's resolution history in the
+same transaction (`GET /v1/runs/{id}/resolutions`), and:
 
 - `CANCEL` ends the run: `PAUSED → CANCELLED`.
 - any other decision continues it as the next attempt (`attempt + 1`):

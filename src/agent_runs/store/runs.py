@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
+from trellis.contracts.ids import stable_id
 from trellis.contracts.runs import (
     Interrupt,
     InterruptDecision,
@@ -38,12 +39,13 @@ from agent_runs.domain.runs import (
     ClaimRequest,
     HeartbeatRequest,
     Lease,
+    ResolutionEntry,
     RunFinish,
     RunPause,
     RunSummary,
 )
 from agent_runs.store.artifacts import ArtifactStore
-from agent_runs.store.tables import RunRow
+from agent_runs.store.tables import ResolutionRow, RunRow
 
 _RECORD_FIELDS = (
     "run_id",
@@ -193,9 +195,25 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if row.status != RunStatus.PAUSED or row.awaiting is None:
             raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
-        if Interrupt.model_validate(row.awaiting).interrupt_id != resolution.interrupt_id:
+        asked = Interrupt.model_validate(row.awaiting)
+        if asked.interrupt_id != resolution.interrupt_id:
             raise Conflict(f"run {run_id} is waiting on another interrupt")
         row.last_resolution = _json(resolution)
+        self._session.add(
+            ResolutionRow(
+                resolution_id=stable_id(run_id, resolution.interrupt_id, prefix="res_"),
+                run_id=run_id,
+                tenant_id=tenant_id,
+                interrupt_id=resolution.interrupt_id,
+                decision=resolution.decision.value,
+                reviewer=resolution.reviewer,
+                interrupt=_json(asked) or {},
+                resolution=_json(resolution) or {},
+                attempt=row.attempt,
+                resolved_at=resolution.resolved_at,
+                recorded_at=now,
+            )
+        )
         if resolution.decision is InterruptDecision.CANCEL:
             _move(row, RunStatus.CANCELLED, now)
         elif row.queued_at is not None:
@@ -378,6 +396,26 @@ class RunStore:
         await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
 
     # ------------------------------------------------------------------ reads
+    async def resolutions(self, tenant_id: str, run_id: str) -> list[ResolutionEntry]:
+        """Every interrupt the run was asked and how it was answered, oldest first."""
+        await self.get(tenant_id, run_id)  # 404 for another tenant's run, as everywhere
+        rows = (
+            await self._session.scalars(
+                select(ResolutionRow)
+                .where(ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id)
+                .order_by(ResolutionRow.recorded_at, ResolutionRow.resolution_id)
+            )
+        ).all()
+        return [
+            ResolutionEntry(
+                interrupt=Interrupt.model_validate(r.interrupt),
+                resolution=InterruptResolution.model_validate(r.resolution),
+                attempt=r.attempt,
+                recorded_at=r.recorded_at,
+            )
+            for r in rows
+        ]
+
     async def get(self, tenant_id: str, run_id: str) -> RunRecord:
         row = await self._one(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
         if row is None:

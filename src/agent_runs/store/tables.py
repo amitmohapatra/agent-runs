@@ -178,6 +178,32 @@ class WebhookDeliveryRow(Base):
     )
 
 
+class ResolutionRow(Base):
+    """Every answer a run's interrupts got, append-only: who decided what about which question
+    and when. ``agent_runs.last_resolution`` keeps only the latest, and HITL decisions are
+    audit records. Written in the resume's own transaction, so a row exists exactly when the
+    resume took effect."""
+
+    __tablename__ = "run_resolutions"
+
+    #: stable_id(run_id, interrupt_id): an interrupt is answered once
+    resolution_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), ForeignKey("agent_runs.run_id"))
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    interrupt_id: Mapped[str] = mapped_column(String(64))
+    decision: Mapped[str] = mapped_column(String(16))
+    reviewer: Mapped[str | None] = mapped_column(String(256))
+    #: the Interrupt as it was asked (question, tool call) and the InterruptResolution
+    interrupt: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    resolution: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    #: the attempt that paused on it
+    attempt: Mapped[int] = mapped_column(Integer)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_run_resolutions_run", "tenant_id", "run_id", "recorded_at"),)
+
+
 class ArtifactRow(Base):
     """A run artifact: what it is and whose; the bytes are in the blob store at ``blob_key``.
     ``expires_at`` is set when the run ends; the ticker deletes the artifact after it."""
