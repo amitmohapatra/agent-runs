@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Body, Path, Request, Response
 from trellis.contracts.ids import now
 
+from agent_runs.api import examples
 from agent_runs.api.deps import Session, Who
+from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
     CursorQuery,
@@ -24,9 +27,23 @@ _CREATED = 201
 _NO_CONTENT = 204
 
 
-@router.post("", status_code=_CREATED)
+WebhookId = Annotated[str, Path(description="The subscription's id (`wh_…`).")]
+
+
+@router.post(
+    "",
+    status_code=_CREATED,
+    summary="Subscribe to run events",
+    response_description="Created: the subscription with its `secret`, shown here only; "
+    "`Location` names it.",
+    responses=conflict("CONFLICT: the tenant already has 20 subscriptions."),
+)
 async def create(
-    body: WebhookCreate, request: Request, response: Response, db: Session, who: Who
+    body: Annotated[WebhookCreate, Body(openapi_examples=examples.WEBHOOK)],
+    request: Request,
+    response: Response,
+    db: Session,
+    who: Who,
 ) -> WebhookCreated:
     """Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,
     which signs every delivery to it; it is shown here and never again."""
@@ -42,7 +59,12 @@ async def create(
 _CURSOR = {"created_at": datetime, "webhook_id": str}
 
 
-@router.get("", name="list")
+@router.get(
+    "",
+    name="list",
+    summary="List subscriptions",
+    response_description="A page of this tenant's subscriptions, oldest first, without secrets.",
+)
 async def listing(
     request: Request,
     response: Response,
@@ -59,14 +81,23 @@ async def listing(
     return page.items
 
 
-@router.get("/{webhook_id}")
-async def get(webhook_id: str, db: Session, who: Who) -> Webhook:
-    """One subscription, without its secret."""
+@router.get(
+    "/{webhook_id}",
+    summary="Read a subscription",
+    response_description="The subscription, without its secret.",
+)
+async def get(webhook_id: WebhookId, db: Session, who: Who) -> Webhook:
+    """One subscription of this tenant, without its secret. Another tenant's is 404."""
     return await WebhookStore(db).get(who.tenant_id, webhook_id)
 
 
-@router.delete("/{webhook_id}", status_code=_NO_CONTENT)
-async def delete(webhook_id: str, db: Session, who: Who) -> Response:
+@router.delete(
+    "/{webhook_id}",
+    status_code=_NO_CONTENT,
+    summary="Unsubscribe",
+    response_description="Deleted, with the deliveries still owed to it.",
+)
+async def delete(webhook_id: WebhookId, db: Session, who: Who) -> Response:
     """Unsubscribe; deliveries still owed to it are dropped."""
     await WebhookStore(db).delete(who.tenant_id, webhook_id)
     await db.commit()

@@ -66,6 +66,7 @@ flowchart LR
 | Component | Where | What it owns |
 |---|---|---|
 | API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface |
+| OpenAPI | `api/openapi.py` `custom_openapi`, `api/examples.py`, `tools/export_openapi.py` | the document every route shares (metadata, `<tag>.<function>` ids, the `ApiKeyAuth` scheme, a problem on every error status, standard headers); `docs/openapi.json` is it committed, and `tests/test_openapi.py` fails when they differ |
 | Errors | `api/errors.py` `install_error_handlers`, `Problem`; `domain/errors.py` `ErrorCode` | every failure as an RFC 9457 problem: `ServiceError` subclasses with their status and `code`, FastAPI's validation and HTTP errors, a database that went away (`503`, `Retry-After`), anything else (`500`, no internals) |
 | Middleware | `api/middleware.py` `RequestContextMiddleware`, `BodyLimitMiddleware`, `CompressionMiddleware` | `X-Request-ID` in, out and in every problem; request metrics by route template; the JSON body cap counted as bytes arrive; gzip, except artifact bytes |
 | Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | a token bucket per tenant per worker process; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
@@ -410,6 +411,8 @@ src/agent_runs/
   api/errors.py        Problem, install_error_handlers(): every error as a problem
   api/middleware.py    request context (id, metrics), body cap, compression
   api/pagination.py    cursor in, Link: rel="next" out
+  api/openapi.py       the OpenAPI document: metadata, ids, problems, headers
+  api/examples.py      a request example for every body
   api/ratelimit.py     TenantRateLimiter: a token bucket per tenant, per process
   api/routers/ops.py   /health/live, /health/ready, /metrics
   api/deps.py          Caller, caller(), session(): who is calling, a session per request
@@ -421,5 +424,6 @@ src/agent_runs/
                        paging.py (Page, page_of: keyset pages)
   blob/                port.py (BlobStore, read), filesystem.py, gcs.py, open_blob_store()
   config/              settings.py (RUNS__* deployment facts), constants.py (design decisions)
+  tools/               export_openapi.py: docs/openapi.json (make openapi)
   observability/       logging.py (structlog, JSON or console), metrics.py (Prometheus)
 ```

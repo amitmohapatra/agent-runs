@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
@@ -16,6 +17,7 @@ from agent_runs.api.middleware import (
     CompressionMiddleware,
     RequestContextMiddleware,
 )
+from agent_runs.api.openapi import TITLE, custom_openapi, operation_id
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.api.routers import artifacts, ops, runs, schedules, webhooks
 from agent_runs.blob import open_blob_store
@@ -49,7 +51,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await engine.dispose()
             log.info("agent_runs.stopped")
 
-    app = FastAPI(title="agent-runs", version=version("agent-runs"), lifespan=lifespan)
+    app = FastAPI(
+        title=TITLE,
+        version=version("agent-runs"),
+        lifespan=lifespan,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        generate_unique_id_function=operation_id,
+    )
     app.state.settings = settings
     app.state.limiter = TenantRateLimiter(settings.rate_limit)
     # Added innermost first: a request meets the request context (id, metrics), then the
@@ -63,4 +73,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(artifacts.router)
     app.include_router(schedules.router)
     app.include_router(webhooks.router)
+
+    def openapi() -> dict[str, Any]:
+        return custom_openapi(app)
+
+    app.openapi = openapi  # type: ignore[method-assign]
     return app

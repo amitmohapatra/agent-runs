@@ -1,4 +1,4 @@
-# agent-runs API (0.2.0)
+# agent-runs API (0.3.0)
 
 Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
 same header), a key issued by the Memory Service (the one key registry; see
@@ -7,6 +7,16 @@ same header), a key issued by the Memory Service (the one key registry; see
 routes (`/health/live`, `/health/ready`) and FastAPI's own `/docs` and `/openapi.json` need
 no key. Bodies are JSON; the record types are `trellis.contracts.runs` models, serialised as
 pydantic does.
+
+The machine-readable contract is [openapi.json](openapi.json) (OpenAPI 3.1, generated from
+the code and checked against it by the suite and CI; `make openapi` rewrites it), served live
+at `/openapi.json` with `/docs` (Swagger UI) and `/redoc`. Operation ids are
+`<tag>.<function>` (`runs.start`, `runs.list`, `schedules.fire`, …); every operation documents
+its error statuses with the `Problem` schema, and every request body has an example.
+
+0.3.0 changed the wire in place (its consumers are the platform's own repositories): errors
+are problems instead of `{"detail": …}`, listings page with `cursor` and `Link`, and the
+limits, the rate limit and the repeat semantics below are new.
 
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated

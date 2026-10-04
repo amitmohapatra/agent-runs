@@ -7,13 +7,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Header, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.contracts.ids import new_id, now
 
 from agent_runs.api.deps import Session, Who
-from agent_runs.api.routers.runs import WorkerId
+from agent_runs.api.openapi import conflict
+from agent_runs.api.routers.runs import RunId, WorkerId
 from agent_runs.blob import BlobCorrupt, BlobNotFound, BlobStore, read
 from agent_runs.config.constants import MAX_ARTIFACT_BYTES
 from agent_runs.domain.errors import NotFound, ServiceError, TooLarge, Unprocessable
@@ -39,14 +40,32 @@ _TOO_LARGE = f"an artifact is at most {MAX_ARTIFACT_BYTES} bytes"
 
 #: The SHA-256 the caller computed, ``sha256:<hex>``: the upload is refused (422) unless the
 #: bytes that arrived match it.
-Checksum = Annotated[str | None, Query(pattern=r"^sha256:[0-9a-f]{64}$")]
+Checksum = Annotated[
+    str | None,
+    Query(
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="The SHA-256 the caller computed, `sha256:<hex>`: the upload is refused "
+        "(422) unless the bytes that arrived match it.",
+    ),
+]
+ArtifactId = Annotated[str, Path(description="The artifact's id (`art_…`).")]
 
 _UPLOAD_BODY = {
     "requestBody": {
         "required": True,
         "description": "The artifact's bytes; Content-Type is its mime type "
         "(application/json for an ask table).",
-        "content": {"*/*": {"schema": {"type": "string", "format": "binary"}}},
+        "content": {
+            "*/*": {
+                "schema": {"type": "string", "format": "binary"},
+                "examples": {
+                    "ask_table": {
+                        "summary": "An ask table, as JSON",
+                        "value": {"columns": ["sku", "qty"], "rows": [["A-1", 12]]},
+                    }
+                },
+            }
+        },
     }
 }
 
@@ -90,11 +109,28 @@ async def _nonempty(request: Request) -> AsyncIterator[bytes]:
 @router.post(
     "/v1/runs/{run_id}/artifacts",
     status_code=_CREATED,
-    responses={_OK: {"model": ArtifactRef}},
+    summary="Store an artifact of a run",
+    response_description="Created: the artifact's reference (for `Interrupt.payload_ref`); "
+    "`Location` names its bytes.",
+    responses={
+        _OK: {
+            "model": ArtifactRef,
+            "description": "A repeat: the same bytes were already stored for this run; the "
+            "first artifact.",
+        },
+        403: {
+            "description": "AUTHORIZATION: the run is paused and the key's role is not "
+            "`service`, or the key may not act in this tenant."
+        },
+        **conflict(
+            "LEASE_LOST: a `worker_id` that does not hold the run's lease. CONFLICT: a leased "
+            "run without `worker_id`, or a run that is no longer running or paused."
+        ),
+    },
     openapi_extra=_UPLOAD_BODY,
 )
 async def upload(
-    run_id: str,
+    run_id: RunId,
     request: Request,
     db: Session,
     who: Who,
@@ -105,7 +141,8 @@ async def upload(
     """Store the body as an artifact of the run and return its reference. While the run is
     ``RUNNING`` a leased run takes only its lease holder's ``worker_id`` (409 otherwise);
     while ``PAUSED`` only a service key may add one (403); never after (409). The same bytes
-    uploaded to the same run again answer 200 with the first artifact."""
+    uploaded to the same run again answer 200 with the first artifact. At most 50 MiB,
+    streamed to the blob store as it arrives (413 past it); an empty body is 422."""
     runs = RunStore(db)
     # fail fast, before the bytes are read and stored; checked again, locked, below
     await runs.check_artifact_writer(
@@ -149,9 +186,32 @@ async def upload(
 @router.get(
     "/v1/artifacts/{artifact_id}",
     response_class=StreamingResponse,
-    responses={_OK: {"content": {"*/*": {}}, "description": "the artifact's bytes"}},
+    summary="Read an artifact's bytes",
+    responses={
+        _OK: {
+            "content": {"*/*": {"schema": {"type": "string", "format": "binary"}}},
+            "description": "The artifact's bytes, with its `Content-Type`, `Content-Length`, "
+            "`ETag` (its checksum) and `Cache-Control: private, max-age=31536000, immutable`.",
+        },
+        _NOT_MODIFIED: {"description": "The client's copy (`If-None-Match`) is this artifact."},
+        500: {
+            "description": "INTERNAL: the stored bytes no longer match their checksum; "
+            "they are never served."
+        },
+    },
 )
-async def download(artifact_id: str, request: Request, db: Session, who: Who) -> Response:
+async def download(
+    artifact_id: ArtifactId,
+    request: Request,
+    db: Session,
+    who: Who,
+    if_none_match: Annotated[
+        str | None,
+        Header(
+            description="ETags the client holds (`*` for any); naming this artifact's is a 304."
+        ),
+    ] = None,
+) -> Response:
     """The artifact's bytes, streamed with its mime type, verified against its checksum as
     they are read (a corrupted object is cut short, never served whole). 404 for another
     tenant's artifact, or one deleted after its run's retention. An artifact never changes
@@ -161,7 +221,7 @@ async def download(artifact_id: str, request: Request, db: Session, who: Who) ->
     await db.close()  # nothing more to read: no connection held while streaming
     etag = f'"{row.checksum}"'
     cached = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
-    if _matches(request.headers.get("if-none-match"), etag):
+    if _matches(if_none_match, etag):
         return Response(status_code=_NOT_MODIFIED, headers=cached)
     stream = read(_blobs(request), row.blob_key, sha256=sha256_of(row), size=row.size)
     try:

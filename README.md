@@ -73,7 +73,8 @@ stateDiagram-v2
 
 ## The API
 
-Every `/v1` route needs `X-API-Key`; the health routes do not. Every error is an RFC 9457
+Every `/v1` route needs `X-API-Key`; the ops routes do not. The OpenAPI document is
+[docs/openapi.json](docs/openapi.json) (live at `/openapi.json`, `/docs`, `/redoc`). Every error is an RFC 9457
 problem (`application/problem+json`) with a stable `code` (`LEASE_LOST` tells a worker to
 stop; `DEPENDENCY_UNAVAILABLE` and `RATE_LIMIT` come with `Retry-After`).
 [docs/api.md](docs/api.md) has every route, body, status code and problem `code`, and the
@@ -215,6 +216,7 @@ documented in [.env.example](.env.example); every other number is a named consta
 ```bash
 make lint typecheck test
 make coverage                # the suite with line and branch coverage, failing under 95%
+make openapi                 # rewrite docs/openapi.json after changing a route or a model
 ```
 
 The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
@@ -228,5 +230,7 @@ skip. Migrations live in `alembic/versions`; a test checks they build exactly th
 code maps.
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright,
-the migrations up, down to base and up again, and the suite with the coverage floor, against
-PostgreSQL 16 with `agent-contracts` checked out beside this repository.
+the migrations up, down to base and up again, the suite with the coverage floor, and a diff
+of `docs/openapi.json` against the document the code generates, against PostgreSQL 16 with
+`agent-contracts` checked out beside this repository. The OpenAPI document embeds the
+contracts' models, so it is regenerated whenever `agent-contracts` changes them.

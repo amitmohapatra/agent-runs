@@ -48,3 +48,8 @@ jobs:
       # the GCS adapter's fake-server tests stay opt-in (RUNS_TEST_GCS=1); the in-memory
       # client covers the adapter here
       - run: uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95
+      # the committed OpenAPI document is the one the code generates (`make openapi`)
+      - name: OpenAPI document is current
+        run: |
+          uv run python -m agent_runs.tools.export_openapi "$RUNNER_TEMP/openapi.json"
+          diff -u docs/openapi.json "$RUNNER_TEMP/openapi.json"

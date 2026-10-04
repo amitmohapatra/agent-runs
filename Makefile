@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint typecheck test coverage migrate image up down
+.PHONY: help install lint typecheck test coverage openapi migrate image up down
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -19,6 +19,9 @@ test: ## Run the test suite (needs the local PostgreSQL)
 
 coverage: ## The suite with line and branch coverage, failing under 95%
 	uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95
+
+openapi: ## Rewrite docs/openapi.json from the code (commit it with the change)
+	uv run python -m agent_runs.tools.export_openapi docs/openapi.json
 
 migrate: ## Bring the database to the latest schema
 	uv run alembic upgrade head
