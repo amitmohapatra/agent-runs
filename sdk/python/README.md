@@ -9,8 +9,25 @@ pip install trellis-runs        # imports as trellis.runs
 
 It depends on `httpx`, `pydantic` and `trellis-contracts` only. It imports no agent framework
 and no harness, so it plugs into whatever runs your agent: LangGraph, OpenAI Agents, the
-Claude Agent SDK or plain code. With [agent-harness](https://github.com/amitmohapatra/agent-harness),
-`h.wrap(agent)` makes these calls for you.
+Claude Agent SDK or plain code.
+
+## Use it directly, or let the harness drive it
+
+- **Let the harness drive it (Way 1)** when your agent is wrapped: with `RUNS_URL` set,
+  [agent-harness](https://github.com/amitmohapatra/agent-harness)'s `h.wrap(agent)` starts,
+  queues, pauses, resumes and finishes runs with this client, lists the inbox
+  (`h.inbox()`), creates schedules (`agent.schedule(...)`) and runs wrapped agents on
+  `Worker` (`h.worker(...)`). You write none of these calls.
+- **Use it directly (Way 2)** when your own framework runs the agent and you want what
+  agent-runs adds without handing over execution: a run that survives the process, a queue
+  of workers, the inbox, schedules. Also when the caller is not an agent: a UI reading the
+  inbox, a job creating schedules, or a webhook receiver, which uses
+  [`verify_signature`](#webhooks) in both ways.
+
+[The two ways to use Trellis](../../README.md#where-this-fits-two-ways-to-use-trellis), and
+what this service does in each, are in agent-runs' README.
+
+On this page:
 
 - [Quickstart](#quickstart)
 - [Configuration and tenants](#configuration-and-tenants)
