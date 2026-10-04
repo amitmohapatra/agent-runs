@@ -35,7 +35,7 @@ from agent_runs.config.constants import (
     MAX_CONSECUTIVE_FAILURES,
 )
 from agent_runs.domain.cadence import next_fire_at, validate_cadence
-from agent_runs.domain.errors import NotFound, Unprocessable
+from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
 from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
 from agent_runs.store.tables import ScheduleRow
@@ -55,7 +55,9 @@ def _checked(fields: dict[str, Any]) -> ScheduleSpec:
     try:
         spec = ScheduleSpec.model_validate(fields)
     except ValidationError as exc:
-        raise Unprocessable(str(exc)) from exc
+        raise Unprocessable(
+            "the schedule is invalid", details={"errors": field_errors(exc.errors())}
+        ) from exc
     return spec.model_copy(update={"cadence": validate_cadence(spec.cadence)})
 
 

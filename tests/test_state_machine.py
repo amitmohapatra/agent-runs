@@ -57,11 +57,15 @@ async def status_of(client: AsyncClient, run_id: str) -> str:
 
 @pytest.mark.parametrize("start", LIVE + ENDINGS)
 async def test_finish_follows_the_state_machine(client, start: str) -> None:
-    """Each ending tried on a fresh run in ``start``."""
+    """Each ending tried on a fresh run in ``start``. The ending a run already has, from
+    the caller that gave it, is a repeat: the stored run, unchanged (``test_runs.py``)."""
     for end in ENDINGS:
         run = await in_status(client, start)
         response = await client.post(f"/v1/runs/{run['run_id']}/finish", json=ending(end))
-        if end in FINISHABLE.get(start, set()):
+        if end == start:
+            assert response.status_code == 200, (end, response.text)
+            assert response.json() == run
+        elif end in FINISHABLE.get(start, set()):
             assert response.status_code == 200, (end, response.text)
             ended = response.json()
             assert ended["status"] == end

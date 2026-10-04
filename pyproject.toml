@@ -55,6 +55,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 "src/agent_runs/api/routers/artifacts.py" = ["PLR0913", "PLR0917"]
 "src/agent_runs/store/runs.py" = ["PLR0913"]
 "src/agent_runs/store/artifacts.py" = ["PLR0913"]
+# A problem has nine members; its builders take them by keyword.
+"src/agent_runs/api/errors.py" = ["PLR0913"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

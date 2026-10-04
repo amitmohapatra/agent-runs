@@ -18,7 +18,7 @@ executes an agent: the harness does, and records here what happened.
 
 ```mermaid
 flowchart LR
-  subgraph clients["Clients (X-Api-Key)"]
+  subgraph clients["Clients (X-API-Key)"]
     harness["agent-harness<br/>HttpRuns: in-process runs<br/>and trellis workers"]
     ui["Inbox UI / its backend"]
   end
@@ -63,8 +63,10 @@ flowchart LR
 
 | Component | Where | What it owns |
 |---|---|---|
-| API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface; one exception handler turns `domain.errors.ServiceError` subclasses into `{"detail": …}` with their status |
-| Caller resolution | `api/deps.py` `caller`, `Caller` | `X-Api-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
+| API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface |
+| Errors | `api/errors.py` `install_error_handlers`, `Problem`; `domain/errors.py` `ErrorCode` | every failure as an RFC 9457 problem: `ServiceError` subclasses with their status and `code`, FastAPI's validation and HTTP errors, a database that went away (`503`, `Retry-After`), anything else (`500`, no internals) |
+| Request context | `api/middleware.py` `RequestContextMiddleware` | `X-Request-ID` in, out, and in every problem |
+| Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
@@ -127,6 +129,12 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
 - `MAX_ATTEMPTS` is 5 (`config/constants.py`).
+- A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
+  move clears it. A repeat of that call (the same caller, to the same status, on the same
+  interrupt for a pause) is answered with the stored run and moves nothing (`_settled`),
+  so a worker that lost the answer may retry. Otherwise a fenced write (`worker_id`) on a
+  run whose lease the worker no longer holds is `LeaseLost` (`409 LEASE_LOST`, `_fence`),
+  checked before the transition.
 
 ## Start, interrupt, resume
 
@@ -158,7 +166,7 @@ sequenceDiagram
   A-->>W: 200 Claimed {run RUNNING, lease}
   loop every third of the lease
     W->>A: POST /v1/runs/{id}/heartbeat {worker_id}
-    A-->>W: 200 Lease (409 = lease lost, stop)
+    A-->>W: 200 Lease (409 LEASE_LOST = stop)
   end
 
   W->>A: POST /v1/runs/{id}/artifacts?worker_id= (bytes)
@@ -241,8 +249,8 @@ moves forward past now, so a long outage fires each schedule once, not once per 
 
 ## The tables
 
-Six tables, built by the eight Alembic revisions in `alembic/versions` (head
-`d3c8e9f0a1b2`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
+Six tables, built by the nine Alembic revisions in `alembic/versions` (head
+`e4d9f0a1b2c3`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
 line is the logical link a schedule fire leaves (no foreign key: a run outlives the schedule
 that fired it).
 
@@ -278,6 +286,7 @@ erDiagram
     timestamptz queued_at "set once the run entered the queue"
     varchar lease_owner
     timestamptz lease_expires_at
+    varchar settled_by "worker_id of the pause or finish that made the state"
     timestamptz created_at
     timestamptz updated_at
   }
@@ -373,7 +382,7 @@ The indexes each serve one query:
 The migrations, oldest first: `1f6242bb21de` initial runs table, `7c1d2e3f4a5b` queue, lease
 and inbox, `8d2e3f4a5b6c` schedules, `9e3f4a5b6c7d` run checkpoint, `a0f4b5c6d7e8` schedule
 identity, `b1a5c6d7e8f9` webhook subscriptions, `c2b6d7e8f9a0` run artifacts,
-`d3c8e9f0a1b2` run resolutions. Each has a downgrade; CI runs upgrade, downgrade to base and
+`d3c8e9f0a1b2` run resolutions, `e4d9f0a1b2c3` run `settled_by`. Each has a downgrade; CI runs upgrade, downgrade to base and
 upgrade again.
 
 ## Code map
@@ -383,15 +392,17 @@ src/agent_runs/
   __main__.py          agent-runs: uvicorn on RUNS__SERVICE__HOST:PORT
   ticker.py            agent-runs-ticker: Ticker, run(), main()
   heartbeat.py         the ticker's liveness file; python -m agent_runs.heartbeat is the probe
-  keys.py              KeyRegistry, KeyInfo: who an X-Api-Key is
+  keys.py              KeyRegistry, KeyInfo: who an X-API-Key is
   firing.py            Firing: one schedule tick → one queued run
   webhooks.py          WebhookSender, sign: delivering the outbox
   retry.py             backoff(), Breaker: the one retry policy
-  api/app.py           create_app(): routers, the ServiceError handler, health routes
+  api/app.py           create_app(): routers, middleware, error handlers, health routes
+  api/errors.py        Problem, install_error_handlers(): every error as a problem
+  api/middleware.py    RequestContextMiddleware: X-Request-ID
   api/deps.py          Caller, caller(), session(): who is calling, a session per request
   api/routers/         runs.py, artifacts.py, schedules.py, webhooks.py
   domain/              runs.py, schedules.py, webhooks.py (request and answer models),
-                       cadence.py (validate_cadence, next_fire_at), errors.py (status codes)
+                       cadence.py (validate_cadence, next_fire_at), errors.py (status, ErrorCode)
   store/               tables.py (the mappings), runs.py, schedules.py, webhooks.py,
                        artifacts.py, database.py (connect + the head-revision check)
   blob/                port.py (BlobStore, read), filesystem.py, gcs.py, open_blob_store()

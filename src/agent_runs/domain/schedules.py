@@ -89,12 +89,15 @@ class FireFailed(Unavailable):
 
     def __init__(self, schedule: Schedule, error: AgentError) -> None:
         super().__init__(
-            {
-                "message": f"schedule {schedule.schedule_id} could not fire: {error.message}",
+            # the database's own words stay in details.error (and the schedule's last_error)
+            f"schedule {schedule.schedule_id} could not queue its run",
+            details={
                 "consecutive_failures": schedule.consecutive_failures,
                 "auto_paused": not schedule.enabled,
                 "error": error.model_dump(mode="json"),
-            }
+            },
+            # worth repeating only while the schedule still fires and the cause may pass
+            retryable=error.retryable and schedule.enabled,
         )
 
 

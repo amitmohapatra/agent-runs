@@ -74,8 +74,9 @@ async def pause(
     """The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that
     inbox. ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound)."""
     at = now()
-    run = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    await WebhookStore(db).announce(run, now=at)
+    run, paused = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
+    if paused:
+        await WebhookStore(db).announce(run, now=at)
     await db.commit()
     return run
 
@@ -99,8 +100,9 @@ async def finish(
 ) -> RunRecord:
     """End the run. Cancelling a queued or paused run is a finish with ``CANCELLED``."""
     at = now()
-    run = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    await WebhookStore(db).announce(run, now=at)
+    run, ended = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
+    if ended:
+        await WebhookStore(db).announce(run, now=at)
     await db.commit()
     return run
 

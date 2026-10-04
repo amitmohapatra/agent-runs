@@ -1,25 +1,48 @@
 # agent-runs API (0.2.0)
 
-Every `/v1` route needs `X-Api-Key`, a key issued by the Memory Service (the one key
-registry; see [Authentication](#authentication)). A platform key (`tenant_id: null`) also
-sends `X-Trellis-Tenant: <tenant>`; a tenant key may send it only with its own tenant. The
-health routes (`/health/live`, `/health/ready`) and FastAPI's own `/docs` and
-`/openapi.json` need no key. Bodies are JSON; the record types are `trellis.contracts.runs`
-models, serialised as pydantic does. Errors answer `{"detail": ...}`: a string, an object
-for a failed schedule fire, or FastAPI's list of field errors for a body or query that does
-not validate.
+Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
+same header), a key issued by the Memory Service (the one key registry; see
+[Authentication](#authentication)). A platform key (`tenant_id: null`) also sends
+`X-Trellis-Tenant: <tenant>`; a tenant key may send it only with its own tenant. The health
+routes (`/health/live`, `/health/ready`) and FastAPI's own `/docs` and `/openapi.json` need
+no key. Bodies are JSON; the record types are `trellis.contracts.runs` models, serialised as
+pydantic does.
 
-| Status | Means |
-|---|---|
-| `400` | a platform key named no tenant |
-| `401` | missing `X-Api-Key`, or one the key registry does not know (or revoked, expired) |
-| `403` | the registry refuses the key (a suspended tenant), the body or header names another tenant, `on_behalf_of` the key may not act as, or an artifact for a paused run from a key whose role is not `service` |
-| `404` | no such run, schedule, webhook or artifact in this tenant |
-| `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook |
-| `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON, or an artifact larger than 50 MiB |
-| `422` | the body or query is invalid (including the contracts' own validators) |
-| `500` | an artifact's stored bytes no longer match their checksum (never served) |
-| `503` | the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule) |
+Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
+or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
+`req_…`.
+
+## Errors
+
+Every error is an RFC 9457 problem, `Content-Type: application/problem+json`, in the Memory
+Service's shape, so one client reads both services:
+
+```json
+{"type": "urn:trellis:problem:lease-lost", "title": "Lease lost", "status": 409,
+ "detail": "worker w-1 does not hold the lease on run run_…",
+ "instance": "/v1/runs/run_…/finish", "code": "LEASE_LOST", "retryable": false,
+ "request_id": "req_…", "details": {}}
+```
+
+`code` is the stable category to branch on (`type` is its URN, `title` its fixed words);
+`detail` is this occurrence and never echoes a submitted value; `retryable: true` means the
+same request may succeed later, and then a `429` or `503` carries `Retry-After` (seconds).
+`details` is structured context: `errors` (each `{loc, msg, type}`) for a `422`, the
+schedule's state for a failed fire, `differing` for a reused idempotency key.
+
+| Status | `code` | Means |
+|---|---|---|
+| `400` | `VALIDATION` | a platform key named no tenant |
+| `401` | `AUTHENTICATION` | missing `X-API-Key`, or one the key registry does not know (or revoked, expired) |
+| `403` | `AUTHORIZATION` | the registry refuses the key (a suspended tenant), the body or header names another tenant, `on_behalf_of` the key may not act as, or an artifact for a paused run from a key whose role is not `service` |
+| `404` | `NOT_FOUND` | no such run, schedule, webhook or artifact in this tenant (or no such route) |
+| `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
+| `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled or finished. **Stop working the run.** |
+| `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook |
+| `413` | `PAYLOAD_TOO_LARGE` | a pause's `checkpoint` is larger than 1 MiB of compact JSON, or an artifact larger than 50 MiB |
+| `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators) |
+| `500` | `INTERNAL` | a fault here (an artifact's stored bytes no longer match their checksum, a statement the database refuses, anything unanticipated); the detail says nothing about internals |
+| `503` | `DEPENDENCY_UNAVAILABLE` | PostgreSQL did not answer (no connection, a connection lost, no pooled connection free in time, a statement past its timeout), the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule); retryable, with `Retry-After: 5` (a fire that paused its schedule is not retryable) |
 
 ## Every route
 
@@ -29,12 +52,12 @@ table have the bodies and the exact semantics.
 
 | Method and path | Body / query | Success | Errors besides `auth` |
 |---|---|---|---|
-| `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id of another tenant, `422` |
+| `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` | `200 Claimed`, `204` nothing queued | `422` |
-| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds}` | `200 Lease` | `404`, `409` lease lost or run not `RUNNING`, `422` |
-| `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`) | `404`, `409` not `RUNNING` or not the lease holder, `413`, `422` interrupt of another run |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `404`, `409` not `PAUSED` or another interrupt, `422` another run |
-| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` | `404`, `409` illegal ending or not the lease holder, `422` not an ending, `error` on a non-failure |
+| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
 | `GET /v1/runs/{id}/resolutions` | | `200 [ResolutionEntry]` | `404` |
 | `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&limit=` | `200 [RunSummary]` | `422` |
@@ -50,7 +73,7 @@ table have the bodies and the exact semantics.
 | `GET /v1/webhooks` | | `200 [Webhook]` | |
 | `DELETE /v1/webhooks/{id}` | | `204` | `404` |
 | `GET /health/live` | no key | `200 {"status": "ok"}` | |
-| `GET /health/ready` | no key | `200 {"status": "ok"}` | `500` the database does not answer |
+| `GET /health/ready` | no key | `200 {"status": "ok"}` | `503` the database does not answer within 3 s |
 
 ## Authentication
 
@@ -62,7 +85,7 @@ Request: the caller's key, unchanged, as the Memory Service authenticates any ca
 
 ```
 GET /v1/keys/self
-X-Api-Key: <the key agent-runs was sent>
+X-API-Key: <the key agent-runs was sent>
 ```
 
 Answers (anything else, a timeout of 3 s or an unreachable service is `503` here, not cached):
@@ -108,8 +131,13 @@ Body: `RunStart` plus `queue`.
 Only `tenant_id` and `agent_id` are required; `run_id` is minted when absent. `queue: false`
 records a run already `RUNNING` in the caller's process; `queue: true` puts it `QUEUED` for a
 worker. Idempotent: a start whose `run_id`, or whose `(tenant_id, idempotency_key)`, already
-exists answers `200` with the existing run (a run id held by another tenant is `409`).
-`on_behalf_of` must be a principal the key may act as.
+exists answers `200` with the existing run. A run id held by another tenant is `409
+CONFLICT` that says only that the id cannot be used, not that or by whom it is held. An
+`idempotency_key` repeated with a different start (any of `agent_id`, `parent_run_id`,
+`thread_id`, `user_id`, `workspace_id`, `on_behalf_of`, `input`, `deadline`, `metadata`,
+`queue`; not `run_id`, which is minted when absent) is `409 CONFLICT` with
+`details.differing` naming the fields, and no run. `on_behalf_of` must be a principal the key
+may act as.
 
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
@@ -136,10 +164,10 @@ queued for those agents; poll again later.
 {"worker_id": "w-1", "lease_seconds": 60}
 ```
 
-Extends the lease to `now + lease_seconds`. `409` means the lease is no longer this
-worker's (it lapsed and the run was re-queued, possibly claimed by another worker) or the
-run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do not
-write to it**. Heartbeat well inside the lease (every third of it).
+Extends the lease to `now + lease_seconds`. `409 LEASE_LOST` means the lease is no longer
+this worker's (it lapsed and the run was re-queued, possibly claimed by another worker) or
+the run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do
+not write to it**. Heartbeat well inside the lease (every third of it).
 
 ### `POST /v1/runs/{id}/pause?worker_id=` → `200 RunRecord`
 
@@ -168,8 +196,14 @@ Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` 
 (`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. Heartbeats do not carry one.
 
 `worker_id` (query, optional, also on `finish`) fences the write: when given, the write is
-refused with `409` unless that worker still holds the run's lease. Workers always send it,
-so a worker whose lease lapsed cannot write over the run another worker has since claimed.
+refused with `409 LEASE_LOST` unless that worker still holds the run's lease. Workers always
+send it, so a worker whose lease lapsed cannot write over the run another worker has since
+claimed.
+
+**A repeated pause is not an error.** A pause of a run that is already `PAUSED` on the same
+`interrupt_id` by the same caller (the same `worker_id`, or none both times) answers `200`
+with the run as stored and changes nothing (no second `run.paused`): a worker that never saw
+the answer to its pause retries it. Another interrupt, or another worker, is `409`.
 
 ### `GET /v1/runs/{id}/resolutions` → `200 [ResolutionEntry]`
 
@@ -211,8 +245,14 @@ same transaction (`GET /v1/runs/{id}/resolutions`), and:
 
 `status` must be an ending (`SUCCESS | PARTIAL | ERROR | TIMEOUT | CANCELLED | REJECTED`);
 `error` only on `ERROR | TIMEOUT | REJECTED`. From `RUNNING` any ending; from `QUEUED` or
-`PAUSED` only `CANCELLED` or `TIMEOUT` (cancelling a queued or waiting run). A second finish
-is `409`. Announced as `run.finished`.
+`PAUSED` only `CANCELLED` or `TIMEOUT` (cancelling a queued or waiting run). Announced as
+`run.finished`.
+
+**A repeated finish is not an error.** A finish of a run that already ended with the same
+`status`, by the same caller (the same `worker_id`, or none both times), answers `200` with
+the run as stored (the first `output` and `error`) and changes nothing (no second
+`run.finished`). A different `status` is `409 CONFLICT` (`409 LEASE_LOST` when a
+`worker_id` was sent); another worker is `409 LEASE_LOST`.
 
 ### Reads
 
@@ -255,11 +295,13 @@ caller computed: `422` unless the bytes that arrived match.
 Who may add one:
 
 - the run is `RUNNING`: a leased run (claimed from the queue) only with its lease holder's
-  `worker_id` (`409` without it, or with another worker's); a run recorded in the caller's
-  process has no lease and takes no `worker_id` (`409` with one);
+  `worker_id` (`409 CONFLICT` without it, `409 LEASE_LOST` with another worker's); a run
+  recorded in the caller's process has no lease and takes no `worker_id` (`409 LEASE_LOST`
+  with one);
 - the run is `PAUSED`: only a key whose registry role is `service` (a harness, or the UI
   backend uploading a reviewer's corrected table); any other key is `403`;
-- any other status: `409`. An unknown run (or another tenant's) is `404`.
+- any other status: `409` (`LEASE_LOST` when a `worker_id` was sent, else `CONFLICT`). An
+  unknown run (or another tenant's) is `404`.
 
 The same bytes uploaded to the same run again return the first artifact with `200` (a
 retried upload stores nothing twice).

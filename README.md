@@ -73,18 +73,20 @@ stateDiagram-v2
 
 ## The API
 
-Every `/v1` route needs `X-Api-Key`; the health routes do not. [docs/api.md](docs/api.md) has
-every route, body and status code, and the exact claim, heartbeat and resume semantics a
-worker implements.
+Every `/v1` route needs `X-API-Key`; the health routes do not. Every error is an RFC 9457
+problem (`application/problem+json`) with a stable `code` (`LEASE_LOST` tells a worker to
+stop; `DEPENDENCY_UNAVAILABLE` and `RATE_LIMIT` come with `Retry-After`).
+[docs/api.md](docs/api.md) has every route, body, status code and problem `code`, and the
+exact claim, heartbeat and resume semantics a worker implements.
 
 | Route | What it does |
 |---|---|
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
-| `POST /v1/runs/{id}/heartbeat` | extend the lease; `409` = lease lost, stop |
+| `POST /v1/runs/{id}/heartbeat` | extend the lease; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
-| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
+| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
 | `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
@@ -120,7 +122,7 @@ ticker; unset, each ticker process beats into its own file in the temp directory
 
 ## Authentication
 
-One scheme, one key system. `X-Api-Key` is a key issued by the Memory Service; agent-runs
+One scheme, one key system. `X-API-Key` is a key issued by the Memory Service; agent-runs
 introspects it there (`GET {RUNS__MEMORY__URL}/v1/keys/self`, cached 60 s, refusals 10 s)
 and learns the tenant it speaks for, the principal recorded as `created_by`, and the
 principals it may put in `on_behalf_of`. The contract is in

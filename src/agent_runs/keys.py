@@ -1,7 +1,7 @@
-"""Who an ``X-Api-Key`` is: asked of the Memory Service, the one key registry.
+"""Who an ``X-API-Key`` is: asked of the Memory Service, the one key registry.
 
 agent-runs keeps no keys. It introspects each key it sees with ``GET {memory}/v1/keys/self``
-(the key in ``X-Api-Key``, as for any memory call) and caches the answer per key: a known
+(the key in ``X-API-Key``, as for any memory call) and caches the answer per key: a known
 key for ``KEY_CACHE_SECONDS``, a refused one for ``KEY_NEGATIVE_CACHE_SECONDS``, so a
 revocation takes effect within a minute and a flood of bad keys costs the registry one call
 per key per interval. Only a hash of each key is held. The contract is in docs/api.md.

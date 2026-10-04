@@ -61,7 +61,13 @@ async def test_a_key_the_registry_refuses_is_forbidden(client) -> None:
 
 async def test_a_registry_that_is_down_is_a_503_not_a_401(client, memory) -> None:
     memory.status = 502
-    assert (await client.get("/v1/runs", headers={"X-Api-Key": "fresh-key"})).status_code == 503
+    response = await client.get("/v1/runs", headers={"X-Api-Key": "fresh-key"})
+    assert response.status_code == 503
+    assert (response.json()["code"], response.json()["retryable"]) == (
+        "DEPENDENCY_UNAVAILABLE",
+        True,
+    )
+    assert response.headers["retry-after"] == "5"
 
 
 # ------------------------------------------------------------------ the registry client
