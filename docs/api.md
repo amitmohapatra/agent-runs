@@ -1,21 +1,56 @@
 # agent-runs API (0.2.0)
 
-Every route needs `X-Api-Key`, a key issued by the Memory Service (the one key registry; see
-[Authentication](#authentication)). A platform key (`tenant_id: null`) also sends
-`X-Trellis-Tenant: <tenant>`; a tenant key may send it only with its own tenant. Bodies are
-JSON; the record types are `trellis.contracts.runs` models, serialised as pydantic does.
-Errors answer `{"detail": ...}`.
+Every `/v1` route needs `X-Api-Key`, a key issued by the Memory Service (the one key
+registry; see [Authentication](#authentication)). A platform key (`tenant_id: null`) also
+sends `X-Trellis-Tenant: <tenant>`; a tenant key may send it only with its own tenant. The
+health routes (`/health/live`, `/health/ready`) and FastAPI's own `/docs` and
+`/openapi.json` need no key. Bodies are JSON; the record types are `trellis.contracts.runs`
+models, serialised as pydantic does. Errors answer `{"detail": ...}`: a string, an object
+for a failed schedule fire, or FastAPI's list of field errors for a body or query that does
+not validate.
 
 | Status | Means |
 |---|---|
 | `400` | a platform key named no tenant |
 | `401` | missing `X-Api-Key`, or one the key registry does not know (or revoked, expired) |
-| `403` | the registry refuses the key (a suspended tenant), the body or header names another tenant, or `on_behalf_of` the key may not act as |
+| `403` | the registry refuses the key (a suspended tenant), the body or header names another tenant, `on_behalf_of` the key may not act as, or an artifact for a paused run from a key whose role is not `service` |
 | `404` | no such run, schedule, webhook or artifact in this tenant |
-| `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity |
+| `409` | the record is not in a state that allows it, or a limit is reached: an illegal transition, an answer to another interrupt, a lease that is no longer the caller's, a taken run id, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook |
 | `413` | a pause's `checkpoint` is larger than 1 MiB of compact JSON, or an artifact larger than 50 MiB |
-| `422` | the body is invalid (including the contracts' own validators) |
+| `422` | the body or query is invalid (including the contracts' own validators) |
+| `500` | an artifact's stored bytes no longer match their checksum (never served) |
 | `503` | the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule) |
+
+## Every route
+
+`auth` below is the four answers any `/v1` route may give before it looks at the request:
+`400`, `401`, `403`, `503` (see [Authentication](#authentication)). The sections after the
+table have the bodies and the exact semantics.
+
+| Method and path | Body / query | Success | Errors besides `auth` |
+|---|---|---|---|
+| `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id of another tenant, `422` |
+| `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` | `200 Claimed`, `204` nothing queued | `422` |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds}` | `200 Lease` | `404`, `409` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`) | `404`, `409` not `RUNNING` or not the lease holder, `413`, `422` interrupt of another run |
+| `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `404`, `409` not `PAUSED` or another interrupt, `422` another run |
+| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` | `404`, `409` illegal ending or not the lease holder, `422` not an ending, `error` on a non-failure |
+| `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
+| `GET /v1/runs/{id}/resolutions` | | `200 [ResolutionEntry]` | `404` |
+| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&limit=` | `200 [RunSummary]` | `422` |
+| `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
+| `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
+| `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
+| `GET /v1/schedules` | `?enabled=&agent_id=&limit=` | `200 [Schedule]` | `422` |
+| `GET /v1/schedules/{id}` | | `200 Schedule` | `404` |
+| `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` |
+| `DELETE /v1/schedules/{id}` | | `204` | `403` `on_behalf_of`, `404` |
+| `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused, `422` `at` ahead or naive, `503` not queued |
+| `POST /v1/webhooks` | `{url, events}` | `201 WebhookCreated` | `409` 20 already, `422` |
+| `GET /v1/webhooks` | | `200 [Webhook]` | |
+| `DELETE /v1/webhooks/{id}` | | `204` | `404` |
+| `GET /health/live` | no key | `200 {"status": "ok"}` | |
+| `GET /health/ready` | no key | `200 {"status": "ok"}` | `500` the database does not answer |
 
 ## Authentication
 
@@ -82,7 +117,8 @@ exists answers `200` with the existing run (a run id held by another tenant is `
 {"worker_id": "w-1", "agent_ids": ["triage", "billing"], "lease_seconds": 60}
 ```
 
-`lease_seconds` is 5–3600 (default 60); `agent_ids` 1–100. Takes the oldest `QUEUED` run
+`lease_seconds` is 5–3600 (default 60); `agent_ids` 1–100; `worker_id` 1–200 characters
+(surrounding whitespace dropped, blank refused). Takes the oldest `QUEUED` run
 (by `queued_at`) of those agents in the tenant, sets it `RUNNING` and leases it:
 
 ```json
@@ -274,6 +310,10 @@ need not be unique. This is the one idempotency mechanism: a client repeats the 
 needs no name, no `409` handling and no follow-up `PATCH`.
 
 ### `GET /v1/schedules?enabled=&agent_id=&limit=` · `GET /v1/schedules/{id}` · `DELETE /v1/schedules/{id}` (`204`)
+
+The listing is this tenant's schedules, newest first, `limit` 1–500 (default 50), filtered by
+`enabled` and `agent_id` when given. Any key of the tenant may list and read a schedule;
+deleting one needs a key that may act as its `on_behalf_of` (`404` before `403`).
 
 ### `PATCH /v1/schedules/{id}` → `Schedule`
 

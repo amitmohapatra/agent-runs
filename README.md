@@ -17,33 +17,65 @@ started from a `RunStart`, paused with an `Interrupt`, resumed with an
 ## The state machine
 
 The contracts' `RunStatus.can_become` is the only transition check; anything else is a
-`409`.
+`409` that changes nothing. These are exactly the moves the routes and the ticker make
+([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has what each does to the row, the sequence
+diagrams and the tables):
 
 ```mermaid
 stateDiagram-v2
-  [*] --> QUEUED: POST /v1/runs {queue: true} · a schedule fires
-  [*] --> RUNNING: POST /v1/runs
-  QUEUED --> RUNNING: claim (a worker, under a lease)
-  RUNNING --> QUEUED: lease lapsed (ticker, attempt + 1)
-  RUNNING --> PAUSED: pause (Interrupt, checkpoint)
-  PAUSED --> RUNNING: resume (in-process run, attempt + 1)
-  PAUSED --> QUEUED: resume (queued run, attempt + 1)
-  PAUSED --> PAUSED: deadline passed, escalate_to (ticker)
-  PAUSED --> TIMEOUT: deadline passed, nobody to escalate to (ticker)
-  PAUSED --> CANCELLED: resume CANCEL · finish
-  QUEUED --> CANCELLED: finish
-  RUNNING --> SUCCESS
-  RUNNING --> PARTIAL
-  RUNNING --> ERROR: finish · lease lapsed MAX_ATTEMPTS times
-  RUNNING --> TIMEOUT
-  RUNNING --> CANCELLED
-  RUNNING --> REJECTED
+  [*] --> RUNNING: POST /v1/runs (queue false)
+  [*] --> QUEUED: POST /v1/runs (queue true), or a schedule fires
+
+  QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
+  QUEUED --> CANCELLED: finish CANCELLED
+  QUEUED --> TIMEOUT: finish TIMEOUT
+
+  RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
+  RUNNING --> QUEUED: ticker, lease lapsed and attempt < MAX_ATTEMPTS (attempt + 1)
+  RUNNING --> ERROR: ticker, lease lapsed and attempt ≥ MAX_ATTEMPTS (lease_expired)
+  RUNNING --> SUCCESS: finish
+  RUNNING --> PARTIAL: finish
+  RUNNING --> ERROR: finish
+  RUNNING --> TIMEOUT: finish
+  RUNNING --> CANCELLED: finish
+  RUNNING --> REJECTED: finish
+
+  PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
+  PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
+  PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
+  PAUSED --> TIMEOUT: finish TIMEOUT, or ticker past deadline with no escalate_to
+  PAUSED --> PAUSED: ticker past deadline, assignee becomes escalate_to (once)
+
+  SUCCESS --> [*]
+  PARTIAL --> [*]
+  ERROR --> [*]
+  TIMEOUT --> [*]
+  CANCELLED --> [*]
+  REJECTED --> [*]
 ```
+
+## When to use what
+
+| You want to… | Use |
+|---|---|
+| keep a durable record of a run your own process executes | `POST /v1/runs` (it is `RUNNING`), then `finish` |
+| hand a run to a fleet of workers, surviving a worker that dies | `POST /v1/runs {queue: true}`; workers `claim`, `heartbeat` every third of the lease, and send `worker_id` on `pause`, `finish` and artifact uploads |
+| make a retried start harmless | the same `run_id`, or an `idempotency_key` (one run per tenant and key) |
+| stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume` |
+| move an unanswered question up, or give up on it | the interrupt's `deadline` and `escalate_to`: the ticker reassigns it once, else ends the run `TIMEOUT` |
+| show a reviewer something too big for a question (a table, a diff) | `POST /v1/runs/{id}/artifacts`, then the `ArtifactRef` as `Interrupt.payload_ref`; the UI reads `GET /v1/artifacts/{id}` |
+| build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…` |
+| prove who approved what, and when | `GET /v1/runs/{id}/resolutions` (append-only) |
+| cancel a run that is queued or waiting | `finish` with `CANCELLED` (or `resume` with `CANCEL`, recorded as an answer) |
+| start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert |
+| run a schedule now, or pause and resume it | `POST /v1/schedules/{id}/fire`; `PATCH {"enabled": false}` / `{"enabled": true}` |
+| hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once |
 
 ## The API
 
-All routes need `X-Api-Key`. [docs/api.md](docs/api.md) has every route, body and status
-code, and the exact claim, heartbeat and resume semantics a worker implements.
+Every `/v1` route needs `X-Api-Key`; the health routes do not. [docs/api.md](docs/api.md) has
+every route, body and status code, and the exact claim, heartbeat and resume semantics a
+worker implements.
 
 | Route | What it does |
 |---|---|
@@ -62,6 +94,7 @@ code, and the exact claim, heartbeat and resume semantics a worker implements.
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
 | `POST/GET /v1/webhooks` · `DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
+| `GET /health/live` · `GET /health/ready` | the process is up · the database answers (no key) |
 
 ## The ticker
 
@@ -128,23 +161,58 @@ make install                 # uv sync, trellis-contracts from ../agent-contract
 make migrate                 # alembic upgrade head (RUNS__DATABASE__URL)
 uv run agent-runs            # the API on RUNS__SERVICE__PORT
 uv run agent-runs-ticker     # the ticker
-make up                      # or all of it in docker compose: postgres, migrate, api, ticker
 ```
 
-Configuration is `RUNS__*` environment variables, each documented in
-[.env.example](.env.example); every other number is a named constant in
+Both processes refuse to start against a database that is not at the head revision: migrate
+first.
+
+With Docker, `make up` starts all of it with `docker compose`: PostgreSQL 17 (published on
+`RUNS_DB_PORT`, 5442), a one-shot `migrate`, the API (on `RUNS_PORT`, 8090) and the ticker,
+sharing a blob volume; the API reaches the Memory Service on the host
+(`host.docker.internal:8080`). `make image` builds the one image alone (it needs
+`../agent-contracts` as the `contracts` build context); `make down` stops everything and
+drops the volumes.
+
+### Configuration
+
+Service settings are `RUNS__*` environment variables (or a `.env` file), each also
+documented in [.env.example](.env.example); every other number is a named constant in
 `src/agent_runs/config/constants.py`.
+
+| Variable | Default | Read by | Meaning |
+|---|---|---|---|
+| `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
+| `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
+| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https` |
+| `RUNS__MEMORY__URL` | `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self` |
+| `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
+| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process |
+| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` or `gcs` |
+| `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
+| `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
+| `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |
+| `RUNS__OBSERVABILITY__LOG_LEVEL` | `INFO` | API, ticker | log level |
+| `RUNS__OBSERVABILITY__LOG_JSON` | `true` | API, ticker | `false` for the console renderer |
+| `RUNS_PORT`, `RUNS_DB_PORT` | `8090`, `5442` | docker compose | host ports of the API and PostgreSQL |
+| `RUNS_TEST_ADMIN_URL`, `RUNS_TEST_DB`, `RUNS_TEST_GCS` | see `.env.example` | the test suite | the admin connection, the test database's name, and the opt-in fake-GCS tests |
 
 ## Develop
 
 ```bash
 make lint typecheck test
+make coverage                # the suite with line and branch coverage, failing under 95%
 ```
 
 The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
 and recreated per run) and skips with a reason when there is none. The key registry is a
 fake (`tests/conftest.py`, `FakeMemory`, a tiny ASGI app answering `/v1/keys/self`); the
-blob store is a filesystem one per test. `RUNS_TEST_GCS=1` also runs the GCS adapter and an
+blob store is a filesystem one per test, and the GCS adapter also runs over an in-memory
+stand-in for the Google client. `RUNS_TEST_GCS=1` also runs the GCS adapter and an
 end-to-end artifact test against a fake GCS server (`fsouza/fake-gcs-server`, started in
-Docker on a free port and removed afterwards; needs Docker). Migrations live in
-`alembic/versions`; a test checks they build exactly the schema the code maps.
+Docker on a free port and removed afterwards; needs Docker); without it those six tests
+skip. Migrations live in `alembic/versions`; a test checks they build exactly the schema the
+code maps.
+
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright,
+the migrations up, down to base and up again, and the suite with the coverage floor, against
+PostgreSQL 16 with `agent-contracts` checked out beside this repository.

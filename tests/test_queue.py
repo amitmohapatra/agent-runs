@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
+from sqlalchemy import text
 from trellis.contracts.ids import now
 
 from agent_runs.config.constants import MAX_ATTEMPTS, MAX_CHECKPOINT_BYTES
@@ -286,3 +287,35 @@ async def test_a_bare_interrupt_is_no_longer_a_pause_body(client) -> None:
     bare = pause(rid)["interrupt"]
     response = await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=bare)
     assert response.status_code == 422
+
+
+async def test_a_heartbeat_is_refused_once_the_run_stops_running_whatever_the_row_says(
+    app, client
+) -> None:
+    """Defence in depth: every way out of RUNNING clears the lease, but the heartbeat checks
+    the status itself too, so a row that still names the worker cannot keep a lease alive on
+    a run that is not running."""
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE agent_runs SET status = 'PAUSED' WHERE run_id = :r"), {"r": rid}
+        )
+    beat = await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
+    assert beat.status_code == 409 and "PAUSED" in beat.json()["detail"]
+
+
+async def test_heartbeat_lease_bounds_are_enforced(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    for lease in (4, 3601):
+        body = {"worker_id": "w1", "lease_seconds": lease}
+        assert (await client.post(f"/v1/runs/{rid}/heartbeat", json=body)).status_code == 422
+    blank = {"worker_id": "   "}
+    assert (await client.post(f"/v1/runs/{rid}/heartbeat", json=blank)).status_code == 422
+
+
+async def test_a_claim_without_a_worker_or_with_too_many_agents_is_refused(client) -> None:
+    assert (await client.post("/v1/runs/claim", json={"agent_ids": ["triage"]})).status_code == 422
+    many = claim(agents=tuple(f"a{i}" for i in range(101)))
+    assert (await client.post("/v1/runs/claim", json=many)).status_code == 422

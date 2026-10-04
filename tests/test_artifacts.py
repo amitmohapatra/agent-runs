@@ -13,6 +13,7 @@ from sqlalchemy import text
 from trellis.contracts.ids import now
 
 from agent_runs.config.constants import ARTIFACT_RETENTION
+from agent_runs.store.runs import RunStore
 from tests.conftest import pause, paused, resolution, started
 
 TABLE = {"columns": ["sku", "qty"], "rows": [["A-1", 3], ["B-2", 5]]}
@@ -237,3 +238,56 @@ async def test_a_blob_that_will_not_delete_keeps_its_row(client, ticker, blobs, 
     assert (await client.get(ref["uri"])).status_code == 200
     monkeypatch.undo()
     assert (await ticker.tick(now=later)).purged == 1
+
+
+# ------------------------------------------------------------------ edges
+
+
+async def test_a_run_that_ends_while_its_artifact_uploads_keeps_no_bytes(
+    client, blobs, monkeypatch
+) -> None:
+    """The writer is checked before the bytes are read and again, locked, before the row is
+    written; a run that ended in between refuses the artifact and its blob is removed."""
+    run = await running(client)
+    real = RunStore.check_artifact_writer
+
+    async def ends_meanwhile(self, tenant_id, run_id, **kwargs):
+        if kwargs["lock"]:
+            await client.post(f"/v1/runs/{run_id}/finish", json={"status": "SUCCESS"})
+        return await real(self, tenant_id, run_id, **kwargs)
+
+    monkeypatch.setattr(RunStore, "check_artifact_writer", ends_meanwhile)
+    response = await upload(client, run["run_id"])
+    assert response.status_code == 409 and "SUCCESS" in response.json()["detail"]
+    assert blob_files(blobs) == []
+
+
+async def test_a_large_artifact_streams_back_whole_in_chunks(client, monkeypatch) -> None:
+    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 8)
+    run = await running(client)
+    data = bytes(range(256)) * 3
+    ref = (await upload(client, run["run_id"], data, {"Content-Type": "image/png"})).json()
+    got = await client.get(ref["uri"])
+    assert got.status_code == 200 and got.content == data
+    assert got.headers["content-length"] == str(len(data))
+    assert got.headers["etag"] == f'"{sha(data)}"'
+    assert got.headers["content-type"] == "image/png"
+
+
+async def test_bytes_without_a_type_are_octet_stream(client) -> None:
+    run = await running(client)
+    response = await upload(client, run["run_id"], b"\x00\x01", headers={})
+    assert response.status_code == 201
+    assert response.json()["mime_type"] == "application/octet-stream"
+
+
+async def test_a_malformed_checksum_is_refused_before_anything_is_stored(client, blobs) -> None:
+    run = await running(client)
+    response = await upload(client, run["run_id"], checksum="md5:abc")
+    assert response.status_code == 422
+    assert blob_files(blobs) == []
+
+
+async def test_an_artifact_for_an_unknown_run_is_404(client, blobs) -> None:
+    assert (await upload(client, "run_nope")).status_code == 404
+    assert blob_files(blobs) == []

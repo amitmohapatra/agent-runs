@@ -1,7 +1,8 @@
 """The blob port, against both adapters: create-only puts, reads verified against the
-recorded checksum as they stream, idempotent deletes. The GCS adapter runs against a local
-fake GCS server (``fsouza/fake-gcs-server`` in Docker, on a free port, removed afterwards)
-when ``RUNS_TEST_GCS=1``; the end-to-end test drives the API and the ticker on it."""
+recorded checksum as they stream, idempotent deletes. The GCS adapter runs over an in-memory
+stand-in for the Google client in every suite, and against a local fake GCS server
+(``fsouza/fake-gcs-server`` in Docker, on a free port, removed afterwards) when
+``RUNS_TEST_GCS=1``; the end-to-end test drives the API and the ticker on it."""
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
+from google.api_core import exceptions as gexc
 from pydantic import ValidationError
 from trellis.contracts.ids import now
 
@@ -81,10 +83,74 @@ def gcs(fake_gcs: str, monkeypatch: pytest.MonkeyPatch) -> GCSBlobStore:
     return GCSBlobStore(BUCKET)
 
 
-@pytest.fixture(params=["filesystem", "gcs"])
+class FakeGCSBlob:
+    """The slice of ``google.cloud.storage.Blob`` the adapter uses, over a dict, with the
+    server's semantics: a create-only upload refused with 412, ranged reads with an inclusive
+    end, and 404 for an object that is gone."""
+
+    def __init__(self, bucket: FakeGCSBucket, key: str) -> None:
+        self._bucket, self._key = bucket, key
+        self.metadata: dict[str, str] | None = None
+
+    @property
+    def size(self) -> int:
+        return len(self._bucket.objects[self._key][0])
+
+    def upload_from_string(
+        self, data: bytes, *, content_type: str, if_generation_match: int, checksum: str
+    ) -> None:
+        assert (if_generation_match, checksum) == (0, "crc32c"), "create-only, checksummed"
+        if self._key in self._bucket.objects:
+            raise gexc.PreconditionFailed("the object exists")
+        self._bucket.objects[self._key] = (data, content_type, self.metadata)
+
+    def download_as_bytes(self, *, start: int, end: int) -> bytes:
+        if self._key not in self._bucket.objects:
+            raise gexc.NotFound("the object is gone")
+        return self._bucket.objects[self._key][0][start : end + 1]
+
+    def delete(self) -> None:
+        if self._bucket.objects.pop(self._key, None) is None:
+            raise gexc.NotFound("no such object")
+
+
+class FakeGCSBucket:
+    def __init__(self) -> None:
+        self.objects: dict[str, tuple[bytes, str, dict[str, str] | None]] = {}
+
+    def blob(self, key: str) -> FakeGCSBlob:
+        return FakeGCSBlob(self, key)
+
+    def get_blob(self, key: str) -> FakeGCSBlob | None:
+        return FakeGCSBlob(self, key) if key in self.objects else None
+
+
+class FakeGCSClient:
+    def __init__(self) -> None:
+        self.buckets: dict[str, FakeGCSBucket] = {}
+        self.closed = False
+
+    def bucket(self, name: str) -> FakeGCSBucket:
+        return self.buckets.setdefault(name, FakeGCSBucket())
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def fake_gcs_store() -> tuple[GCSBlobStore, FakeGCSClient]:
+    client = FakeGCSClient()
+    return GCSBlobStore(BUCKET, client=client), client  # pyright: ignore[reportArgumentType]
+
+
+@pytest.fixture(params=["filesystem", "gcs", "gcs-in-memory"])
 def store(request: pytest.FixtureRequest, tmp_path: Any) -> BlobStore:
+    """Each adapter. ``gcs`` is the real client against the fake GCS server (opt-in, needs
+    Docker); ``gcs-in-memory`` is the same adapter over an in-memory stand-in for the client,
+    so its own logic runs in every suite."""
     if request.param == "gcs":
         return request.getfixturevalue("gcs")
+    if request.param == "gcs-in-memory":
+        return fake_gcs_store()[0]
     return FilesystemBlobStore(tmp_path)
 
 
@@ -144,6 +210,44 @@ async def test_bytes_that_do_not_match_never_arrive_whole(store, monkeypatch) ->
         await _all(read(store, key, sha256=hashlib.sha256(data).hexdigest(), size=17))
 
 
+async def test_read_skips_empty_chunks_and_an_empty_object_reads_as_nothing() -> None:
+    class Chunks:
+        def __init__(self, *parts: bytes) -> None:
+            self._parts = parts
+
+        async def chunks(self, key: str) -> AsyncIterator[bytes]:
+            for part in self._parts:
+                yield part
+
+    data = b"abcdef"
+    sha = hashlib.sha256(data).hexdigest()
+    store = Chunks(b"", b"abc", b"", b"def", b"")
+    assert await _all(read(store, "k", sha256=sha, size=6)) == data  # pyright: ignore[reportArgumentType]
+    empty = hashlib.sha256(b"").hexdigest()
+    assert await _all(read(Chunks(), "k", sha256=empty, size=0)) == b""  # pyright: ignore[reportArgumentType]
+
+
+async def test_the_gcs_adapter_writes_create_only_with_the_sha256_in_metadata() -> None:
+    store, client = fake_gcs_store()
+    stored = await store.put("artifacts/a", b"bytes", content_type="application/json")
+    data, content_type, metadata = client.buckets[BUCKET].objects["artifacts/a"]
+    assert (data, content_type) == (b"bytes", "application/json")
+    assert metadata == {"sha256": stored.sha256}
+    await store.aclose()
+    assert client.closed
+
+
+async def test_a_gcs_object_deleted_mid_read_is_not_found(monkeypatch) -> None:
+    monkeypatch.setattr("agent_runs.blob.gcs.BLOB_CHUNK_BYTES", 2)
+    store, client = fake_gcs_store()
+    await store.put("artifacts/a", b"abcdef", content_type="text/plain")
+    chunks = store.chunks("artifacts/a")
+    assert await anext(chunks) == b"ab"
+    del client.buckets[BUCKET].objects["artifacts/a"]
+    with pytest.raises(BlobNotFound):
+        await anext(chunks)
+
+
 def test_the_filesystem_store_refuses_keys_that_leave_its_root(tmp_path) -> None:
     store = FilesystemBlobStore(tmp_path)
     for key in ("../escape", "a//b", "", "a/./b"):
@@ -158,6 +262,18 @@ def test_the_provider_is_chosen_by_settings(tmp_path) -> None:
     assert isinstance(open_blob_store(BlobSettings(root=tmp_path)), FilesystemBlobStore)
     with pytest.raises(ValidationError, match="RUNS__BLOB__BUCKET"):
         BlobSettings(provider=BlobProvider.GCS)
+
+
+def test_gcs_settings_open_the_gcs_adapter_on_their_bucket(monkeypatch) -> None:
+    opened: list[str] = []
+
+    class Recorded:
+        def __init__(self, bucket: str) -> None:
+            opened.append(bucket)
+
+    monkeypatch.setattr("agent_runs.blob.GCSBlobStore", Recorded)
+    store = open_blob_store(BlobSettings(provider=BlobProvider.GCS, bucket="b-1"))
+    assert isinstance(store, Recorded) and opened == ["b-1"]
 
 
 def test_gcs_is_chosen_with_a_bucket(fake_gcs, monkeypatch) -> None:

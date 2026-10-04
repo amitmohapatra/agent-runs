@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: memory
+          POSTGRES_PASSWORD: memory
+          POSTGRES_DB: agent_runs
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U memory" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      # alembic's database; the suite makes its own (agent_runs_tests) through the admin URL
+      RUNS__DATABASE__URL: postgresql+psycopg://memory:memory@localhost:5432/agent_runs
+      RUNS_TEST_ADMIN_URL: postgresql://memory:memory@localhost:5432/postgres
+    defaults:
+      run:
+        working-directory: agent-runs
+    steps:
+      # trellis-contracts is a path dependency on ../agent-contracts (pyproject.toml), so the
+      # two repositories are checked out side by side, exactly as on a laptop.
+      - uses: actions/checkout@v4
+        with:
+          path: agent-runs
+      - uses: actions/checkout@v4
+        with:
+          repository: amitmohapatra/agent-contracts
+          path: agent-contracts
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: agent-runs/uv.lock
+      - run: uv sync --all-extras
+      - run: uv run ruff check src tests alembic
+      - run: uv run ruff format --check src tests alembic
+      - run: uv run pyright
+      - run: uv run alembic upgrade head && uv run alembic downgrade base && uv run alembic upgrade head
+      # the GCS adapter's fake-server tests stay opt-in (RUNS_TEST_GCS=1); the in-memory
+      # client covers the adapter here
+      - run: uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95

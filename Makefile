@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint typecheck test migrate image up down
+.PHONY: help install lint typecheck test coverage migrate image up down
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -16,6 +16,9 @@ typecheck: ## Pyright
 
 test: ## Run the test suite (needs the local PostgreSQL)
 	uv run pytest -q
+
+coverage: ## The suite with line and branch coverage, failing under 95%
+	uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95
 
 migrate: ## Bring the database to the latest schema
 	uv run alembic upgrade head
