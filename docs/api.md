@@ -96,6 +96,9 @@ agent-runs keeps no keys. It asks the Memory Service who a key is and caches the
 
 ### The introspection contract: `GET {RUNS__MEMORY__URL}/v1/keys/self`
 
+`RUNS__MEMORY__URL`, else the platform-wide `MEMORY_URL`. One kept-alive connection pool
+(at most 100 connections, 20 idle ones kept 30 s), 2 s to connect, 3 s in all.
+
 Request: the caller's key, unchanged, as the Memory Service authenticates any call:
 
 ```

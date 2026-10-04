@@ -185,11 +185,19 @@ documented in [.env.example](.env.example); every other number is a named consta
 |---|---|---|---|
 | `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
 | `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
-| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https` |
-| `RUNS__MEMORY__URL` | `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self` |
+| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https`. Only `dev` and `test` may use the filesystem blob store |
+| `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache, rate-limit buckets and metrics |
+| `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
+| `RUNS__MEMORY__URL` | `MEMORY_URL`, else `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self`. `MEMORY_URL` is the platform-wide name; this one wins when both are set |
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
-| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process |
-| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` or `gcs` |
+| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process (per worker) |
+| `RUNS__DATABASE__MAX_OVERFLOW` | `10` | API, ticker | connections opened past the pool under a burst |
+| `RUNS__DATABASE__POOL_TIMEOUT_SECONDS` | `5` | API, ticker | wait for a pooled connection before answering `503` |
+| `RUNS__DATABASE__POOL_RECYCLE_SECONDS` | `300` | API, ticker | a pooled connection older than this is replaced, not reused |
+| `RUNS__DATABASE__POOL_PRE_PING` | `true` | API, ticker | test a pooled connection on checkout; a dead one is replaced, not handed to a request |
+| `RUNS__DATABASE__CONNECT_TIMEOUT_SECONDS` | `5` | API, ticker | opening a connection to PostgreSQL |
+| `RUNS__DATABASE__STATEMENT_TIMEOUT_MS` | `15000` | API, ticker | PostgreSQL cancels a statement past this (`503` here); `0` is no limit |
+| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` (dev and test only) or `gcs` |
 | `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
 | `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
 | `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |

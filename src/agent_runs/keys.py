@@ -21,7 +21,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from agent_runs.config.constants import (
     HEADER_API_KEY,
     KEY_CACHE_SECONDS,
+    KEY_CONNECT_TIMEOUT_SECONDS,
     KEY_INTROSPECTION_TIMEOUT_SECONDS,
+    KEY_KEEPALIVE_SECONDS,
+    KEY_MAX_CONNECTIONS,
+    KEY_MAX_KEEPALIVE,
     KEY_NEGATIVE_CACHE_SECONDS,
     MAX_CACHED_KEYS,
 )
@@ -67,7 +71,16 @@ class KeyRegistry:
         client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._client = client or httpx.AsyncClient(timeout=KEY_INTROSPECTION_TIMEOUT_SECONDS)
+        self._client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                KEY_INTROSPECTION_TIMEOUT_SECONDS, connect=KEY_CONNECT_TIMEOUT_SECONDS
+            ),
+            limits=httpx.Limits(
+                max_connections=KEY_MAX_CONNECTIONS,
+                max_keepalive_connections=KEY_MAX_KEEPALIVE,
+                keepalive_expiry=KEY_KEEPALIVE_SECONDS,
+            ),
+        )
         self._url = memory_url.rstrip("/") + INTROSPECTION_PATH
         self._clock = clock
         #: sha256(key) -> (expires at, the answer): a KeyInfo, or the refusal to raise

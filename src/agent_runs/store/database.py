@@ -27,8 +27,20 @@ _HEAD = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
 
 
 async def connect(config: DatabaseSettings) -> AsyncEngine:
-    """An engine on a database at the schema this build was written against."""
-    engine = create_async_engine(config.url, pool_size=config.pool_size)
+    """An engine on a database at the schema this build was written against, with the
+    pool and timeout protections of ``DatabaseSettings``."""
+    engine = create_async_engine(
+        config.url,
+        pool_size=config.pool_size,
+        max_overflow=config.max_overflow,
+        pool_timeout=config.pool_timeout_seconds,
+        pool_recycle=config.pool_recycle_seconds,
+        pool_pre_ping=config.pool_pre_ping,
+        connect_args={
+            "connect_timeout": config.connect_timeout_seconds,
+            "options": f"-c statement_timeout={config.statement_timeout_ms}",
+        },
+    )
     async with engine.connect() as conn:
         current = await conn.run_sync(
             lambda sync: MigrationContext.configure(sync).get_current_revision()

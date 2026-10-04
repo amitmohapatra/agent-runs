@@ -74,6 +74,7 @@ flowchart LR
 | Webhook sender | `webhooks.py` `WebhookSender`, `sign` | one signed attempt per due outbox row |
 | Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
+| Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
 
 ## The run lifecycle
 
@@ -391,7 +392,8 @@ upgrade again.
 
 ```
 src/agent_runs/
-  __main__.py          agent-runs: uvicorn on RUNS__SERVICE__HOST:PORT
+  __main__.py          agent-runs: uvicorn on RUNS__SERVICE__HOST:PORT, RUNS__SERVICE__WORKERS
+                       processes (one per CPU, 1 to 8), graceful shutdown
   ticker.py            agent-runs-ticker: Ticker, run(), main()
   heartbeat.py         the ticker's liveness file; python -m agent_runs.heartbeat is the probe
   keys.py              KeyRegistry, KeyInfo: who an X-API-Key is

@@ -30,6 +30,13 @@ KEY_CACHE_SECONDS: Final = 60.0
 #: How long a refused key stays refused without asking again.
 KEY_NEGATIVE_CACHE_SECONDS: Final = 10.0
 KEY_INTROSPECTION_TIMEOUT_SECONDS: Final = 3.0
+#: Opening a connection to the registry, within the timeout above.
+KEY_CONNECT_TIMEOUT_SECONDS: Final = 2.0
+#: Connections to the registry: introspection is one small GET per uncached key, so a few
+#: kept alive (30 s, under the usual 60 s idle timeout of a load balancer) carry it.
+KEY_MAX_CONNECTIONS: Final = 100
+KEY_MAX_KEEPALIVE: Final = 20
+KEY_KEEPALIVE_SECONDS: Final = 30.0
 #: Keys cached per process (least recently used goes first).
 MAX_CACHED_KEYS: Final = 10_000
 #: Webhook headers, spelled as the Memory Service spells them so one receiver verifies both.
