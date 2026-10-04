@@ -1,7 +1,8 @@
 #!/bin/bash
 # Claude Code on the web: install what this repo's CLAUDE.md requires before the session
 # starts - gstack (global, team mode), Matt Pocock's skills plugin, and the Python env.
-# Idempotent: every step is skipped when its result is already there. Local sessions are
+# Idempotent: every step is skipped when its result is already there, and the env sync
+# never removes a package (--inexact), so a fuller local install is left intact. Local sessions are
 # left alone (their tools are installed once, by hand, as CLAUDE.md says).
 set -euo pipefail
 [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || exit 0
@@ -23,4 +24,4 @@ if ! claude plugin list 2>/dev/null | grep -q "mattpocock-skills@claude-plugins-
 fi
 
 cd "$CLAUDE_PROJECT_DIR"
-uv sync --all-extras -q || echo "uv sync --all-extras failed (a sibling checkout this repo builds against may be missing)" >&2
+uv sync --all-extras --inexact -q || echo "uv sync --all-extras failed (a sibling checkout this repo builds against may be missing)" >&2
