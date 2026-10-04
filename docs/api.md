@@ -68,7 +68,7 @@ table have the bodies and the exact semantics.
 |---|---|---|---|
 | `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` | `200 Claimed`, `204` nothing queued | `422` |
-| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `404`, `409` not `PAUSED` or another interrupt, `422` another run |
 | `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
@@ -179,10 +179,18 @@ queued for those agents; poll again later.
 ### `POST /v1/runs/{id}/heartbeat` → `200 Lease`
 
 ```json
-{"worker_id": "w-1", "lease_seconds": 60}
+{"worker_id": "w-1", "lease_seconds": 60,
+ "checkpoint": {"tools": {"call_1": {"output": "PO-17 created"}}}}
 ```
 
-Extends the lease to `now + lease_seconds`. `409 LEASE_LOST` means the lease is no longer
+Extends the lease to `now + lease_seconds`. **Progress checkpoints:** `checkpoint`
+(optional) is saved on the run as it stands, replacing the one there (omitted: the run's
+checkpoint is kept as it is), with the pause checkpoint's bound (`413 PAYLOAD_TOO_LARGE`
+past 1 MiB of compact JSON, nothing saved). It comes back as `RunRecord.checkpoint` on the
+next claim and on every read, so when this worker dies the next attempt resumes from it and
+repeats no side effect the journal records. Only the lease holder saves one (`409
+LEASE_LOST` otherwise, nothing saved); sending the same checkpoint again is harmless. A
+worker saves progress after each side-effecting step, on the heartbeat it sends anyway. `409 LEASE_LOST` means the lease is no longer
 this worker's (it lapsed and the run was re-queued, possibly claimed by another worker) or
 the run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do
 not write to it**. Heartbeat well inside the lease (every third of it).
@@ -211,7 +219,8 @@ interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.chec
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` answer, a
 `TIMEOUT`, a run failed after `MAX_ATTEMPTS`) clears it. Larger than 1 MiB as compact JSON
-(`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. Heartbeats do not carry one.
+(`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. A heartbeat may save one too, as
+progress (below).
 
 `worker_id` (query, optional, also on `finish`) fences the write: when given, the write is
 refused with `409 LEASE_LOST` unless that worker still holds the run's lease. Workers always

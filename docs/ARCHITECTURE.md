@@ -130,6 +130,8 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
 - `MAX_ATTEMPTS` is 5 (`config/constants.py`).
+- `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat; a
+  requeue keeps it, so the next attempt's claim resumes from it; only an ending clears it.
 - A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
   move clears it. A repeat of that call (the same caller, to the same status, on the same
   interrupt for a pause) is answered with the stored run and moves nothing (`_settled`),
@@ -166,7 +168,7 @@ sequenceDiagram
   A->>DB: SELECT … FOR UPDATE SKIP LOCKED, oldest queued_at
   A-->>W: 200 Claimed {run RUNNING, lease}
   loop every third of the lease
-    W->>A: POST /v1/runs/{id}/heartbeat {worker_id}
+    W->>A: POST /v1/runs/{id}/heartbeat {worker_id, checkpoint (progress, optional)}
     A-->>W: 200 Lease (409 LEASE_LOST = stop)
   end
 

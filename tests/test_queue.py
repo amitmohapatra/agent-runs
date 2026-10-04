@@ -385,3 +385,48 @@ async def test_a_lapsed_workers_heartbeat_is_lease_lost(client) -> None:
     await client.post(f"/v1/runs/{rid}/finish", json={"status": "CANCELLED"})
     beat = await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
     assert (beat.status_code, beat.json()["code"]) == (409, "LEASE_LOST")
+
+
+# ------------------------------------------------------------------ progress checkpoints
+
+
+async def test_a_heartbeat_saves_progress_the_next_attempt_resumes_from(
+    app, client, ticker
+) -> None:
+    """A worker that crashes after a side effect it checkpointed: the next claim gets the
+    journal and repeats nothing."""
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()["run"]["run_id"]
+    journal = {"tools": {"call_1": {"output": "PO-17 created"}}}
+    beat = await client.post(
+        f"/v1/runs/{rid}/heartbeat",
+        json={"worker_id": "w1", "lease_seconds": 5, "checkpoint": journal},
+    )
+    assert beat.status_code == 200
+    again = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1", "checkpoint": journal}
+    )
+    assert again.status_code == 200, "saving the same progress twice is harmless"
+    plain = await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
+    assert plain.status_code == 200
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == journal, "kept"
+
+    await ticker.tick(now=now() + timedelta(hours=2))  # the worker died: the lease lapses
+    reclaimed = (await client.post("/v1/runs/claim", json=claim("w2"))).json()["run"]
+    assert (reclaimed["run_id"], reclaimed["attempt"]) == (rid, 2)
+    assert reclaimed["checkpoint"] == journal
+
+
+async def test_only_the_lease_holder_saves_progress_and_within_the_bound(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    stranger = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w2", "checkpoint": {"x": 1}}
+    )
+    assert (stranger.status_code, stranger.json()["code"]) == (409, "LEASE_LOST")
+    huge = {"blob": "x" * (MAX_CHECKPOINT_BYTES + 1)}
+    too_big = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1", "checkpoint": huge}
+    )
+    assert (too_big.status_code, too_big.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] is None

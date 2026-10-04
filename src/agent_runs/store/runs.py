@@ -43,6 +43,7 @@ from agent_runs.domain.runs import (
     RunFinish,
     RunPause,
     RunSummary,
+    bounded_checkpoint,
 )
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
@@ -343,11 +344,16 @@ class RunStore:
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime
     ) -> Lease:
-        """Extend the caller's lease. A 409 means the lease is gone (it lapsed and the run was
-        re-queued, or the run was cancelled or finished): the worker must stop."""
+        """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
+        means the lease is gone (it lapsed and the run was re-queued, or the run was
+        cancelled or finished): the worker must stop, and nothing is saved."""
+        checkpoint = bounded_checkpoint(request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
+        if checkpoint is not None:
+            row.checkpoint = checkpoint
+            row.updated_at = now
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
         return lease

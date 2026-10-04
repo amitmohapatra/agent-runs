@@ -35,6 +35,18 @@ class RunCreate(RunStart):
         return RunStart.model_validate(self.model_dump(exclude={"queue"}))
 
 
+def bounded_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The checkpoint, refused (413) past ``MAX_CHECKPOINT_BYTES`` of compact JSON."""
+    if checkpoint is None:
+        return None
+    size = len(json.dumps(checkpoint, separators=(",", ":"), ensure_ascii=False).encode())
+    if size > MAX_CHECKPOINT_BYTES:
+        raise TooLarge(
+            f"checkpoint is {size} bytes; the most a run keeps is {MAX_CHECKPOINT_BYTES}"
+        )
+    return checkpoint
+
+
 class RunPause(BaseModel):
     """What a run waits on, and the executor's opaque ``checkpoint`` (its resume journal and
     the framework's own resume state) for whichever worker resumes it. The checkpoint
@@ -46,15 +58,7 @@ class RunPause(BaseModel):
     checkpoint: dict[str, Any] | None = None
 
     def bounded_checkpoint(self) -> dict[str, Any] | None:
-        """The checkpoint, refused (413) past ``MAX_CHECKPOINT_BYTES`` of compact JSON."""
-        if self.checkpoint is None:
-            return None
-        size = len(json.dumps(self.checkpoint, separators=(",", ":"), ensure_ascii=False).encode())
-        if size > MAX_CHECKPOINT_BYTES:
-            raise TooLarge(
-                f"checkpoint is {size} bytes; the most a pause carries is {MAX_CHECKPOINT_BYTES}"
-            )
-        return self.checkpoint
+        return bounded_checkpoint(self.checkpoint)
 
 
 class RunFinish(BaseModel):
@@ -85,10 +89,17 @@ class ClaimRequest(BaseModel):
 
 
 class HeartbeatRequest(BaseModel):
+    """Extend the lease, and optionally save a progress ``checkpoint``: the executor's resume
+    journal as it stands (tool calls done and their outputs), so the attempt after a worker
+    crash resumes from it instead of repeating side effects. It replaces the run's
+    checkpoint (absent: kept as it is), has the pause checkpoint's bound, and comes back on
+    the next claim and every read."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     worker_id: WorkerId
     lease_seconds: LeaseSeconds = DEFAULT_LEASE_SECONDS
+    checkpoint: dict[str, Any] | None = None
 
 
 class Lease(BaseModel):

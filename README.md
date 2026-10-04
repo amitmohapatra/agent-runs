@@ -83,7 +83,7 @@ exact claim, heartbeat and resume semantics a worker implements.
 |---|---|
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
-| `POST /v1/runs/{id}/heartbeat` | extend the lease; `409 LEASE_LOST` = stop |
+| `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
