@@ -319,3 +319,114 @@ async def test_a_claim_without_a_worker_or_with_too_many_agents_is_refused(clien
     assert (await client.post("/v1/runs/claim", json={"agent_ids": ["triage"]})).status_code == 422
     many = claim(agents=tuple(f"a{i}" for i in range(101)))
     assert (await client.post("/v1/runs/claim", json=many)).status_code == 422
+
+
+# ------------------------------------------------------------------ repeated endings
+
+
+async def test_a_workers_repeated_finish_answers_the_stored_run_and_announces_once(
+    app, client
+) -> None:
+    """A worker whose finish succeeded but whose answer was lost retries it: the same run,
+    as stored, and no second run.finished in the outbox."""
+    await client.post(
+        "/v1/webhooks", json={"url": "https://hooks.example/x", "events": ["run.finished"]}
+    )
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    body = {"status": "SUCCESS", "output": {"n": 1}}
+    first = await client.post(f"/v1/runs/{rid}/finish", params={"worker_id": "w1"}, json=body)
+    again = await client.post(
+        f"/v1/runs/{rid}/finish", params={"worker_id": "w1"}, json={**body, "output": 2}
+    )
+    assert (first.status_code, again.status_code) == (200, 200)
+    assert again.json() == first.json()
+    async with app.state.engine.connect() as conn:
+        owed = await conn.scalar(text("SELECT count(*) FROM webhook_deliveries"))
+    assert owed == 1
+
+
+async def test_a_finish_repeated_by_another_worker_or_another_way_is_refused(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    done = {"status": "SUCCESS"}
+    await client.post(f"/v1/runs/{rid}/finish", params={"worker_id": "w1"}, json=done)
+    other = await client.post(f"/v1/runs/{rid}/finish", params={"worker_id": "w2"}, json=done)
+    assert (other.status_code, other.json()["code"]) == (409, "LEASE_LOST")
+    changed = await client.post(
+        f"/v1/runs/{rid}/finish", params={"worker_id": "w1"}, json={"status": "ERROR"}
+    )
+    assert (changed.status_code, changed.json()["code"]) == (409, "LEASE_LOST")
+    unfenced = await client.post(f"/v1/runs/{rid}/finish", json=done)
+    assert (unfenced.status_code, unfenced.json()["code"]) == (409, "CONFLICT")
+
+
+async def test_a_workers_repeated_pause_answers_the_stored_run(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    body = pause(rid, checkpoint={"step": 1})
+    first = await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=body)
+    again = await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=body)
+    assert (first.status_code, again.status_code) == (200, 200)
+    assert again.json() == first.json()
+
+    another_question = pause(rid)
+    refused = await client.post(
+        f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=another_question
+    )
+    assert (refused.status_code, refused.json()["code"]) == (409, "LEASE_LOST")
+    stranger = await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w2"}, json=body)
+    assert (stranger.status_code, stranger.json()["code"]) == (409, "LEASE_LOST")
+
+
+async def test_a_lapsed_workers_heartbeat_is_lease_lost(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    await client.post(f"/v1/runs/{rid}/finish", json={"status": "CANCELLED"})
+    beat = await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
+    assert (beat.status_code, beat.json()["code"]) == (409, "LEASE_LOST")
+
+
+# ------------------------------------------------------------------ progress checkpoints
+
+
+async def test_a_heartbeat_saves_progress_the_next_attempt_resumes_from(
+    app, client, ticker
+) -> None:
+    """A worker that crashes after a side effect it checkpointed: the next claim gets the
+    journal and repeats nothing."""
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()["run"]["run_id"]
+    journal = {"tools": {"call_1": {"output": "PO-17 created"}}}
+    beat = await client.post(
+        f"/v1/runs/{rid}/heartbeat",
+        json={"worker_id": "w1", "lease_seconds": 5, "checkpoint": journal},
+    )
+    assert beat.status_code == 200
+    again = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1", "checkpoint": journal}
+    )
+    assert again.status_code == 200, "saving the same progress twice is harmless"
+    plain = await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
+    assert plain.status_code == 200
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == journal, "kept"
+
+    await ticker.tick(now=now() + timedelta(hours=2))  # the worker died: the lease lapses
+    reclaimed = (await client.post("/v1/runs/claim", json=claim("w2"))).json()["run"]
+    assert (reclaimed["run_id"], reclaimed["attempt"]) == (rid, 2)
+    assert reclaimed["checkpoint"] == journal
+
+
+async def test_only_the_lease_holder_saves_progress_and_within_the_bound(client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
+    stranger = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w2", "checkpoint": {"x": 1}}
+    )
+    assert (stranger.status_code, stranger.json()["code"]) == (409, "LEASE_LOST")
+    huge = {"blob": "x" * (MAX_CHECKPOINT_BYTES + 1)}
+    too_big = await client.post(
+        f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1", "checkpoint": huge}
+    )
+    assert (too_big.status_code, too_big.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] is None

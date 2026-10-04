@@ -9,11 +9,11 @@ interrupt is a test rather than a wait.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -33,7 +33,7 @@ from agent_runs.config.constants import (
     MAX_ATTEMPTS,
     PAUSED_ARTIFACT_ROLE,
 )
-from agent_runs.domain.errors import Conflict, Forbidden, NotFound, Unprocessable
+from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
 from agent_runs.domain.runs import (
     Claimed,
     ClaimRequest,
@@ -43,8 +43,10 @@ from agent_runs.domain.runs import (
     RunFinish,
     RunPause,
     RunSummary,
+    bounded_checkpoint,
 )
 from agent_runs.store.artifacts import ArtifactStore
+from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import ResolutionRow, RunRow
 
 _RECORD_FIELDS = (
@@ -73,6 +75,24 @@ _RECORD_FIELDS = (
 
 _SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
 
+#: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
+#: same key with a different request is a client bug to surface, not a run to hand back.
+#: ``run_id`` is not compared (the contracts mint one when none is sent, so a retry that
+#: sent none differs there by construction).
+_START_FIELDS = frozenset(
+    {
+        "agent_id",
+        "parent_run_id",
+        "thread_id",
+        "user_id",
+        "workspace_id",
+        "on_behalf_of",
+        "input",
+        "deadline",
+        "metadata",
+    }
+)
+
 
 def _record(row: RunRow) -> RunRecord:
     fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
@@ -83,19 +103,43 @@ def _json(model: Any) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True) if model is not None else None
 
 
+def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: bool) -> list[str]:
+    """The fields in which a repeated start asks for something other than the run it found."""
+    asked = start.model_dump(mode="json", include=set(_START_FIELDS))
+    kept = existing.model_dump(mode="json", include=set(_START_FIELDS))
+    differing = sorted(name for name in _START_FIELDS if asked.get(name) != kept.get(name))
+    return [*differing, "queue"] if queue != queued else differing
+
+
 def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     """The one transition check. Leaving RUNNING or PAUSED clears what belonged to it; an
-    ending clears the checkpoint, which only a run that may still continue needs."""
+    ending clears the checkpoint, which only a run that may still continue needs. Whoever
+    settled the old state did not settle the new one."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
     row.status = to.value
     row.updated_at = now
+    row.settled_by = None
     if to is not RunStatus.RUNNING:
         row.lease_owner = row.lease_expires_at = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.assignee = row.awaiting_deadline = None
     if to.final:
         row.checkpoint = None
+
+
+def _fence(row: RunRow, worker_id: str | None) -> None:
+    """A worker's write (``worker_id``) is taken only while it still holds the run's lease:
+    a worker whose lease lapsed must not write over the run another worker has since
+    claimed."""
+    if worker_id is not None and row.lease_owner != worker_id:
+        raise LeaseLost(f"worker {worker_id} does not hold the lease on run {row.run_id}")
+
+
+def _settled(row: RunRow, status: RunStatus, worker_id: str | None) -> bool:
+    """Is the run already in ``status``, put there by this caller? Then a pause or finish
+    to it is a repeat: the caller never saw the answer to the first one."""
+    return row.status == status.value and row.settled_by == worker_id
 
 
 def _requeue(row: RunRow, now: datetime) -> None:
@@ -112,13 +156,20 @@ class RunStore:
         self._session = session
 
     # ------------------------------------------------------------------ starting
-    async def start(self, start: RunStart, *, queue: bool, now: datetime) -> tuple[RunRecord, bool]:
+    async def start(
+        self, start: RunStart, *, queue: bool, now: datetime, strict: bool = True
+    ) -> tuple[RunRecord, bool]:
         """Record a run as ``RUNNING``, or ``QUEUED`` for a worker. Returns ``(run, created)``.
 
         Idempotent on the run id and on ``(tenant, idempotency_key)``: a repeat returns the
         run the first start made. ``ON CONFLICT DO NOTHING`` makes that hold under
         concurrency too: the loser of two simultaneous starts waits on the unique index and
-        then reads the winner's row.
+        then reads the winner's row. ``strict``: a key repeated with a different request is
+        a ``Conflict`` (a schedule's fire is not strict: its key is the tick, and the
+        schedule may have been edited since the tick's first fire).
+
+        A run id held by another tenant is a ``Conflict`` that says nothing about who holds
+        it, or that anyone does.
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
         record = RunRecord.from_start(start, status=status)
@@ -148,17 +199,27 @@ class RunStore:
         )
         if row is not None:
             return _record(row), True
-        existing = None
         if start.idempotency_key:
-            existing = await self._one(
+            keyed = await self._one(
                 RunRow.tenant_id == start.tenant_id,
                 RunRow.idempotency_key == start.idempotency_key,
             )
-        existing = existing or await self._one(
+            if keyed is not None:
+                found = _record(keyed)
+                queued = keyed.queued_at is not None
+                differing = _differing(found, start, queue=queue, queued=queued)
+                if strict and differing:
+                    raise Conflict(
+                        f"idempotency_key {start.idempotency_key!r} started a different run: "
+                        f"{', '.join(differing)} differ",
+                        details={"differing": differing},
+                    )
+                return found, False
+        existing = await self._one(
             RunRow.tenant_id == start.tenant_id, RunRow.run_id == start.run_id
         )
         if existing is None:
-            raise Conflict(f"run id {start.run_id} is taken")
+            raise Conflict("this run_id cannot be used: send another, or none and one is minted")
         return _record(existing), False
 
     # ------------------------------------------------------------------ transitions
@@ -170,18 +231,26 @@ class RunStore:
         *,
         worker_id: str | None,
         now: datetime,
-    ) -> RunRecord:
+    ) -> tuple[RunRecord, bool]:
+        """The run waits on ``pause.interrupt``. Returns ``(run, paused)``: a repeat of the
+        pause that made the current state (the same caller, the same interrupt) answers the
+        stored run with ``paused`` false, changing nothing."""
         interrupt = pause.interrupt
         if (interrupt.tenant_id, interrupt.run_id) != (tenant_id, run_id):
             raise Unprocessable("the interrupt belongs to another run")
         checkpoint = pause.bounded_checkpoint()
-        row = await self._locked(tenant_id, run_id, worker_id=worker_id)
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        waiting_on = (row.awaiting or {}).get("interrupt_id")
+        if _settled(row, RunStatus.PAUSED, worker_id) and waiting_on == interrupt.interrupt_id:
+            return _record(row), False
+        _fence(row, worker_id)
         _move(row, RunStatus.PAUSED, now)
         row.checkpoint = checkpoint
         row.awaiting = interrupt.awaiting()
         row.assignee = interrupt.assignee
         row.awaiting_deadline = interrupt.deadline
-        return await self._flushed(row)
+        row.settled_by = worker_id
+        return await self._flushed(row), True
 
     async def resume(
         self, tenant_id: str, run_id: str, resolution: InterruptResolution, *, now: datetime
@@ -232,13 +301,20 @@ class RunStore:
         *,
         worker_id: str | None,
         now: datetime,
-    ) -> RunRecord:
-        row = await self._locked(tenant_id, run_id, worker_id=worker_id)
+    ) -> tuple[RunRecord, bool]:
+        """End the run. Returns ``(run, ended)``: a repeat of the finish that ended it (the
+        same caller, the same status) answers the stored run with ``ended`` false, changing
+        nothing, so a worker that never saw the answer may retry."""
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        if _settled(row, ending.status, worker_id):
+            return _record(row), False
+        _fence(row, worker_id)
         _move(row, ending.status, now)
         row.output = ending.output
         row.error = _json(ending.error)
+        row.settled_by = worker_id
         await self._ended([row], now)
-        return await self._flushed(row)
+        return await self._flushed(row), True
 
     # ------------------------------------------------------------------ the queue
     async def claim(
@@ -268,11 +344,16 @@ class RunStore:
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime
     ) -> Lease:
-        """Extend the caller's lease. A 409 means the lease is gone (it lapsed and the run was
-        re-queued, or the run was cancelled or finished): the worker must stop."""
+        """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
+        means the lease is gone (it lapsed and the run was re-queued, or the run was
+        cancelled or finished): the worker must stop, and nothing is saved."""
+        checkpoint = bounded_checkpoint(request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
         if row.status != RunStatus.RUNNING:
-            raise Conflict(f"run {run_id} is {row.status}")
+            raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
+        if checkpoint is not None:
+            row.checkpoint = checkpoint
+            row.updated_at = now
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
         return lease
@@ -380,13 +461,15 @@ class RunStore:
         if row is None:
             raise NotFound(f"no run {run_id}")
         if row.status == RunStatus.RUNNING:
-            if (row.lease_owner is not None or worker_id is not None) and (
-                worker_id != row.lease_owner
-            ):
-                raise Conflict(f"worker {worker_id} does not hold the lease on run {run_id}")
+            if worker_id is None and row.lease_owner is not None:
+                raise Conflict(f"run {run_id} is leased: only its lease holder adds artifacts")
+            if worker_id != row.lease_owner:
+                raise LeaseLost(f"worker {worker_id} does not hold the lease on run {run_id}")
         elif row.status == RunStatus.PAUSED:
             if role != PAUSED_ARTIFACT_ROLE:
                 raise Forbidden(f"only a {PAUSED_ARTIFACT_ROLE} key adds to a paused run")
+        elif worker_id is not None:
+            raise LeaseLost(f"run {run_id} is {row.status}; worker {worker_id} holds no lease")
         else:
             raise Conflict(f"run {run_id} is {row.status}; artifacts are added while it runs")
 
@@ -396,25 +479,35 @@ class RunStore:
         await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
 
     # ------------------------------------------------------------------ reads
-    async def resolutions(self, tenant_id: str, run_id: str) -> list[ResolutionEntry]:
-        """Every interrupt the run was asked and how it was answered, oldest first."""
+    async def resolutions(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        limit: int = DEFAULT_PAGE,
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[ResolutionEntry]:
+        """Every interrupt the run was asked and how it was answered, oldest first, a page
+        at a time (keyset ``recorded_at, resolution_id``)."""
         await self.get(tenant_id, run_id)  # 404 for another tenant's run, as everywhere
-        rows = (
-            await self._session.scalars(
-                select(ResolutionRow)
-                .where(ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id)
-                .order_by(ResolutionRow.recorded_at, ResolutionRow.resolution_id)
-            )
-        ).all()
-        return [
-            ResolutionEntry(
+        order = (ResolutionRow.recorded_at, ResolutionRow.resolution_id)
+        query = select(ResolutionRow).where(
+            ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id
+        )
+        if after is not None:
+            query = query.where(tuple_(*order) > (after["recorded_at"], after["resolution_id"]))
+        rows = (await self._session.scalars(query.order_by(*order).limit(limit + 1))).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=lambda r: ResolutionEntry(
                 interrupt=Interrupt.model_validate(r.interrupt),
                 resolution=InterruptResolution.model_validate(r.resolution),
                 attempt=r.attempt,
                 recorded_at=r.recorded_at,
-            )
-            for r in rows
-        ]
+            ),
+            position=lambda r: {"recorded_at": r.recorded_at, "resolution_id": r.resolution_id},
+        )
 
     async def get(self, tenant_id: str, run_id: str) -> RunRecord:
         row = await self._one(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
@@ -432,11 +525,16 @@ class RunStore:
         thread_id: str | None = None,
         parent_run_id: str | None = None,
         limit: int = DEFAULT_PAGE,
-    ) -> list[RunSummary]:
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[RunSummary]:
         """This tenant's runs, newest first, as summaries (only the summary's columns are
-        read). ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served
-        by ``ix_runs_inbox``."""
-        query = select(*_SUMMARY_COLUMNS).where(RunRow.tenant_id == tenant_id)
+        read), a page at a time (keyset ``created_at, run_id``, both descending).
+        ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served by
+        ``ix_runs_inbox``."""
+        order = (RunRow.created_at, RunRow.run_id)
+        query = select(*_SUMMARY_COLUMNS, RunRow.created_at).where(RunRow.tenant_id == tenant_id)
+        if after is not None:
+            query = query.where(tuple_(*order) < (after["created_at"], after["run_id"]))
         filters: dict[Any, Any] = {
             RunRow.status: status.value if status else None,
             RunRow.assignee: assignee,
@@ -447,8 +545,14 @@ class RunStore:
         for column, value in filters.items():
             if value is not None:
                 query = query.where(column == value)
-        rows = await self._session.execute(query.order_by(RunRow.created_at.desc()).limit(limit))
-        return [RunSummary.model_validate(dict(row._mapping)) for row in rows.all()]
+        newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
+        rows = (await self._session.execute(newest)).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=lambda row: RunSummary.model_validate(dict(row._mapping)),
+            position=lambda row: {"created_at": row.created_at, "run_id": row.run_id},
+        )
 
     # ------------------------------------------------------------------ internals
     async def _one(self, *conditions: Any) -> RunRow | None:
@@ -465,8 +569,7 @@ class RunStore:
         )
         if row is None:
             raise NotFound(f"no run {run_id}")
-        if worker_id is not None and row.lease_owner != worker_id:
-            raise Conflict(f"worker {worker_id} does not hold the lease on run {run_id}")
+        _fence(row, worker_id)
         return row
 
     async def _flushed(self, row: RunRow) -> RunRecord:

@@ -45,6 +45,7 @@ from agent_runs.config.settings import get_settings
 from agent_runs.domain.schedules import FireFailed
 from agent_runs.domain.webhooks import WebhookEvent
 from agent_runs.firing import Firing
+from agent_runs.observability import metrics
 from agent_runs.observability.logging import configure_logging
 from agent_runs.retry import Breaker
 from agent_runs.store.artifacts import ArtifactStore
@@ -89,6 +90,7 @@ class Ticker:
         recorded on the breaker and reported as an empty tick."""
         now = now or clock()
         if not self.breaker.allows(now):
+            metrics.ticks_total.labels("skipped").inc()
             return TickReport()
         try:
             report = TickReport(
@@ -100,9 +102,13 @@ class Ticker:
             )
         except (DBAPIError, OSError) as exc:
             self.breaker.record_failure(now)
+            metrics.ticks_total.labels("failed").inc()
             log.warning("ticker.tick_failed", error=str(exc), failures=self.breaker.failures)
             return TickReport()
         self.breaker.record_success()
+        metrics.ticks_total.labels("ok").inc()
+        for step, count in report.__dict__.items():
+            metrics.swept_total.labels(step).inc(count)
         if report != TickReport():
             log.info("ticker.tick", **report.__dict__)
         return report
@@ -205,6 +211,9 @@ async def run() -> None:
         level=settings.observability.log_level, json_output=settings.observability.log_json
     )
     engine = await connect(settings.database)
+    if settings.ticker.metrics_port is not None:
+        metrics.serve(settings.ticker.metrics_port, engine)
+        log.info("ticker.metrics", port=settings.ticker.metrics_port)
     webhooks = WebhookSender(allow_http=settings.service.is_dev)
     blobs = open_blob_store(settings.blob)
     stop = asyncio.Event()

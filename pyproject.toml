@@ -1,6 +1,6 @@
 [project]
 name = "agent-runs"
-version = "0.2.0"
+version = "0.3.0"
 description = "Durable agent runs, the worker queue, the human inbox and the schedules that start runs."
 requires-python = ">=3.12"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
   "httpx>=0.28",
   "trellis-contracts>=0.4,<0.5",
   "google-cloud-storage>=3.4",
+  "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]
@@ -49,12 +50,13 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 # PLR2004: in a test the literal IS the assertion. PLC0415: conftest imports psycopg inside
 # the probe so collection still works (and skips with a reason) without PostgreSQL.
 "tests/**" = ["PLR2004", "PLC0415"]
-# PLR0913/PLR0917: FastAPI expresses query parameters as function arguments, and the list
-# filters are keyword-only and optional in the store.
-"src/agent_runs/api/routers/runs.py" = ["PLR0913", "PLR0917"]
-"src/agent_runs/api/routers/artifacts.py" = ["PLR0913", "PLR0917"]
+# PLR0913/PLR0917: FastAPI expresses query parameters (filters, cursor, limit) as function
+# arguments, and the list filters are keyword-only and optional in the store.
+"src/agent_runs/api/routers/*.py" = ["PLR0913", "PLR0917"]
 "src/agent_runs/store/runs.py" = ["PLR0913"]
 "src/agent_runs/store/artifacts.py" = ["PLR0913"]
+# A problem has nine members; its builders take them by keyword.
+"src/agent_runs/api/errors.py" = ["PLR0913"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

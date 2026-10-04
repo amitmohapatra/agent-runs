@@ -18,6 +18,8 @@ from agent_runs.domain.errors import Conflict, Unprocessable
 
 
 class WebhookEvent(StrEnum):
+    """A run event a subscription may hear: a pause, an escalation, an ending."""
+
     PAUSED = "run.paused"
     ESCALATED = "run.escalated"
     FINISHED = "run.finished"
@@ -36,8 +38,10 @@ Url = Annotated[str, StringConstraints(min_length=1, max_length=2048, strip_whit
 class WebhookCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    url: Url
-    events: list[WebhookEvent] = Field(min_length=1)
+    url: Url = Field(description="Where deliveries go: absolute https (http too in dev).")
+    events: list[WebhookEvent] = Field(
+        min_length=1, description="The run events to deliver (duplicates dropped)."
+    )
 
     @field_validator("events")
     @classmethod
@@ -57,17 +61,19 @@ class Webhook(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    webhook_id: str
-    url: str
-    events: list[WebhookEvent]
-    created_by: str
-    created_at: AwareDatetime
+    webhook_id: str = Field(description="The subscription's id.")
+    url: str = Field(description="Where deliveries go.")
+    events: list[WebhookEvent] = Field(description="The run events delivered, sorted.")
+    created_by: str = Field(description="The principal of the key that created it.")
+    created_at: AwareDatetime = Field(description="When it was created.")
 
 
 class WebhookCreated(Webhook):
     """The answer to a create, the only one that carries ``secret``."""
 
-    secret: str
+    secret: str = Field(
+        description="Signs every delivery (X-Trellis-Signature); shown in this answer only."
+    )
 
 
 class TooManyWebhooks(Conflict):

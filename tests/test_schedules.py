@@ -213,7 +213,11 @@ async def test_a_failed_fire_is_recorded_loudly_and_does_not_advance(client, bro
     broken.fail()
     failed = await client.post(f"/v1/schedules/{sid}/fire")
     assert failed.status_code == 503
-    detail = failed.json()["detail"]
+    problem = failed.json()
+    assert (problem["code"], problem["retryable"]) == ("DEPENDENCY_UNAVAILABLE", True)
+    assert failed.headers["retry-after"].isdigit()
+    assert "INSERT" not in problem["detail"], "the database's words stay in details"
+    detail = problem["details"]
     assert (detail["consecutive_failures"], detail["auto_paused"]) == (1, False)
 
     recorded = (await client.get(f"/v1/schedules/{sid}")).json()
@@ -229,7 +233,9 @@ async def test_a_refusal_that_will_not_change_its_mind_pauses_at_once(client, br
     ]
     broken.fail(retryable=False)
     failed = await client.post(f"/v1/schedules/{sid}/fire")
-    assert failed.json()["detail"]["auto_paused"] is True
+    assert failed.json()["details"]["auto_paused"] is True
+    assert failed.json()["retryable"] is False, "a paused schedule will not fire on a repeat"
+    assert "retry-after" not in failed.headers
     paused = (await client.get(f"/v1/schedules/{sid}")).json()
     assert (paused["enabled"], paused["consecutive_failures"]) == (False, 1)
     assert paused["last_error"]["retryable"] is False

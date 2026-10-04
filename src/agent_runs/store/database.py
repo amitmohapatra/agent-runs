@@ -7,13 +7,18 @@ schema.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from agent_runs.config.constants import READY_TIMEOUT_SECONDS
 from agent_runs.config.settings import DatabaseSettings
 
 #: Resolved at import: reading the filesystem inside a coroutine blocks the loop.
@@ -22,8 +27,20 @@ _HEAD = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
 
 
 async def connect(config: DatabaseSettings) -> AsyncEngine:
-    """An engine on a database at the schema this build was written against."""
-    engine = create_async_engine(config.url, pool_size=config.pool_size)
+    """An engine on a database at the schema this build was written against, with the
+    pool and timeout protections of ``DatabaseSettings``."""
+    engine = create_async_engine(
+        config.url,
+        pool_size=config.pool_size,
+        max_overflow=config.max_overflow,
+        pool_timeout=config.pool_timeout_seconds,
+        pool_recycle=config.pool_recycle_seconds,
+        pool_pre_ping=config.pool_pre_ping,
+        connect_args={
+            "connect_timeout": config.connect_timeout_seconds,
+            "options": f"-c statement_timeout={config.statement_timeout_ms}",
+        },
+    )
     async with engine.connect() as conn:
         current = await conn.run_sync(
             lambda sync: MigrationContext.configure(sync).get_current_revision()
@@ -35,3 +52,16 @@ async def connect(config: DatabaseSettings) -> AsyncEngine:
             "run `alembic upgrade head` (make migrate) first"
         )
     return engine
+
+
+async def ping(engine: AsyncEngine, *, within: float = READY_TIMEOUT_SECONDS) -> bool:
+    """Whether the database answers ``SELECT 1`` within ``within`` seconds: the readiness probe.
+    Bounded as a whole (a pooled connection that turns out dead, a server that accepts the
+    query and never answers), and it never raises: "not ready" is an answer."""
+    try:
+        async with asyncio.timeout(within):
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+    except (DBAPIError, PoolTimeout, TimeoutError, OSError):
+        return False
+    return True

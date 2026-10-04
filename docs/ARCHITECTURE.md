@@ -18,7 +18,7 @@ executes an agent: the harness does, and records here what happened.
 
 ```mermaid
 flowchart LR
-  subgraph clients["Clients (X-Api-Key)"]
+  subgraph clients["Clients (X-API-Key)"]
     harness["agent-harness<br/>HttpRuns: in-process runs<br/>and trellis workers"]
     ui["Inbox UI / its backend"]
   end
@@ -26,7 +26,8 @@ flowchart LR
   subgraph runs["agent-runs"]
     subgraph api["API process: agent-runs (FastAPI, api/app.py)"]
       deps["api/deps.py<br/>caller() → Caller"]
-      routers["routers: runs · artifacts<br/>schedules · webhooks<br/>+ /health/live, /health/ready"]
+      mw["api/middleware.py<br/>request id · metrics · body cap · gzip"]
+      routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
       ticker["Ticker.tick() every TICK_SECONDS<br/>fire · requeue · escalate<br/>send webhooks · purge artifacts"]
@@ -47,6 +48,7 @@ flowchart LR
 
   harness -- "HTTP /v1/runs, /v1/schedules,<br/>/v1/artifacts" --> routers
   ui -- "HTTP inbox, resume,<br/>artifacts, webhooks" --> routers
+  mw --> routers
   routers --> deps --> keys -- "introspect key" --> memory
   routers --> stores
   routers --> blobport
@@ -63,15 +65,21 @@ flowchart LR
 
 | Component | Where | What it owns |
 |---|---|---|
-| API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface; one exception handler turns `domain.errors.ServiceError` subclasses into `{"detail": …}` with their status |
-| Caller resolution | `api/deps.py` `caller`, `Caller` | `X-Api-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
+| API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface |
+| OpenAPI | `api/openapi.py` `custom_openapi`, `api/examples.py`, `tools/export_openapi.py` | the document every route shares (metadata, `<tag>.<function>` ids, the `ApiKeyAuth` scheme, a problem on every error status, standard headers); `docs/openapi.json` is it committed, and `tests/test_openapi.py` fails when they differ |
+| Errors | `api/errors.py` `install_error_handlers`, `Problem`; `domain/errors.py` `ErrorCode` | every failure as an RFC 9457 problem: `ServiceError` subclasses with their status and `code`, FastAPI's validation and HTTP errors, a database that went away (`503`, `Retry-After`), anything else (`500`, no internals) |
+| Middleware | `api/middleware.py` `RequestContextMiddleware`, `BodyLimitMiddleware`, `CompressionMiddleware` | `X-Request-ID` in, out and in every problem; request metrics by route template; the JSON body cap counted as bytes arrive; gzip, except artifact bytes |
+| Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | a token bucket per tenant per worker process; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
+| Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
+| Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
 | Webhook sender | `webhooks.py` `WebhookSender`, `sign` | one signed attempt per due outbox row |
-| Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `read` verifies SHA-256 and size while streaming |
+| Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
+| Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
 
 ## The run lifecycle
 
@@ -127,6 +135,14 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
 - `MAX_ATTEMPTS` is 5 (`config/constants.py`).
+- `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat; a
+  requeue keeps it, so the next attempt's claim resumes from it; only an ending clears it.
+- A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
+  move clears it. A repeat of that call (the same caller, to the same status, on the same
+  interrupt for a pause) is answered with the stored run and moves nothing (`_settled`),
+  so a worker that lost the answer may retry. Otherwise a fenced write (`worker_id`) on a
+  run whose lease the worker no longer holds is `LeaseLost` (`409 LEASE_LOST`, `_fence`),
+  checked before the transition.
 
 ## Start, interrupt, resume
 
@@ -157,8 +173,8 @@ sequenceDiagram
   A->>DB: SELECT … FOR UPDATE SKIP LOCKED, oldest queued_at
   A-->>W: 200 Claimed {run RUNNING, lease}
   loop every third of the lease
-    W->>A: POST /v1/runs/{id}/heartbeat {worker_id}
-    A-->>W: 200 Lease (409 = lease lost, stop)
+    W->>A: POST /v1/runs/{id}/heartbeat {worker_id, checkpoint (progress, optional)}
+    A-->>W: 200 Lease (409 LEASE_LOST = stop)
   end
 
   W->>A: POST /v1/runs/{id}/artifacts?worker_id= (bytes)
@@ -241,8 +257,8 @@ moves forward past now, so a long outage fires each schedule once, not once per 
 
 ## The tables
 
-Six tables, built by the eight Alembic revisions in `alembic/versions` (head
-`d3c8e9f0a1b2`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
+Six tables, built by the nine Alembic revisions in `alembic/versions` (head
+`e4d9f0a1b2c3`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
 line is the logical link a schedule fire leaves (no foreign key: a run outlives the schedule
 that fired it).
 
@@ -278,6 +294,7 @@ erDiagram
     timestamptz queued_at "set once the run entered the queue"
     varchar lease_owner
     timestamptz lease_expires_at
+    varchar settled_by "worker_id of the pause or finish that made the state"
     timestamptz created_at
     timestamptz updated_at
   }
@@ -352,7 +369,9 @@ erDiagram
   }
 ```
 
-The indexes each serve one query:
+Every listing is a keyset page (`store/paging.py`): ordered by `created_at` (or
+`recorded_at`) and the id, fetched one row past the page, the next page starting strictly
+after the last row returned. The indexes each serve one query:
 
 | Index | Table | Serves |
 |---|---|---|
@@ -373,28 +392,38 @@ The indexes each serve one query:
 The migrations, oldest first: `1f6242bb21de` initial runs table, `7c1d2e3f4a5b` queue, lease
 and inbox, `8d2e3f4a5b6c` schedules, `9e3f4a5b6c7d` run checkpoint, `a0f4b5c6d7e8` schedule
 identity, `b1a5c6d7e8f9` webhook subscriptions, `c2b6d7e8f9a0` run artifacts,
-`d3c8e9f0a1b2` run resolutions. Each has a downgrade; CI runs upgrade, downgrade to base and
+`d3c8e9f0a1b2` run resolutions, `e4d9f0a1b2c3` run `settled_by`. Each has a downgrade; CI runs upgrade, downgrade to base and
 upgrade again.
 
 ## Code map
 
 ```
 src/agent_runs/
-  __main__.py          agent-runs: uvicorn on RUNS__SERVICE__HOST:PORT
+  __main__.py          agent-runs: uvicorn on RUNS__SERVICE__HOST:PORT, RUNS__SERVICE__WORKERS
+                       processes (one per CPU, 1 to 8), graceful shutdown
   ticker.py            agent-runs-ticker: Ticker, run(), main()
   heartbeat.py         the ticker's liveness file; python -m agent_runs.heartbeat is the probe
-  keys.py              KeyRegistry, KeyInfo: who an X-Api-Key is
+  keys.py              KeyRegistry, KeyInfo: who an X-API-Key is
   firing.py            Firing: one schedule tick → one queued run
   webhooks.py          WebhookSender, sign: delivering the outbox
   retry.py             backoff(), Breaker: the one retry policy
-  api/app.py           create_app(): routers, the ServiceError handler, health routes
+  api/app.py           create_app(): routers, middleware, error handlers, health routes
+  api/errors.py        Problem, install_error_handlers(): every error as a problem
+  api/middleware.py    request context (id, metrics), body cap, compression
+  api/pagination.py    cursor in, Link: rel="next" out
+  api/openapi.py       the OpenAPI document: metadata, ids, problems, headers
+  api/examples.py      a request example for every body
+  api/ratelimit.py     TenantRateLimiter: a token bucket per tenant, per process
+  api/routers/ops.py   /health/live, /health/ready, /metrics
   api/deps.py          Caller, caller(), session(): who is calling, a session per request
   api/routers/         runs.py, artifacts.py, schedules.py, webhooks.py
   domain/              runs.py, schedules.py, webhooks.py (request and answer models),
-                       cadence.py (validate_cadence, next_fire_at), errors.py (status codes)
+                       cadence.py (validate_cadence, next_fire_at), errors.py (status, ErrorCode)
   store/               tables.py (the mappings), runs.py, schedules.py, webhooks.py,
-                       artifacts.py, database.py (connect + the head-revision check)
+                       artifacts.py, database.py (connect + the head-revision check),
+                       paging.py (Page, page_of: keyset pages)
   blob/                port.py (BlobStore, read), filesystem.py, gcs.py, open_blob_store()
   config/              settings.py (RUNS__* deployment facts), constants.py (design decisions)
-  observability/       logging.py (structlog, JSON or console)
+  tools/               export_openapi.py: docs/openapi.json (make openapi)
+  observability/       logging.py (structlog, JSON or console), metrics.py (Prometheus)
 ```

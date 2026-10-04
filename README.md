@@ -73,28 +73,31 @@ stateDiagram-v2
 
 ## The API
 
-Every `/v1` route needs `X-Api-Key`; the health routes do not. [docs/api.md](docs/api.md) has
-every route, body and status code, and the exact claim, heartbeat and resume semantics a
-worker implements.
+Every `/v1` route needs `X-API-Key`; the ops routes do not. The OpenAPI document is
+[docs/openapi.json](docs/openapi.json) (live at `/openapi.json`, `/docs`, `/redoc`). Every error is an RFC 9457
+problem (`application/problem+json`) with a stable `code` (`LEASE_LOST` tells a worker to
+stop; `DEPENDENCY_UNAVAILABLE` and `RATE_LIMIT` come with `Retry-After`).
+[docs/api.md](docs/api.md) has every route, body, status code and problem `code`, and the
+exact claim, heartbeat and resume semantics a worker implements.
 
 | Route | What it does |
 |---|---|
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
-| `POST /v1/runs/{id}/heartbeat` | extend the lease; `409` = lease lost, stop |
+| `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
-| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` |
+| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
-| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
+| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role. Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
 | `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
 | `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |
 | `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
-| `POST/GET /v1/webhooks` · `DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
-| `GET /health/live` · `GET /health/ready` | the process is up · the database answers (no key) |
+| `POST/GET /v1/webhooks` · `GET/DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
+| `GET /health/live` · `GET /health/ready` · `GET /metrics` | the process is up · the database answers · Prometheus metrics (no key) |
 
 ## The ticker
 
@@ -120,7 +123,7 @@ ticker; unset, each ticker process beats into its own file in the temp directory
 
 ## Authentication
 
-One scheme, one key system. `X-Api-Key` is a key issued by the Memory Service; agent-runs
+One scheme, one key system. `X-API-Key` is a key issued by the Memory Service; agent-runs
 introspects it there (`GET {RUNS__MEMORY__URL}/v1/keys/self`, cached 60 s, refusals 10 s)
 and learns the tenant it speaks for, the principal recorded as `created_by`, and the
 principals it may put in `on_behalf_of`. The contract is in
@@ -183,14 +186,26 @@ documented in [.env.example](.env.example); every other number is a named consta
 |---|---|---|---|
 | `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
 | `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
-| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https` |
-| `RUNS__MEMORY__URL` | `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self` |
+| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https`. Only `dev` and `test` may use the filesystem blob store |
+| `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache, rate-limit buckets and metrics |
+| `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
+| `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB |
+| `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` | API | a run's `input` or `output` past this (compact JSON) is `413` |
+| `RUNS__RATE_LIMIT__PER_MINUTE`, `RUNS__RATE_LIMIT__BURST` | `3000`, `500` | API | each tenant's token bucket per worker process (`429` + `Retry-After` when empty); `0` per minute turns it off |
+| `RUNS__MEMORY__URL` | `MEMORY_URL`, else `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self`. `MEMORY_URL` is the platform-wide name; this one wins when both are set |
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
-| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process |
-| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` or `gcs` |
+| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process (per worker) |
+| `RUNS__DATABASE__MAX_OVERFLOW` | `10` | API, ticker | connections opened past the pool under a burst |
+| `RUNS__DATABASE__POOL_TIMEOUT_SECONDS` | `5` | API, ticker | wait for a pooled connection before answering `503` |
+| `RUNS__DATABASE__POOL_RECYCLE_SECONDS` | `300` | API, ticker | a pooled connection older than this is replaced, not reused |
+| `RUNS__DATABASE__POOL_PRE_PING` | `true` | API, ticker | test a pooled connection on checkout; a dead one is replaced, not handed to a request |
+| `RUNS__DATABASE__CONNECT_TIMEOUT_SECONDS` | `5` | API, ticker | opening a connection to PostgreSQL |
+| `RUNS__DATABASE__STATEMENT_TIMEOUT_MS` | `15000` | API, ticker | PostgreSQL cancels a statement past this (`503` here); `0` is no limit |
+| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` (dev and test only) or `gcs` |
 | `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
 | `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
 | `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |
+| `RUNS__TICKER__METRICS_PORT` | unset | ticker | serve the ticker's Prometheus metrics on this port |
 | `RUNS__OBSERVABILITY__LOG_LEVEL` | `INFO` | API, ticker | log level |
 | `RUNS__OBSERVABILITY__LOG_JSON` | `true` | API, ticker | `false` for the console renderer |
 | `RUNS_PORT`, `RUNS_DB_PORT` | `8090`, `5442` | docker compose | host ports of the API and PostgreSQL |
@@ -201,6 +216,7 @@ documented in [.env.example](.env.example); every other number is a named consta
 ```bash
 make lint typecheck test
 make coverage                # the suite with line and branch coverage, failing under 95%
+make openapi                 # rewrite docs/openapi.json after changing a route or a model
 ```
 
 The suite runs against the local PostgreSQL in its own database (`agent_runs_tests`, dropped
@@ -214,5 +230,7 @@ skip. Migrations live in `alembic/versions`; a test checks they build exactly th
 code maps.
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright,
-the migrations up, down to base and up again, and the suite with the coverage floor, against
-PostgreSQL 16 with `agent-contracts` checked out beside this repository.
+the migrations up, down to base and up again, the suite with the coverage floor, and a diff
+of `docs/openapi.json` against the document the code generates, against PostgreSQL 16 with
+`agent-contracts` checked out beside this repository. The OpenAPI document embeds the
+contracts' models, so it is regenerated whenever `agent-contracts` changes them.

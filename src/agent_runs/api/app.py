@@ -5,18 +5,23 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
+from typing import Any
 
 import structlog
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from agent_runs.api.deps import Session
-from agent_runs.api.routers import artifacts, runs, schedules, webhooks
+from agent_runs.api.errors import install_error_handlers
+from agent_runs.api.middleware import (
+    BodyLimitMiddleware,
+    CompressionMiddleware,
+    RequestContextMiddleware,
+)
+from agent_runs.api.openapi import TITLE, custom_openapi, operation_id
+from agent_runs.api.ratelimit import TenantRateLimiter
+from agent_runs.api.routers import artifacts, ops, runs, schedules, webhooks
 from agent_runs.blob import open_blob_store
 from agent_runs.config.settings import Settings, get_settings
-from agent_runs.domain.errors import ServiceError
 from agent_runs.keys import KeyRegistry
 from agent_runs.observability.logging import configure_logging
 from agent_runs.store.database import connect
@@ -46,25 +51,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await engine.dispose()
             log.info("agent_runs.stopped")
 
-    app = FastAPI(title="agent-runs", version=version("agent-runs"), lifespan=lifespan)
+    app = FastAPI(
+        title=TITLE,
+        version=version("agent-runs"),
+        lifespan=lifespan,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        generate_unique_id_function=operation_id,
+    )
     app.state.settings = settings
+    app.state.limiter = TenantRateLimiter(settings.rate_limit)
+    # Added innermost first: a request meets the request context (id, metrics), then the
+    # body limit, then compression, which acts on what the route produced.
+    app.add_middleware(CompressionMiddleware)
+    app.add_middleware(BodyLimitMiddleware, max_body_bytes=settings.service.max_body_bytes)
+    app.add_middleware(RequestContextMiddleware)
+    install_error_handlers(app)
+    app.include_router(ops.router)
     app.include_router(runs.router)
     app.include_router(artifacts.router)
     app.include_router(schedules.router)
     app.include_router(webhooks.router)
 
-    @app.exception_handler(ServiceError)
-    async def service_error(_: Request, exc: ServiceError) -> JSONResponse:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    def openapi() -> dict[str, Any]:
+        return custom_openapi(app)
 
-    @app.get("/health/live", tags=["ops"])
-    async def live() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/health/ready", tags=["ops"])
-    async def ready(db: Session) -> dict[str, str]:
-        """Ready means the database answers, the only dependency this service has."""
-        await db.execute(text("SELECT 1"))
-        return {"status": "ok"}
-
+    app.openapi = openapi  # type: ignore[method-assign]
     return app

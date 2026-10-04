@@ -9,9 +9,20 @@ from typing import Final
 # --------------------------------------------------------------------------- the wire
 
 #: The caller's credential. It names the tenant it speaks for, unless it is a platform key.
-HEADER_API_KEY: Final = "X-Api-Key"
+#: Spelled as the Memory Service spells it; header names are case-insensitive, so
+#: ``X-Api-Key`` is the same header.
+HEADER_API_KEY: Final = "X-API-Key"
 #: The tenant a platform key acts for. A tenant key may send it only to agree with itself.
 HEADER_TENANT: Final = "X-Trellis-Tenant"
+#: The caller's request id, echoed on every response and quoted in every problem; a client
+#: that sends none (or one that is not an id) gets a generated one.
+HEADER_REQUEST_ID: Final = "X-Request-ID"
+#: Seconds a client waits before repeating a request a dependency could not serve (a 503):
+#: long enough for a database failover or a restarted key registry to come back, short
+#: enough that a worker's lease outlives a couple of retries.
+RETRY_AFTER_SECONDS: Final = 5
+#: The longest the readiness probe waits for the database before answering 503.
+READY_TIMEOUT_SECONDS: Final = 3.0
 
 #: How long an introspected key is trusted before the registry is asked again: the longest
 #: a revoked key keeps working here.
@@ -19,6 +30,13 @@ KEY_CACHE_SECONDS: Final = 60.0
 #: How long a refused key stays refused without asking again.
 KEY_NEGATIVE_CACHE_SECONDS: Final = 10.0
 KEY_INTROSPECTION_TIMEOUT_SECONDS: Final = 3.0
+#: Opening a connection to the registry, within the timeout above.
+KEY_CONNECT_TIMEOUT_SECONDS: Final = 2.0
+#: Connections to the registry: introspection is one small GET per uncached key, so a few
+#: kept alive (30 s, under the usual 60 s idle timeout of a load balancer) carry it.
+KEY_MAX_CONNECTIONS: Final = 100
+KEY_MAX_KEEPALIVE: Final = 20
+KEY_KEEPALIVE_SECONDS: Final = 30.0
 #: Keys cached per process (least recently used goes first).
 MAX_CACHED_KEYS: Final = 10_000
 #: Webhook headers, spelled as the Memory Service spells them so one receiver verifies both.

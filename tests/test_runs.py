@@ -36,6 +36,23 @@ async def test_the_same_idempotency_key_never_starts_a_second_run(client) -> Non
     assert len((await client.get("/v1/runs")).json()) == 1
 
 
+async def test_an_idempotency_key_repeated_with_another_request_is_a_conflict(client) -> None:
+    """The key promises one run per request; a different request under it is a client bug,
+    surfaced instead of handing back a run that is not what was asked for."""
+    body = started(idempotency_key="turn-7", input={"q": "hi"})
+    first = await client.post("/v1/runs", json=body)
+    assert first.status_code == 201
+    replay = await client.post("/v1/runs", json=body)
+    assert (replay.status_code, replay.json()["run_id"]) == (200, first.json()["run_id"])
+
+    changed = await client.post("/v1/runs", json={**body, "input": {"q": "bye"}})
+    assert (changed.status_code, changed.json()["code"]) == (409, "CONFLICT")
+    assert changed.json()["details"] == {"differing": ["input"]}
+    queued = await client.post("/v1/runs", json={**body, "queue": True})
+    assert queued.json()["details"] == {"differing": ["queue"]}
+    assert len((await client.get("/v1/runs")).json()) == 1
+
+
 async def test_the_same_run_id_is_the_same_run(client) -> None:
     """The harness derives run ids, so a retried turn reopens nothing."""
     first = (await client.post("/v1/runs", json=started(run_id="run_abc"))).json()
@@ -50,7 +67,9 @@ async def test_a_run_id_another_tenant_holds_is_a_conflict_not_a_read(client, ot
         "/v1/runs", json=started(tenant_id="globex", run_id="run_shared")
     )
     assert theirs.status_code == 409
-    assert "acme" not in theirs.text
+    assert theirs.json()["code"] == "CONFLICT"
+    for leak in ("acme", "taken", "exists", "another tenant"):
+        assert leak not in theirs.text, leak
 
 
 async def test_two_tenants_may_use_the_same_idempotency_key(client, other_tenant) -> None:
@@ -182,14 +201,28 @@ async def test_an_unknown_field_in_a_resolution_is_refused(client) -> None:
 # ------------------------------------------------------------------ endings
 
 
-async def test_a_finished_run_cannot_finish_again(client) -> None:
+async def test_a_repeated_finish_answers_the_stored_run_and_changes_nothing(client) -> None:
+    """The caller that ended a run, ending it the same way again, never saw the first
+    answer: it gets the run as stored (the first output), not a 409."""
     run = (await client.post("/v1/runs", json=started())).json()
     rid = run["run_id"]
     first = await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": 1})
     assert first.status_code == 200
     again = await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": 2})
-    assert again.status_code == 409
+    assert again.status_code == 200
+    assert again.json() == first.json()
     assert (await client.get(f"/v1/runs/{rid}")).json()["output"] == 1
+
+
+async def test_a_finished_run_cannot_finish_another_way(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    rid = run["run_id"]
+    await client.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": 1})
+    other = await client.post(f"/v1/runs/{rid}/finish", json={"status": "CANCELLED"})
+    assert other.status_code == 409
+    assert other.headers["content-type"] == "application/problem+json"
+    assert (other.json()["code"], other.json()["retryable"]) == ("CONFLICT", False)
+    assert (await client.get(f"/v1/runs/{rid}")).json()["status"] == "SUCCESS"
 
 
 async def test_a_paused_run_cannot_jump_to_success_but_can_be_cancelled(client) -> None:
@@ -345,4 +378,6 @@ async def test_every_route_needs_a_key(app) -> None:
         ]:
             response = await anon.request(method, path)
             assert response.status_code == 401, (method, path, response.status_code)
-            assert response.json() == {"detail": "missing X-Api-Key"}
+            assert response.headers["content-type"] == "application/problem+json"
+            problem = response.json()
+            assert (problem["code"], problem["detail"]) == ("AUTHENTICATION", "missing X-API-Key")

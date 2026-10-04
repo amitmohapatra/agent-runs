@@ -78,7 +78,7 @@ class Firing:
         )
         try:
             async with self._session.begin_nested():
-                run, _ = await self._runs.start(start, queue=True, now=now)
+                run, _ = await self._runs.start(start, queue=True, now=now, strict=False)
         except DBAPIError as exc:
             error = AgentError.of(
                 exc,

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from trellis.contracts.errors import AgentError
 from trellis.contracts.runs import Schedule
 
@@ -29,14 +29,22 @@ class ScheduleUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    agent_id: str | None = None
-    name: str | None = None
-    cadence: str | None = None
-    timezone: str | None = None
-    input: Any = None
-    workspace_id: str | None = None
-    enabled: bool | None = None
-    metadata: dict[str, Any] | None = None
+    agent_id: str | None = Field(default=None, description="Fire runs of this agent instead.")
+    name: str | None = Field(default=None, description="A new label (need not be unique).")
+    cadence: str | None = Field(
+        default=None,
+        description="hourly, daily, weekly, weekdays, manual, or a cron expression firing at "
+        "most hourly; a change re-arms the next fire.",
+    )
+    timezone: str | None = Field(default=None, description="The IANA zone the cadence is in.")
+    input: Any = Field(default=None, description="The input each fired run gets.")
+    workspace_id: str | None = Field(default=None, description="The workspace runs act in.")
+    enabled: bool | None = Field(
+        default=None, description="false pauses; true resumes (clearing an auto-pause)."
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None, description="Merged into the schedule's metadata."
+    )
 
 
 class FireRequest(BaseModel):
@@ -47,17 +55,21 @@ class FireRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    at: AwareDatetime | None = None
+    at: AwareDatetime | None = Field(
+        default=None,
+        description="The tick to fire for, an instant that has arrived (with an offset); "
+        "half of the idempotency key.",
+    )
 
 
 class FireResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    schedule_id: str
-    run_id: str
-    fire_time: datetime
-    idempotency_key: str
-    schedule: Schedule
+    schedule_id: str = Field(description="The schedule fired.")
+    run_id: str = Field(description="The run queued (the same one for a repeated tick).")
+    fire_time: datetime = Field(description="The tick this fire was for.")
+    idempotency_key: str = Field(description="The run's key: `<schedule_id>@<fire_time UTC>`.")
+    schedule: Schedule = Field(description="The schedule, advanced.")
 
 
 class DuplicateSchedule(Conflict):
@@ -89,12 +101,15 @@ class FireFailed(Unavailable):
 
     def __init__(self, schedule: Schedule, error: AgentError) -> None:
         super().__init__(
-            {
-                "message": f"schedule {schedule.schedule_id} could not fire: {error.message}",
+            # the database's own words stay in details.error (and the schedule's last_error)
+            f"schedule {schedule.schedule_id} could not queue its run",
+            details={
                 "consecutive_failures": schedule.consecutive_failures,
                 "auto_paused": not schedule.enabled,
                 "error": error.model_dump(mode="json"),
-            }
+            },
+            # worth repeating only while the schedule still fires and the cause may pass
+            retryable=error.retryable and schedule.enabled,
         )
 
 

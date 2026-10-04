@@ -63,6 +63,9 @@ class RunRow(Base):
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(200))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the worker_id whose pause or finish made the current state (null: no worker), so a
+    #: repeat of that call answers the stored run instead of a conflict
+    settled_by: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
 
