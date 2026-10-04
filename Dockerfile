@@ -18,11 +18,15 @@ COPY --from=contracts src /agent-contracts/src
 WORKDIR /app
 
 # Dependencies first, in their own layer: code changes far more often than the lockfile.
+# trellis-runs (sdk/python) is a workspace member, so its metadata must be here for the
+# lockfile to resolve; it is installed with the sources, below.
 COPY pyproject.toml uv.lock ./
+COPY sdk/python/pyproject.toml sdk/python/README.md ./sdk/python/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --frozen --no-install-workspace --no-dev
 
 COPY src ./src
+COPY sdk/python/src ./sdk/python/src
 # The migrations ship in the image: the `migrate` service runs them, and both processes
 # refuse to start against a schema other than the head revision.
 COPY alembic.ini ./alembic.ini

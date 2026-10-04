@@ -1,0 +1,24 @@
+[project]
+name = "trellis-runs"
+version = "0.3.0"
+description = "Python SDK for agent-runs: durable runs, the worker queue, the inbox, schedules and webhooks."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+  "httpx>=0.28",
+  "pydantic>=2.13,<3",
+  # RunRecord, RunStart, Interrupt, Schedule…: the wire's records are the contracts' models
+  "trellis-contracts>=0.4,<0.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6", "respx>=0.22", "jsonschema>=4.23"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# ``trellis`` is a namespace package shared by every trellis-* distribution: no __init__.py.
+packages = ["src/trellis"]

@@ -1,10 +1,10 @@
 """Sending webhook deliveries from the outbox.
 
-The envelope and the signature are the Memory Service's (ADR 0023), so one receiver verifies
-both with ``trellis.memory.webhooks.verify_signature``: ``X-Trellis-Signature: t=<unix
-seconds>,v1=<hex hmac-sha256 of "<t>.<body>">`` over the exact bytes sent, keyed by the
-subscription's secret, with ``X-Trellis-Event`` and ``X-Trellis-Delivery`` (the event id,
-the same on every retry) beside it.
+Every delivery is signed with ``trellis.runs.webhooks.sign``, the SDK's one implementation of
+the scheme, so a receiver checks it with ``trellis.runs.webhooks.verify_signature``:
+``X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of "<t>.<body>">`` over the exact
+bytes sent, keyed by the subscription's secret, with ``X-Trellis-Event`` and
+``X-Trellis-Delivery`` (the event id, the same on every retry) beside it.
 
 One attempt per delivery per tick; the outbox row carries the attempt count and the backoff
 (``WebhookStore.settle``). At least once: the run row stays the source of truth, so a
@@ -14,32 +14,18 @@ receiver that missed one reconciles by reading the run.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import time
-from hashlib import sha256
 from urllib.parse import urlparse
 
 import httpx
 import structlog
+from trellis.runs.webhooks import DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign
 
-from agent_runs.config.constants import (
-    HEADER_DELIVERY,
-    HEADER_EVENT,
-    HEADER_SIGNATURE,
-    WEBHOOK_RETRYABLE,
-    WEBHOOK_TIMEOUT_SECONDS,
-)
+from agent_runs.config.constants import WEBHOOK_RETRYABLE, WEBHOOK_TIMEOUT_SECONDS
 from agent_runs.store.webhooks import Delivery
 
 log = structlog.get_logger(__name__)
-
-SIGNATURE_VERSION = "v1"
-
-
-def sign(secret: str, timestamp: int, body: bytes) -> str:
-    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, sha256).hexdigest()
-    return f"t={timestamp},{SIGNATURE_VERSION}={digest}"
 
 
 class WebhookSender:
@@ -65,9 +51,9 @@ class WebhookSender:
         body = json.dumps(payload, separators=(",", ":")).encode()
         headers = {
             "Content-Type": "application/json",
-            HEADER_EVENT: payload["type"],
-            HEADER_DELIVERY: payload["event_id"],
-            HEADER_SIGNATURE: sign(delivery.secret, int(time.time()), body),
+            EVENT_HEADER: payload["type"],
+            DELIVERY_HEADER: payload["event_id"],
+            SIGNATURE_HEADER: sign(delivery.secret, int(time.time()), body),
         }
         try:
             response = await self._client.post(delivery.url, content=body, headers=headers)

@@ -1,10 +1,10 @@
 """Webhooks: tenant subscriptions, written to an outbox with the run change, sent by the
-ticker with the Memory Service's envelope and a per-subscription signature, retried."""
+ticker with the event envelope and a per-subscription signature that the SDK's
+``trellis.runs.webhooks.verify_signature`` accepts, retried."""
 
 from __future__ import annotations
 
 import hmac
-import time
 from datetime import timedelta
 from hashlib import sha256
 from typing import Any
@@ -13,23 +13,16 @@ import httpx
 import pytest
 from sqlalchemy import text
 from trellis.contracts.runs import RunRecord, RunStatus
+from trellis.runs.webhooks import parse_delivery, sign, verify_signature
 
 from agent_runs.config.constants import WEBHOOK_ATTEMPTS
 from agent_runs.domain.webhooks import WebhookEvent, event_of
 from agent_runs.store.webhooks import Delivery, WebhookStore, envelope
 from agent_runs.ticker import Ticker
-from agent_runs.webhooks import WebhookSender, sign
+from agent_runs.webhooks import WebhookSender
 from tests.conftest import at, pause, started
 
 HOOK = "https://ui.example/h"
-
-
-def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
-    """The receiver's side, as ``trellis.memory.webhooks.verify_signature`` implements it."""
-    parts = dict(part.split("=", 1) for part in header.split(","))
-    stamp, digest = int(parts["t"]), parts["v1"]
-    expected = hmac.new(secret.encode(), f"{stamp}.".encode() + body, sha256).hexdigest()
-    return abs(time.time() - stamp) <= tolerance and hmac.compare_digest(expected, digest)
 
 
 def _run(**over: Any) -> RunRecord:
@@ -46,7 +39,7 @@ async def subscribe(client, events: list[str] | None = None, url: str = HOOK) ->
 # ------------------------------------------------------------------ pure
 
 
-def test_the_signature_is_the_memory_services() -> None:
+def test_the_signature_is_hmac_sha256_over_the_timestamp_and_the_body() -> None:
     body = b'{"type":"run.finished"}'
     header = sign("s3cret", 1_700_000_000, body)
     digest = hmac.new(b"s3cret", b"1700000000." + body, sha256).hexdigest()
@@ -174,7 +167,14 @@ async def test_a_pause_is_delivered_by_the_ticker_signed_with_the_subscriptions_
     assert event["type"] == "run.paused"
     assert event["data"]["run"]["assignee"] == "user:u1"
     request = receiver.received[0]
-    assert verify(hook["secret"], request.headers["X-Trellis-Signature"], request.content)
+    # the receiver's side, with the SDK: the exact bytes sent verify, and parse
+    assert verify_signature(hook["secret"], request.headers["X-Trellis-Signature"], request.content)
+    assert not verify_signature(
+        "whsec_other", request.headers["X-Trellis-Signature"], request.content
+    )
+    delivery = parse_delivery(request.content)
+    assert delivery.event_id == event["event_id"] and delivery.data.run.run_id == run["run_id"]
+    assert delivery.type == "run.paused" and delivery.data.run.assignee == "user:u1"
     assert request.headers["X-Trellis-Event"] == "run.paused"
     assert request.headers["X-Trellis-Delivery"] == event["event_id"]
     assert (await ticker.tick()).sent == 0  # delivered once

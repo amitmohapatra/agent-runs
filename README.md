@@ -4,9 +4,9 @@ Durable agent runs, the worker queue, the human inbox, and the schedules that st
 One service (it absorbed agent-schedules in 0.2.0): an API process and a ticker process over
 one PostgreSQL database, with run artifacts' bytes in blob storage (a filesystem, or GCS).
 
-This service never executes an agent. A harness does, either in its own process (it records
-the run here as `RUNNING`) or as a `trellis worker` that claims `QUEUED` runs from here under
-a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
+This service never executes an agent. A harness (or any framework, through the
+[Python SDK](#the-python-sdk)) does, either in its own process (it records the run here as
+`RUNNING`) or as a worker that claims `QUEUED` runs from here under a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
 at 9 a.m., a crashed worker's run goes back on the queue, and a schedule fires on behalf of a
 person who is not present.
 
@@ -69,7 +69,43 @@ stateDiagram-v2
 | cancel a run that is queued or waiting | `finish` with `CANCELLED` (or `resume` with `CANCEL`, recorded as an answer) |
 | start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert |
 | run a schedule now, or pause and resume it | `POST /v1/schedules/{id}/fire`; `PATCH {"enabled": false}` / `{"enabled": true}` |
-| hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once |
+| hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once (`trellis.runs.webhooks.verify_signature`) |
+| drive all of it from Python, from any agent framework | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([below](#the-python-sdk)) |
+
+## The Python SDK
+
+[`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
+Python client of this API, versioned with it (0.3.0). It depends on `httpx`, `pydantic` and
+`trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
+plain code as well as into agent-harness:
+
+```python
+from trellis.contracts.runs import RunStart, RunStatus
+from trellis.runs import Job, RunsClient, Worker
+
+async with RunsClient() as runs:  # RUNS_URL and TRELLIS_API_KEY
+    await runs.start(RunStart(tenant_id="acme", agent_id="triage", input={"ticket": 7}), queue=True)
+
+    async def handle(job: Job) -> None:  # your framework runs the claimed run
+        await job.finish(RunStatus.SUCCESS, output=await my_agent(job.record.input))
+
+    await Worker(runs, handle, ["triage"]).serve()  # claim, heartbeat, stop on SIGTERM
+```
+
+- `RunsClient`: one method per operation, named by its operation id (`runs.start` is
+  `start`, `schedules.fire` is `schedules.fire`); reads by id answer `None` for a record that
+  does not exist; listings answer a `Page` (`iterate` follows the `Link` pages); problems
+  raise typed errors (`LeaseLostError`, `ConflictError`, …); failures on the way are
+  retried, honouring `Retry-After`.
+- `Worker`: the claim loop: a heartbeat every third of the lease, a lost lease cancels the
+  handler, bounded concurrency, idle backoff, a graceful stop that releases what is still
+  running after 25 s.
+- `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
+  `verify_signature` and `parse_delivery` for a receiver.
+
+It lives in this repository as a uv workspace member, so a change to a route and to its
+client is one change; its suite (`make sdk`) checks it against `docs/openapi.json` and holds
+it to 100% line and branch coverage.
 
 ## The API
 
@@ -147,11 +183,13 @@ service key. Fencing, limits and retention are in [docs/api.md](docs/api.md#arti
 A tenant subscribes URLs to run events (`POST /v1/webhooks`: `run.paused`,
 `run.escalated`, `run.finished`); each subscription has its own secret, shown once. An event
 is written to an outbox in the transaction of the run change that caused it and the ticker
-sends it, retried with the service's backoff, at least once. The envelope and the signature
-are the Memory Service's: `X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of
-"<t>.<body>">`, with `X-Trellis-Event` and `X-Trellis-Delivery`, so one receiver verifies
-both with `trellis.memory.webhooks.verify_signature`; `event_id` is stable per event, so a
-receiver drops repeats.
+sends it, retried with the service's backoff, at least once. Every delivery carries
+`X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of "<t>.<body>">`, with
+`X-Trellis-Event` and `X-Trellis-Delivery`. The SDK's `trellis.runs.webhooks.sign` is the one
+implementation of the scheme: the ticker signs with it, and a receiver checks with
+`trellis.runs.webhooks.verify_signature` (five minutes' tolerance, constant-time compare);
+[the SDK's README](sdk/python/README.md#webhooks) has a receiver. `event_id` is stable per
+event, so a receiver drops repeats.
 
 ## Run it
 
@@ -215,7 +253,8 @@ documented in [.env.example](.env.example); every other number is a named consta
 
 ```bash
 make lint typecheck test
-make coverage                # the suite with line and branch coverage, failing under 95%
+make coverage                # the service's suite with line and branch coverage, failing under 95%
+make sdk                     # the SDK's suite, failing under 100% line and branch coverage
 make openapi                 # rewrite docs/openapi.json after changing a route or a model
 ```
 
@@ -229,8 +268,9 @@ Docker on a free port and removed afterwards; needs Docker); without it those si
 skip. Migrations live in `alembic/versions`; a test checks they build exactly the schema the
 code maps.
 
-CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright,
-the migrations up, down to base and up again, the suite with the coverage floor, and a diff
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright
+(the service and the SDK), the migrations up, down to base and up again, the suite with the
+coverage floor, the SDK's suite at 100% line and branch coverage, and a diff
 of `docs/openapi.json` against the document the code generates, against PostgreSQL 16 with
 `agent-contracts` checked out beside this repository. The OpenAPI document embeds the
 contracts' models, so it is regenerated whenever `agent-contracts` changes them.
