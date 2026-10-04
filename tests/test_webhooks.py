@@ -16,7 +16,7 @@ from trellis.contracts.runs import RunRecord, RunStatus
 
 from agent_runs.config.constants import WEBHOOK_ATTEMPTS
 from agent_runs.domain.webhooks import WebhookEvent, event_of
-from agent_runs.store.webhooks import Delivery, envelope
+from agent_runs.store.webhooks import Delivery, WebhookStore, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender, sign
 from tests.conftest import at, pause, started
@@ -264,8 +264,6 @@ async def test_unsubscribing_drops_what_is_still_owed(app, client, ticker, recei
 
 
 async def test_a_delivery_held_by_a_dead_ticker_comes_due_again(app, client) -> None:
-    from agent_runs.store.webhooks import WebhookStore
-
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})
@@ -276,3 +274,51 @@ async def test_a_delivery_held_by_a_dead_ticker_comes_due_again(app, client) -> 
         assert await WebhookStore(db).claim_due(now=at(0), limit=10) == []
         again = await WebhookStore(db).claim_due(now=at(0) + timedelta(minutes=1), limit=10)
         assert [d.attempts for d in again] == [2]
+
+
+async def test_an_unreachable_receiver_is_worth_another_attempt() -> None:
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    hooks = WebhookSender(
+        allow_http=False, client=httpx.AsyncClient(transport=httpx.MockTransport(unreachable))
+    )
+    assert await hooks.send(_delivery()) is True
+    await hooks.aclose()
+
+
+async def test_a_delivery_whose_subscription_went_mid_send_is_settled_quietly(app, client) -> None:
+    """The ticker holds a delivery, the tenant unsubscribes while it is being sent (the row
+    goes with the subscription), and the retry finds nothing to reschedule."""
+    hook = await subscribe(client)
+    run = (await client.post("/v1/runs", json=started())).json()
+    await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})
+    async with app.state.sessions() as db:
+        [held] = await WebhookStore(db).claim_due(now=at(0), limit=10)
+        await db.commit()
+    assert (await client.delete(f"/v1/webhooks/{hook['webhook_id']}")).status_code == 204
+    async with app.state.sessions() as db:
+        assert await WebhookStore(db).settle(held, retry=True, now=at(0)) is True
+        await db.commit()
+    assert await _outbox(app) == []
+
+
+async def test_unsubscribing_an_unknown_webhook_is_404(client) -> None:
+    response = await client.delete("/v1/webhooks/wh_nope")
+    assert response.status_code == 404 and "wh_nope" in response.json()["detail"]
+
+
+async def test_subscriptions_are_listed_oldest_first(client) -> None:
+    first = await subscribe(client, ["run.paused"])
+    second = await subscribe(client, ["run.finished"])
+    listed = (await client.get("/v1/webhooks")).json()
+    assert [w["webhook_id"] for w in listed] == [first["webhook_id"], second["webhook_id"]]
+
+
+async def test_plain_http_subscriptions_are_accepted_only_in_dev(app, client) -> None:
+    body = {"url": "http://laptop.local/h", "events": ["run.paused"]}
+    assert (await client.post("/v1/webhooks", json=body)).status_code == 201
+    app.state.settings = app.state.settings.model_copy(
+        update={"service": app.state.settings.service.model_copy(update={"environment": "prod"})}
+    )
+    assert (await client.post("/v1/webhooks", json=body)).status_code == 422

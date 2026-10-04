@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "pyright>=1.1.400"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6", "ruff>=0.6", "pyright>=1.1.400"]
 
 [project.scripts]
 agent-runs = "agent_runs.__main__:main"
@@ -58,6 +58,13 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+# SQLAlchemy's asyncio layer runs the driver in greenlets; without this, coverage loses
+# track of every line after the first database await and reports them as never run.
+concurrency = ["greenlet", "thread"]
 
 [tool.pyright]
 pythonVersion = "3.12"

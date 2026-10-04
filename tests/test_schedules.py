@@ -10,6 +10,15 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
+from sqlalchemy import text
+from trellis.contracts.errors import AgentError
+from trellis.contracts.ids import now
+from trellis.contracts.runs import ScheduleSpec
+
+from agent_runs.domain.errors import NotFound
+from agent_runs.domain.schedules import DuplicateSchedule
+from agent_runs.store.schedules import ScheduleStore
 from tests.conftest import arm, queued_runs, scheduled
 
 
@@ -536,3 +545,93 @@ async def test_a_platform_key_administers_a_tenants_schedules(client, platform) 
     assert (
         await platform.patch(f"/v1/schedules/{sid}", json={"enabled": False})
     ).status_code == 200
+
+
+# ------------------------------------------------------------------ updates, edges, unknowns
+
+
+async def test_an_update_merges_metadata_and_changes_only_what_it_sends(client) -> None:
+    created = (
+        await client.post("/v1/schedules", json=scheduled(metadata={"team": "ops", "tier": 1}))
+    ).json()
+    sid = created["schedule_id"]
+    updated = (
+        await client.patch(
+            f"/v1/schedules/{sid}", json={"name": "renamed", "metadata": {"tier": 2, "x": True}}
+        )
+    ).json()
+    assert updated["name"] == "renamed"
+    assert updated["metadata"] == {"team": "ops", "tier": 2, "x": True}
+    unchanged = {"agent_id", "cadence", "timezone", "input", "on_behalf_of", "next_fire_at"}
+    assert {k: updated[k] for k in unchanged} == {k: created[k] for k in unchanged}
+
+
+async def test_an_update_the_contracts_refuse_is_422_and_changes_nothing(client) -> None:
+    created = (await client.post("/v1/schedules", json=scheduled())).json()
+    sid = created["schedule_id"]
+    response = await client.patch(f"/v1/schedules/{sid}", json={"timezone": "Mars/Olympus_Mons"})
+    assert response.status_code == 422
+    assert (await client.get(f"/v1/schedules/{sid}")).json() == created
+
+
+async def test_resuming_a_manual_schedule_arms_nothing(client) -> None:
+    sid = (await client.post("/v1/schedules", json=scheduled(cadence="manual"))).json()[
+        "schedule_id"
+    ]
+    await client.patch(f"/v1/schedules/{sid}", json={"enabled": False})
+    resumed = (await client.patch(f"/v1/schedules/{sid}", json={"enabled": True})).json()
+    assert (resumed["enabled"], resumed["next_fire_at"]) == (True, None)
+
+
+async def test_every_verb_on_an_unknown_schedule_is_404(client) -> None:
+    assert (await client.get("/v1/schedules/sch_nope")).status_code == 404
+    assert (
+        await client.patch("/v1/schedules/sch_nope", json={"enabled": False})
+    ).status_code == 404
+    assert (await client.post("/v1/schedules/sch_nope/fire")).status_code == 404
+    assert (await client.delete("/v1/schedules/sch_nope")).status_code == 404
+
+
+async def test_a_listing_outside_its_bounds_is_refused(client) -> None:
+    for limit in (0, 501):
+        assert (await client.get("/v1/schedules", params={"limit": limit})).status_code == 422
+
+
+async def test_a_create_racing_a_delete_of_the_same_identity_is_a_conflict(
+    app, client, monkeypatch
+) -> None:
+    """The insert meets the existing schedule, which is deleted before it can be read back:
+    vanishingly rare, and answered as a conflict rather than an empty 200."""
+    body = scheduled()
+    existing = (await client.post("/v1/schedules", json=body)).json()
+    async with app.state.sessions() as db:
+        real = db.scalar
+        calls = 0
+
+        async def scalar(statement, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = await real(statement, *args, **kwargs)
+            if calls == 1:
+                async with app.state.engine.begin() as conn:
+                    await conn.execute(
+                        text("DELETE FROM agent_schedules WHERE schedule_id = :s"),
+                        {"s": existing["schedule_id"]},
+                    )
+            return result
+
+        monkeypatch.setattr(db, "scalar", scalar)
+        with pytest.raises(DuplicateSchedule):
+            await ScheduleStore(db).upsert(
+                ScheduleSpec.model_validate(body), created_by="user_ada", now=now()
+            )
+
+
+async def test_bookkeeping_for_a_schedule_that_is_gone_is_not_found(app) -> None:
+
+    async with app.state.sessions() as db:
+        store = ScheduleStore(db)
+        with pytest.raises(NotFound):
+            await store.record_success("sch_gone", fire_time=now(), run_id="run_x", now=now())
+        with pytest.raises(NotFound):
+            await store.record_failure("sch_gone", error=AgentError(code="x"), now=now())

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from trellis.contracts.runs import RunStart
 
@@ -270,3 +272,77 @@ async def test_one_tenant_cannot_read_or_move_another_tenants_run(client, other_
 async def test_health_reports_the_database(client) -> None:
     assert (await client.get("/health/live")).json() == {"status": "ok"}
     assert (await client.get("/health/ready")).json() == {"status": "ok"}
+
+
+# ------------------------------------------------------------------ the listing's filters
+
+
+async def test_the_listing_filters_and_pages_newest_first(client) -> None:
+    first = (await client.post("/v1/runs", json=started(thread_id="t1"))).json()
+    second = (await client.post("/v1/runs", json=started(agent_id="billing"))).json()
+    waiting = await paused(client, thread_id="t1")
+
+    def ids(rows: list[dict]) -> list[str]:
+        return [r["run_id"] for r in rows]
+
+    everything = (await client.get("/v1/runs")).json()
+    assert ids(everything) == [waiting["run_id"], second["run_id"], first["run_id"]]
+    assert ids((await client.get("/v1/runs", params={"limit": 1})).json()) == [waiting["run_id"]]
+    by_agent = (await client.get("/v1/runs", params={"agent_id": "billing"})).json()
+    assert ids(by_agent) == [second["run_id"]]
+    by_thread = (await client.get("/v1/runs", params={"thread_id": "t1"})).json()
+    assert ids(by_thread) == [waiting["run_id"], first["run_id"]]
+    running = (await client.get("/v1/runs", params={"status": "RUNNING"})).json()
+    assert ids(running) == [second["run_id"], first["run_id"]]
+    inbox = (await client.get("/v1/runs", params={"status": "PAUSED", "assignee": "nobody"})).json()
+    assert inbox == []
+
+
+@pytest.mark.parametrize(
+    "params", [{"limit": 0}, {"limit": 501}, {"status": "SLEEPING"}, {"limit": "many"}]
+)
+async def test_a_listing_outside_its_bounds_is_refused(client, params) -> None:
+    assert (await client.get("/v1/runs", params=params)).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"tenant_id": "acme"},
+        {"agent_id": "triage"},
+        {"tenant_id": "acme", "agent_id": "triage", "surprise": 1},
+        {"tenant_id": "acme", "agent_id": "triage", "queue": "maybe"},
+    ],
+)
+async def test_a_malformed_start_is_refused_and_records_nothing(client, body) -> None:
+    assert (await client.post("/v1/runs", json=body)).status_code == 422
+    assert (await client.get("/v1/runs")).json() == []
+
+
+async def test_every_route_needs_a_key(app) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runs") as anon:
+        for method, path in [
+            ("POST", "/v1/runs"),
+            ("POST", "/v1/runs/claim"),
+            ("GET", "/v1/runs"),
+            ("GET", "/v1/runs/run_x"),
+            ("GET", "/v1/runs/run_x/resolutions"),
+            ("POST", "/v1/runs/run_x/pause"),
+            ("POST", "/v1/runs/run_x/resume"),
+            ("POST", "/v1/runs/run_x/finish"),
+            ("POST", "/v1/runs/run_x/heartbeat"),
+            ("POST", "/v1/runs/run_x/artifacts"),
+            ("GET", "/v1/artifacts/art_x"),
+            ("POST", "/v1/schedules"),
+            ("GET", "/v1/schedules"),
+            ("GET", "/v1/schedules/sch_x"),
+            ("PATCH", "/v1/schedules/sch_x"),
+            ("DELETE", "/v1/schedules/sch_x"),
+            ("POST", "/v1/schedules/sch_x/fire"),
+            ("POST", "/v1/webhooks"),
+            ("GET", "/v1/webhooks"),
+            ("DELETE", "/v1/webhooks/wh_x"),
+        ]:
+            response = await anon.request(method, path)
+            assert response.status_code == 401, (method, path, response.status_code)
+            assert response.json() == {"detail": "missing X-Api-Key"}

@@ -208,3 +208,18 @@ def test_the_probe_reads_the_configured_file(tmp_path, monkeypatch) -> None:
     reset_settings_cache()
     assert main() == 0
     reset_settings_cache()
+
+
+async def test_a_tick_fires_at_most_a_batch_of_schedules(app, client, ticker, monkeypatch) -> None:
+    """The rest wait for the next tick, so one tick is bounded however many came due."""
+    monkeypatch.setattr("agent_runs.ticker.SWEEP_BATCH", 1)
+    due = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5)
+    for _ in range(2):
+        sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+            "schedule_id"
+        ]
+        await arm(app, sid, due)
+    assert (await ticker.tick()).fired == 1
+    assert len(await queued_runs(app)) == 1
+    assert (await ticker.tick()).fired == 1
+    assert len(await queued_runs(app)) == 2
