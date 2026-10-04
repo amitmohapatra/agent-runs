@@ -5,7 +5,7 @@ One service (it absorbed agent-schedules in 0.2.0): an API process and a ticker 
 one PostgreSQL database, with run artifacts' bytes in blob storage (a filesystem, or GCS).
 
 This service never executes an agent. A harness (or any framework, through the
-[Python SDK](#the-python-sdk)) does, either in its own process (it records the run here as
+[Python SDK](#the-python-sdk): the [two ways](#where-this-fits-two-ways-to-use-trellis)) does, either in its own process (it records the run here as
 `RUNNING`) or as a worker that claims `QUEUED` runs from here under a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
 at 9 a.m., a crashed worker's run goes back on the queue, and a schedule fires on behalf of a
 person who is not present.
@@ -13,6 +13,63 @@ person who is not present.
 Every record is a [trellis-contracts](../agent-contracts) type: a run is a `RunRecord`
 started from a `RunStart`, paused with an `Interrupt`, resumed with an
 `InterruptResolution`; a schedule is a `Schedule` created from a `ScheduleSpec`.
+
+## Where this fits: two ways to use Trellis
+
+Trellis is used in one of two ways, and each block works in both:
+
+- **Way 1, wrapped.** `from trellis import Harness; h = Harness(); agent = h.wrap(my_agent)`.
+  The harness runs your agent (LangGraph, Deep Agents, OpenAI Agents SDK, Claude Agent SDK,
+  a plain function) and uses every block automatically: memory context, recording and
+  feedback; durable runs, the inbox, schedules and the worker in agent-runs; governance of
+  tool calls; models and MCP tools through Bifrost; evals; the AG-UI and A2A surfaces.
+- **Way 2, pluggable blocks.** Keep your framework untouched and import only the blocks you
+  want: `trellis.memory` (`MemoryClient`), `trellis.runs` (`RunsClient`, `Worker`,
+  `webhooks.verify_signature`), `trellis.contracts` (the shared types), `bifrost_sdk` (models
+  and MCP tools through Bifrost), and from the harness repo `trellis.harness.governance`
+  (`Governance.from_env`, `check`, `governed`), `trellis.harness.evals` (`EvalServices`,
+  `evaluate`, `judge`) and `trellis.harness.a2a.remote`.
+
+A package shipped from its own repo is top-level `trellis.X`; anything from the harness repo
+is `trellis.harness.X`. `bifrost_sdk` (pip `bifrost-sdk`) is the exception: it keeps its own,
+older name.
+
+**This package** is the durable side of a run: agent-runs keeps runs, the worker queue, the
+inbox of paused runs, schedules and webhooks, and never executes an agent. `trellis.runs`
+(pip `trellis-runs`, in [`sdk/python`](sdk/python/README.md)) is its Python client and a
+framework-neutral worker loop.
+
+| | What happens with agent-runs and `trellis.runs` |
+|---|---|
+| **Way 1, wrapped** | With `RUNS_URL` set, the harness's run store is `trellis.runs.RunsClient`: `agent.run` records the run and finishes it, `agent.start` queues it, an `ask` or an approval pauses it (the `Interrupt`, a large table or diff as an artifact, the run's journal as `checkpoint`), `agent.resume` answers it, `h.inbox()` lists the paused runs, `agent.schedule(...)` creates a schedule, and `h.worker(...)` (or `python -m trellis.harness.worker`) runs wrapped agents on `trellis.runs.Worker`. You write no runs code. Without `RUNS_URL` the harness keeps runs in its own process, and none outlives it. |
+| **Way 2, pluggable** | Your framework runs the agent, untouched; you start, queue, pause and finish its runs with the SDK: |
+
+```python
+from trellis.contracts.runs import RunStart, RunStatus
+from trellis.runs import Job, RunsClient, Worker
+
+async with RunsClient() as runs:  # RUNS_URL and TRELLIS_API_KEY
+    await runs.start(RunStart(tenant_id="acme", agent_id="triage", input={"ticket": 7}), queue=True)
+
+    async def handle(job: Job) -> None:  # your framework runs the claimed run
+        await job.finish(RunStatus.SUCCESS, output=await my_agent(job.record.input))
+
+    await Worker(runs, handle, ["triage"]).serve()  # claim, heartbeat, stop on SIGTERM
+```
+
+- **Choose Way 1 when** you want durable runs, approvals, the inbox and schedules from
+  `h.wrap` with no code, and a resumed run that repeats no question and no side effect (the
+  harness's journal is the checkpoint).
+- **Choose Way 2 when** your framework keeps its own state (a LangGraph checkpointer, an OpenAI
+  Agents `RunState`) and you want only what this service adds: a run that survives the
+  process, a queue of workers, an inbox, schedules. Or when the caller is not an agent at
+  all: a UI reading the inbox, or a webhook receiver (`trellis.runs.webhooks.verify_signature`,
+  the same in both ways).
+
+Harness docs: [the two ways](https://github.com/amitmohapatra/agent-harness/blob/main/README.md#two-ways-to-use-trellis) · [every page](https://github.com/amitmohapatra/agent-harness/blob/main/docs/README.md) ·
+blocks: [runs](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/runs.md), [contracts](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/contracts.md), [governance](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/governance.md) ·
+recipes: [LangGraph](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/langgraph.md), [OpenAI Agents SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/openai-agents.md),
+[Claude Agent SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/claude-agent-sdk.md).
 
 ## The state machine
 
@@ -70,27 +127,16 @@ stateDiagram-v2
 | start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert |
 | run a schedule now, or pause and resume it | `POST /v1/schedules/{id}/fire`; `PATCH {"enabled": false}` / `{"enabled": true}` |
 | hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once (`trellis.runs.webhooks.verify_signature`) |
-| drive all of it from Python, from any agent framework | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([below](#the-python-sdk)) |
+| drive all of it from Python, from any agent framework (Way 2) | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([below](#the-python-sdk)) |
+| have a wrapped agent use all of it with no code (Way 1) | `h.wrap(agent)` with `RUNS_URL` set ([the two ways](#where-this-fits-two-ways-to-use-trellis)) |
 
 ## The Python SDK
 
 [`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
 Python client of this API, versioned with it (0.3.0). It depends on `httpx`, `pydantic` and
 `trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
-plain code as well as into agent-harness:
-
-```python
-from trellis.contracts.runs import RunStart, RunStatus
-from trellis.runs import Job, RunsClient, Worker
-
-async with RunsClient() as runs:  # RUNS_URL and TRELLIS_API_KEY
-    await runs.start(RunStart(tenant_id="acme", agent_id="triage", input={"ticket": 7}), queue=True)
-
-    async def handle(job: Job) -> None:  # your framework runs the claimed run
-        await job.finish(RunStatus.SUCCESS, output=await my_agent(job.record.input))
-
-    await Worker(runs, handle, ["triage"]).serve()  # claim, heartbeat, stop on SIGTERM
-```
+plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
+into agent-harness, whose run store it is (Way 1):
 
 - `RunsClient`: one method per operation, named by its operation id (`runs.start` is
   `start`, `schedules.fire` is `schedules.fire`); reads by id answer `None` for a record that
