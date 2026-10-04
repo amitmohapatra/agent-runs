@@ -14,13 +14,18 @@ marked). The wire contract is [api.md](api.md); this page is the inside.
 ## Components
 
 Two processes from one image share one PostgreSQL database and one blob store. Neither
-executes an agent: the harness does, and records here what happened.
+executes an agent: a harness or any other framework does, through the Python SDK
+`trellis.runs` (`sdk/python`, pip `trellis-runs`), and records here what happened. The SDK is
+a uv workspace member of this repository: its `RunsClient` speaks every route, its `Worker`
+is the claim loop, and its `webhooks.sign` is the one implementation of the delivery
+signature, which the ticker signs with and a receiver checks with `verify_signature`.
 
 ```mermaid
 flowchart LR
   subgraph clients["Clients (X-API-Key)"]
-    harness["agent-harness<br/>HttpRuns: in-process runs<br/>and trellis workers"]
+    harness["agent-harness, or any framework<br/>in-process runs and workers"]
     ui["Inbox UI / its backend"]
+    sdk["trellis.runs (sdk/python)<br/>RunsClient · Worker<br/>webhooks: sign · verify_signature"]
   end
 
   subgraph runs["agent-runs"]
@@ -46,8 +51,9 @@ flowchart LR
   receivers["Webhook receivers<br/>(tenant subscriptions)"]
   migrate["migrate job<br/>alembic upgrade head"]
 
-  harness -- "HTTP /v1/runs, /v1/schedules,<br/>/v1/artifacts" --> routers
-  ui -- "HTTP inbox, resume,<br/>artifacts, webhooks" --> routers
+  harness --> sdk
+  ui --> sdk
+  sdk -- "HTTP /v1/runs, /v1/schedules,<br/>/v1/artifacts, /v1/webhooks" --> routers
   mw --> routers
   routers --> deps --> keys -- "introspect key" --> memory
   routers --> stores
@@ -55,12 +61,14 @@ flowchart LR
   ticker --> stores
   ticker --> blobport
   ticker --> sender -- "POST signed event" --> receivers
+  sender -. "sign" .-> sdk
+  receivers -. "verify_signature" .-> sdk
   stores --> pg
   blobport --> blob
   migrate --> pg
   domain -. "types" .-> contracts
   stores -. "types" .-> contracts
-  harness -. "types" .-> contracts
+  sdk -. "types" .-> contracts
 ```
 
 | Component | Where | What it owns |
@@ -76,7 +84,8 @@ flowchart LR
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
-| Webhook sender | `webhooks.py` `WebhookSender`, `sign` | one signed attempt per due outbox row |
+| Webhook sender | `webhooks.py` `WebhookSender` | one attempt per due outbox row, signed with the SDK's `trellis.runs.webhooks.sign` |
+| SDK | `sdk/python/src/trellis/runs`: `RunsClient`, `Worker`, `webhooks`, `errors`, `models` | the Python client of every route (method names are the operation ids), the framework-neutral worker loop, the delivery signature; `sdk/python/tests` holds it to 100% line and branch coverage and checks it against `docs/openapi.json` |
 | Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
 | Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
@@ -154,7 +163,7 @@ cache); that step is drawn once.
 ```mermaid
 sequenceDiagram
   autonumber
-  participant W as Worker (agent-harness)
+  participant W as Worker (trellis.runs Worker)
   participant A as agent-runs API
   participant M as Memory Service
   participant DB as PostgreSQL
@@ -405,7 +414,7 @@ src/agent_runs/
   heartbeat.py         the ticker's liveness file; python -m agent_runs.heartbeat is the probe
   keys.py              KeyRegistry, KeyInfo: who an X-API-Key is
   firing.py            Firing: one schedule tick → one queued run
-  webhooks.py          WebhookSender, sign: delivering the outbox
+  webhooks.py          WebhookSender: delivering the outbox (signed with trellis.runs.webhooks.sign)
   retry.py             backoff(), Breaker: the one retry policy
   api/app.py           create_app(): routers, middleware, error handlers, health routes
   api/errors.py        Problem, install_error_handlers(): every error as a problem
@@ -426,4 +435,15 @@ src/agent_runs/
   config/              settings.py (RUNS__* deployment facts), constants.py (design decisions)
   tools/               export_openapi.py: docs/openapi.json (make openapi)
   observability/       logging.py (structlog, JSON or console), metrics.py (Prometheus)
+
+sdk/python/src/trellis/runs/      (trellis-runs, a workspace member; no trellis/__init__.py)
+  client.py            RunsClient: the run verbs, list/iterate, live/ready/metrics
+  artifacts.py         ArtifactsAPI: upload (with its SHA-256), download
+  schedules.py         SchedulesAPI: create, list, get, update, delete, fire
+  webhooks.py          WebhooksAPI; sign, verify_signature, parse_delivery, the header names
+  worker.py            Worker, Job, WorkerStore, RELEASED: the claim loop
+  models.py            RunSummary, Lease, Claimed, ResolutionEntry, ScheduleUpdate, FireResult,
+                       Webhook*, WebhookDelivery, Page
+  errors.py            RunsError and its classes, error_from_problem
+  _transport.py        the key and tenant headers, retries, Retry-After, Link paging
 ```

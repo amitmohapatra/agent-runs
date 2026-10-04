@@ -41,13 +41,15 @@ jobs:
           enable-cache: true
           cache-dependency-glob: agent-runs/uv.lock
       - run: uv sync --all-extras
-      - run: uv run ruff check src tests alembic
-      - run: uv run ruff format --check src tests alembic
+      - run: uv run ruff check src tests alembic sdk/python
+      - run: uv run ruff format --check src tests alembic sdk/python
       - run: uv run pyright
       - run: uv run alembic upgrade head && uv run alembic downgrade base && uv run alembic upgrade head
       # the GCS adapter's fake-server tests stay opt-in (RUNS_TEST_GCS=1); the in-memory
       # client covers the adapter here
       - run: uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95
+      # the SDK (sdk/python, trellis.runs): every line and branch
+      - run: uv run pytest sdk/python/tests --cov=trellis.runs --cov-branch --cov-fail-under=100
       # the committed OpenAPI document is the one the code generates (`make openapi`)
       - name: OpenAPI document is current
         run: |

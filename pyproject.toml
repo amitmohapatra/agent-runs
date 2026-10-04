@@ -14,13 +14,24 @@ dependencies = [
   "structlog>=25.2",
   "croniter>=6",
   "httpx>=0.28",
-  "trellis-contracts>=0.4,<0.5",
+  "trellis-contracts>=0.4,<0.6",
+  # the SDK (sdk/python, a workspace member): the service signs webhooks with its ``sign``
+  "trellis-runs",
   "google-cloud-storage>=3.4",
   "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6", "ruff>=0.6", "pyright>=1.1.400"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6",
+  "ruff>=0.6",
+  "pyright>=1.1.400",
+  # the SDK's suite (sdk/python/tests): HTTP mocks and the OpenAPI schema checks
+  "respx>=0.22",
+  "jsonschema>=4.23",
+]
 
 [project.scripts]
 agent-runs = "agent_runs.__main__:main"
@@ -31,6 +42,11 @@ agent-runs-ticker = "agent_runs.ticker:main"
 # context (`contracts`, see docker-compose.yml and the Makefile), placed at /agent-contracts
 # next to /app, so this relative path resolves the same way inside and outside Docker.
 trellis-contracts = { path = "../agent-contracts", editable = true }
+trellis-runs = { workspace = true }
+
+[tool.uv.workspace]
+# trellis-runs, the Python SDK (``trellis.runs``), lives beside the service it speaks to
+members = ["sdk/python"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runs"]
@@ -57,9 +73,15 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 "src/agent_runs/store/artifacts.py" = ["PLR0913"]
 # A problem has nine members; its builders take them by keyword.
 "src/agent_runs/api/errors.py" = ["PLR0913"]
+# The SDK's listings take their filters as keyword arguments, as the routes do.
+"sdk/python/src/trellis/runs/*.py" = ["PLR0913"]
+# The SDK's tests as the service's (PLR2004), and test doubles that take what its calls take.
+"sdk/python/tests/**" = ["PLR2004", "PLR0913"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# the service's suite; the SDK's (sdk/python/tests) runs on its own, with its own coverage gate
+testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["src"]
@@ -70,5 +92,5 @@ concurrency = ["greenlet", "thread"]
 
 [tool.pyright]
 pythonVersion = "3.12"
-include = ["src", "tests"]
+include = ["src", "tests", "sdk/python/src", "sdk/python/tests"]
 typeCheckingMode = "standard"

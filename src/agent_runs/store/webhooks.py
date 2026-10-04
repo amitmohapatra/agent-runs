@@ -54,9 +54,9 @@ def _webhook(row: WebhookRow) -> Webhook:
 
 
 def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
-    """The Memory Service's event envelope, with the run's summary as the data. ``event_id``
-    is derived from the run, its attempt, status and assignee and the event, so the same
-    event is the same id however often it is written or retried."""
+    """The event envelope (what ``trellis.runs.parse_delivery`` reads), with the run's summary
+    as the data. ``event_id`` is derived from the run, its attempt, status and assignee and
+    the event, so the same event is the same id however often it is written or retried."""
     assignee = run.awaiting.assignee if run.awaiting else None
     summary = RunSummary(
         run_id=run.run_id,

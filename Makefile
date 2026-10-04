@@ -1,21 +1,25 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint typecheck test coverage openapi migrate image up down
+.PHONY: help install lint typecheck test sdk coverage openapi migrate image up down
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
-install: ## Sync the dev environment (agent-contracts from ../agent-contracts)
+install: ## Sync the dev environment (agent-contracts from ../agent-contracts, the SDK from sdk/python)
 	uv sync --all-extras
 
 lint: ## Ruff check and format check
-	uv run ruff check src tests alembic
-	uv run ruff format --check src tests alembic
+	uv run ruff check src tests alembic sdk/python
+	uv run ruff format --check src tests alembic sdk/python
 
 typecheck: ## Pyright
 	uv run pyright
 
-test: ## Run the test suite (needs the local PostgreSQL)
+test: ## Run the service's suite (needs the local PostgreSQL), then the SDK's
 	uv run pytest -q
+	uv run pytest -q sdk/python/tests
+
+sdk: ## The SDK's suite with line and branch coverage, failing under 100%
+	uv run pytest -q sdk/python/tests --cov=trellis.runs --cov-branch --cov-report=term-missing --cov-fail-under=100
 
 coverage: ## The suite with line and branch coverage, failing under 95%
 	uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95

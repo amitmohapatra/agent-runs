@@ -14,6 +14,14 @@ at `/openapi.json` with `/docs` (Swagger UI) and `/redoc`. Operation ids are
 `<tag>.<function>` (`runs.start`, `runs.list`, `schedules.fire`, …); every operation documents
 its error statuses with the `Problem` schema, and every request body has an example.
 
+The Python client is the SDK in [`sdk/python`](../sdk/python/README.md), `trellis.runs`
+(pip `trellis-runs`, versioned with this API): `RunsClient` has one method per operation,
+named by its operation id (`runs.start` is `RunsClient.start`, `schedules.fire` is
+`RunsClient.schedules.fire`), raises each problem `code` below as its own error class
+(`LEASE_LOST` is `LeaseLostError`, a sibling of `ConflictError`, not a kind of it), and
+retries what is safe to retry; its `Worker` implements the claim, heartbeat and release
+semantics of [Runs](#runs).
+
 0.3.0 changed the wire in place (its consumers are the platform's own repositories): errors
 are problems instead of `{"detail": …}`, listings page with `cursor` and `Link`, and the
 limits, the rate limit and the repeat semantics below are new.
@@ -506,7 +514,10 @@ subscription of the tenant that wants it, and the ticker sends it (so within one
 
 and headers `X-Trellis-Event: <type>`, `X-Trellis-Delivery: <event_id>`,
 `X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 keyed by the subscription's
-secret over "<t>.<raw body>">` (the Memory Service's scheme). `event_id` is the same on every
+secret over "<t>.<raw body>">`, made by the SDK's `trellis.runs.webhooks.sign`. A receiver
+checks it over the raw bytes with `trellis.runs.webhooks.verify_signature(secret, header,
+body)` (it refuses a timestamp more than 300 s from its clock and compares in constant time)
+and reads the body with `parse_delivery`. `event_id` is the same on every
 retry. A `2xx` accepts; `408`, `429`, `5xx` and an unreachable receiver are retried (7
 attempts, 15 s doubling to at most 10 min); any other answer is final. At least once:
 receivers drop repeats by `event_id` and read the run for anything the summary lacks.

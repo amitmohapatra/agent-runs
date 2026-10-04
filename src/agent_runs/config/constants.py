@@ -39,10 +39,6 @@ KEY_MAX_KEEPALIVE: Final = 20
 KEY_KEEPALIVE_SECONDS: Final = 30.0
 #: Keys cached per process (least recently used goes first).
 MAX_CACHED_KEYS: Final = 10_000
-#: Webhook headers, spelled as the Memory Service spells them so one receiver verifies both.
-HEADER_SIGNATURE: Final = "X-Trellis-Signature"
-HEADER_EVENT: Final = "X-Trellis-Event"
-HEADER_DELIVERY: Final = "X-Trellis-Delivery"
 
 #: A page of runs or schedules.
 DEFAULT_PAGE: Final = 50
