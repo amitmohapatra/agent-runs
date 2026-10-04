@@ -16,6 +16,7 @@ dependencies = [
   "httpx>=0.28",
   "trellis-contracts>=0.4,<0.5",
   "google-cloud-storage>=3.4",
+  "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]

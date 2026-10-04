@@ -96,10 +96,18 @@ class FakeGCSBlob:
     def size(self) -> int:
         return len(self._bucket.objects[self._key][0])
 
-    def upload_from_string(
-        self, data: bytes, *, content_type: str, if_generation_match: int, checksum: str
+    def upload_from_file(
+        self,
+        file_obj: Any,
+        *,
+        size: int,
+        content_type: str,
+        if_generation_match: int,
+        checksum: str,
     ) -> None:
         assert (if_generation_match, checksum) == (0, "crc32c"), "create-only, checksummed"
+        data = file_obj.read()
+        assert len(data) == size, "the spool is rewound and its size declared"
         if self._key in self._bucket.objects:
             raise gexc.PreconditionFailed("the object exists")
         self._bucket.objects[self._key] = (data, content_type, self.metadata)

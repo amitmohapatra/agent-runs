@@ -43,6 +43,12 @@ class ServiceSettings(BaseModel):
     workers: int | None = Field(default=None, ge=1)
     #: How long a stopping worker lets requests in flight finish before closing them.
     graceful_shutdown_seconds: int = Field(default=20, ge=0)
+    #: Request bodies of the JSON routes are refused (413) past this many bytes, counted as
+    #: they arrive (chunked bodies too). Artifact uploads have their own bound.
+    max_body_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
+    #: The most a run's ``input`` (POST /v1/runs) or ``output`` (finish) may be, as compact
+    #: JSON (413 past it): they live in the run's row, and every read of the run carries them.
+    max_payload_bytes: int = Field(default=1024 * 1024, ge=1024)
 
     @property
     def is_dev(self) -> bool:
@@ -109,6 +115,18 @@ class TickerSettings(BaseModel):
     #: The file the ticker touches every tick and ``python -m agent_runs.heartbeat`` reads.
     #: Unset: a per-process file in the temp directory (and no probe).
     heartbeat_file: Path | None = None
+    #: The port the ticker serves Prometheus metrics on (``/metrics``); unset, none.
+    metrics_port: int | None = Field(default=None, ge=1, le=65535)
+
+
+class RateLimitSettings(BaseModel):
+    """Each tenant's request budget on the ``/v1`` routes: a token bucket refilled at
+    ``per_minute`` and holding at most ``burst`` requests. Kept in each worker process's
+    memory, so the budget a tenant really gets is about this times the number of workers and
+    replicas: a guard against a runaway client, not a quota. ``per_minute`` 0 turns it off."""
+
+    per_minute: int = Field(default=3000, ge=0)
+    burst: int = Field(default=500, ge=1)
 
 
 class ObservabilitySettings(BaseModel):
@@ -126,6 +144,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     blob: BlobSettings = Field(default_factory=BlobSettings)
     ticker: TickerSettings = Field(default_factory=TickerSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     @model_validator(mode="after")

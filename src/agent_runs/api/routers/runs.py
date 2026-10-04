@@ -29,7 +29,9 @@ from agent_runs.domain.runs import (
     RunFinish,
     RunPause,
     RunSummary,
+    bounded_payload,
 )
+from agent_runs.observability.metrics import claims_total
 from agent_runs.store.runs import RunStore
 from agent_runs.store.webhooks import WebhookStore
 
@@ -38,16 +40,24 @@ router = APIRouter(prefix="/v1/runs", tags=["runs"])
 _CREATED = 201
 _NO_CONTENT = 204
 
+
+def _payload_limit(request: Request) -> int:
+    return request.app.state.settings.service.max_payload_bytes
+
+
 #: A worker fencing its write: refused (409) unless it still holds the run's lease.
 WorkerId = Annotated[str | None, Query(max_length=200)]
 
 
 @router.post("", status_code=_CREATED, responses={200: {"model": RunRecord}})
-async def start(body: RunCreate, db: Session, who: Who, response: Response) -> RunRecord:
+async def start(
+    body: RunCreate, request: Request, db: Session, who: Who, response: Response
+) -> RunRecord:
     """Record a run (``RUNNING``), or queue it for a worker (``queue: true`` → ``QUEUED``).
     A repeated run id or ``idempotency_key`` answers 200 with the run the first start made."""
     who.require_tenant(body.tenant_id)
     who.require_may_act_for(body.on_behalf_of)
+    bounded_payload(body.input, name="input", limit=_payload_limit(request))
     run, created = await RunStore(db).start(body.start(), queue=body.queue, now=now())
     await db.commit()
     if created:
@@ -65,6 +75,7 @@ async def claim(body: ClaimRequest, db: Session, who: Who) -> Claimed | Response
     none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``."""
     claimed = await RunStore(db).claim(who.tenant_id, body, now=now())
     await db.commit()
+    claims_total.labels("empty" if claimed is None else "claimed").inc()
     return claimed if claimed is not None else Response(status_code=_NO_CONTENT)
 
 
@@ -105,9 +116,15 @@ async def resume(run_id: str, body: InterruptResolution, db: Session, who: Who) 
 
 @router.post("/{run_id}/finish")
 async def finish(
-    run_id: str, body: RunFinish, db: Session, who: Who, worker_id: WorkerId = None
+    run_id: str,
+    body: RunFinish,
+    request: Request,
+    db: Session,
+    who: Who,
+    worker_id: WorkerId = None,
 ) -> RunRecord:
     """End the run. Cancelling a queued or paused run is a finish with ``CANCELLED``."""
+    bounded_payload(body.output, name="output", limit=_payload_limit(request))
     at = now()
     run, ended = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
     if ended:

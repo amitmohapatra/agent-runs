@@ -95,7 +95,11 @@ async def test_the_ticker_process_wires_the_loop_and_its_stop_signals(
     monkeypatch.setenv("RUNS__DATABASE__URL", SETTINGS.database.url)
     monkeypatch.setenv("RUNS__TICKER__HEARTBEAT_FILE", str(beat))
     monkeypatch.setenv("RUNS__BLOB__ROOT", str(tmp_path / "blobs"))
+    monkeypatch.setenv("RUNS__TICKER__METRICS_PORT", "9464")
     seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        ticker_module.metrics, "serve", lambda port, engine: seen.update(metrics_port=port)
+    )
 
     async def one_pass(self: ticker_module.Ticker, stop: asyncio.Event) -> None:
         seen["heartbeat"] = self._heartbeat
@@ -105,6 +109,7 @@ async def test_the_ticker_process_wires_the_loop_and_its_stop_signals(
     monkeypatch.setattr(ticker_module.Ticker, "run_forever", one_pass)
     await ticker_module.run()
     assert seen["heartbeat"] == beat
+    assert seen["metrics_port"] == 9464, "the ticker serves its metrics when asked to"
     assert seen["report"] == ticker_module.TickReport()
     assert not seen["stop"].is_set()
     loop = asyncio.get_running_loop()

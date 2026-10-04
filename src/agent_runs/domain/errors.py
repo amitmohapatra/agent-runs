@@ -123,9 +123,23 @@ class Unprocessable(ServiceError):
 
 
 class RateLimited(ServiceError):
+    """The tenant's request budget is spent for now; a token is back in ``retry_after``
+    seconds."""
+
     status_code = _TOO_MANY
     code = ErrorCode.RATE_LIMIT
     retryable = True
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        retry_after: int,
+        details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(detail, details=details, headers=headers)
+        self.retry_after = retry_after
 
 
 class Unavailable(ServiceError):

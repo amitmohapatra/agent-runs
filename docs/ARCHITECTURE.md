@@ -26,7 +26,8 @@ flowchart LR
   subgraph runs["agent-runs"]
     subgraph api["API process: agent-runs (FastAPI, api/app.py)"]
       deps["api/deps.py<br/>caller() → Caller"]
-      routers["routers: runs · artifacts<br/>schedules · webhooks<br/>+ /health/live, /health/ready"]
+      mw["api/middleware.py<br/>request id · metrics · body cap · gzip"]
+      routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
       ticker["Ticker.tick() every TICK_SECONDS<br/>fire · requeue · escalate<br/>send webhooks · purge artifacts"]
@@ -47,6 +48,7 @@ flowchart LR
 
   harness -- "HTTP /v1/runs, /v1/schedules,<br/>/v1/artifacts" --> routers
   ui -- "HTTP inbox, resume,<br/>artifacts, webhooks" --> routers
+  mw --> routers
   routers --> deps --> keys -- "introspect key" --> memory
   routers --> stores
   routers --> blobport
@@ -65,14 +67,16 @@ flowchart LR
 |---|---|---|
 | API | `api/app.py` `create_app`, `api/routers/*` | the HTTP surface |
 | Errors | `api/errors.py` `install_error_handlers`, `Problem`; `domain/errors.py` `ErrorCode` | every failure as an RFC 9457 problem: `ServiceError` subclasses with their status and `code`, FastAPI's validation and HTTP errors, a database that went away (`503`, `Retry-After`), anything else (`500`, no internals) |
-| Request context | `api/middleware.py` `RequestContextMiddleware` | `X-Request-ID` in, out, and in every problem |
+| Middleware | `api/middleware.py` `RequestContextMiddleware`, `BodyLimitMiddleware`, `CompressionMiddleware` | `X-Request-ID` in, out and in every problem; request metrics by route template; the JSON body cap counted as bytes arrive; gzip, except artifact bytes |
+| Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | a token bucket per tenant per worker process; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
+| Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
 | Webhook sender | `webhooks.py` `WebhookSender`, `sign` | one signed attempt per due outbox row |
-| Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `read` verifies SHA-256 and size while streaming |
+| Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
 | Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
 
@@ -404,8 +408,10 @@ src/agent_runs/
   retry.py             backoff(), Breaker: the one retry policy
   api/app.py           create_app(): routers, middleware, error handlers, health routes
   api/errors.py        Problem, install_error_handlers(): every error as a problem
-  api/middleware.py    RequestContextMiddleware: X-Request-ID
+  api/middleware.py    request context (id, metrics), body cap, compression
   api/pagination.py    cursor in, Link: rel="next" out
+  api/ratelimit.py     TenantRateLimiter: a token bucket per tenant, per process
+  api/routers/ops.py   /health/live, /health/ready, /metrics
   api/deps.py          Caller, caller(), session(): who is calling, a session per request
   api/routers/         runs.py, artifacts.py, schedules.py, webhooks.py
   domain/              runs.py, schedules.py, webhooks.py (request and answer models),
@@ -415,5 +421,5 @@ src/agent_runs/
                        paging.py (Page, page_of: keyset pages)
   blob/                port.py (BlobStore, read), filesystem.py, gcs.py, open_blob_store()
   config/              settings.py (RUNS__* deployment facts), constants.py (design decisions)
-  observability/       logging.py (structlog, JSON or console)
+  observability/       logging.py (structlog, JSON or console), metrics.py (Prometheus)
 ```

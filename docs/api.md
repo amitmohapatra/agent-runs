@@ -39,8 +39,9 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 | `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
 | `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled or finished. **Stop working the run.** |
 | `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook |
-| `413` | `PAYLOAD_TOO_LARGE` | a pause's `checkpoint` is larger than 1 MiB of compact JSON, or an artifact larger than 50 MiB |
-| `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators) |
+| `413` | `PAYLOAD_TOO_LARGE` | a JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (4 MiB), a run's `input` or `output` past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), a `checkpoint` past 1 MiB, an artifact past 50 MiB (see [Limits](#limits)) |
+| `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators), or a cursor this listing did not issue |
+| `429` | `RATE_LIMIT` | the tenant's request budget is spent for now; retryable after `Retry-After` (see [Limits](#limits)) |
 | `500` | `INTERNAL` | a fault here (an artifact's stored bytes no longer match their checksum, a statement the database refuses, anything unanticipated); the detail says nothing about internals |
 | `503` | `DEPENDENCY_UNAVAILABLE` | PostgreSQL did not answer (no connection, a connection lost, no pooled connection free in time, a statement past its timeout), the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule); retryable, with `Retry-After: 5` (a fire that paused its schedule is not retryable) |
 
@@ -58,11 +59,33 @@ Every create that answers `201` says where the new record lives: `Location: /v1/
 `/v1/schedules/{id}`, `/v1/webhooks/{id}`, `/v1/artifacts/{id}`. A repeat answered `200`
 carries none.
 
+## Limits
+
+- **Body.** A JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (default 4 MiB) is `413`: at
+  once when `Content-Length` says so, else as soon as the bytes that arrived pass it (a
+  chunked body is counted too), before the route has it all.
+- **Run payloads.** A run's `input` (`POST /v1/runs`) or `output` (`finish`) past
+  `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (default 1 MiB) of compact JSON is `413`: both live in
+  the run's row and in every read of it. Anything larger belongs in an artifact.
+- **Checkpoints** are at most 1 MiB (`MAX_CHECKPOINT_BYTES`), **artifacts** at most 50 MiB
+  (`MAX_ARTIFACT_BYTES`), streamed to the blob store as they arrive.
+- **Rate.** Each tenant's `/v1` requests draw on a token bucket refilled at
+  `RUNS__RATE_LIMIT__PER_MINUTE` (default 3000) a minute and holding at most
+  `RUNS__RATE_LIMIT__BURST` (500). Every counted response carries `X-RateLimit-Limit` (the
+  budget a minute) and `X-RateLimit-Remaining`; an empty bucket is `429 RATE_LIMIT` with
+  `Retry-After` (seconds until a token is back). The buckets live in each worker process
+  (agent-runs has no shared cache, and a limiter writing to PostgreSQL on every request
+  would load what it protects), so a tenant really gets the budget times the number of
+  workers and replicas: a guard against a runaway client, not a quota. `0` turns it off.
+- **Compression.** A response of 1 KiB or more is gzipped for a client that sends
+  `Accept-Encoding: gzip`, except artifact bytes, served as stored.
+
 ## Every route
 
-`auth` below is the four answers any `/v1` route may give before it looks at the request:
-`400`, `401`, `403`, `503` (see [Authentication](#authentication)). The sections after the
-table have the bodies and the exact semantics.
+`auth` below is the answers any `/v1` route may give before it looks at the request:
+`400`, `401`, `403`, `429` (see [Limits](#limits)), `503` (see
+[Authentication](#authentication)); any route with a body may also answer `413`. The
+sections after the table have the bodies and the exact semantics.
 
 | Method and path | Body / query | Success | Errors besides `auth` |
 |---|---|---|---|
@@ -89,6 +112,7 @@ table have the bodies and the exact semantics.
 | `DELETE /v1/webhooks/{id}` | | `204` | `404` |
 | `GET /health/live` | no key | `200 {"status": "ok"}` | |
 | `GET /health/ready` | no key | `200 {"status": "ok"}` | `503` the database does not answer within 3 s |
+| `GET /metrics` | no key | `200` Prometheus text | |
 
 ## Authentication
 
@@ -310,7 +334,9 @@ filesystem or GCS), its record to PostgreSQL, and the run carries only the retur
 The body is the artifact's raw bytes; `Content-Type` is its mime type (`application/json`
 for an `ask` table; `application/octet-stream` when absent). At most 50 MiB
 (`MAX_ARTIFACT_BYTES`), `413` past it, counted as the body arrives when there is no
-`Content-Length`; an empty body is `422`. `checksum` (optional, `sha256:<hex>`) is what the
+`Content-Length`; an empty body is `422`. The bytes are streamed to the blob store as they
+arrive (to a temporary file, or a spool for GCS), never held whole in memory; a refused or
+broken upload leaves nothing behind. `checksum` (optional, `sha256:<hex>`) is what the
 caller computed: `422` unless the bytes that arrived match.
 
 ```json
@@ -335,8 +361,10 @@ retried upload stores nothing twice).
 
 ### `GET /v1/artifacts/{artifact_id}` → `200` the bytes
 
-Streams the bytes with the artifact's `Content-Type`, `Content-Length` and
-`ETag: "sha256:<hex>"`. The bytes are verified against the recorded SHA-256 as they are
+Streams the bytes with the artifact's `Content-Type`, `Content-Length`,
+`ETag: "sha256:<hex>"` and `Cache-Control: private, max-age=31536000, immutable` (an
+artifact never changes under its id). `If-None-Match` naming the ETag (or `*`; weak
+comparison) is `304` with no body. The bytes are verified against the recorded SHA-256 as they are
 read, and the last chunk is held back until they match: corrupted bytes are `500` (or a
 response cut short), never served whole. `404` for another tenant's artifact, or one
 already deleted.
@@ -409,10 +437,14 @@ schedule is due for, else for now. Queues the run (`QUEUED`, `idempotency_key =
 ```
 
 A repeat for the same instant returns the same run. `409` when the schedule is paused.
-`503` when the run could not be queued; the detail says what the schedule did about it:
+`503 DEPENDENCY_UNAVAILABLE` when the run could not be queued; `details` says what the
+schedule did about it (`retryable` is false once the schedule paused itself):
 
 ```json
-{"detail": {"message": "…", "consecutive_failures": 1, "auto_paused": false, "error": {…}}}
+{"type": "urn:trellis:problem:dependency-unavailable", "status": 503,
+ "code": "DEPENDENCY_UNAVAILABLE", "detail": "schedule sch_… could not queue its run",
+ "retryable": true, "details": {"consecutive_failures": 1, "auto_paused": false,
+ "error": {…AgentError…}}, …}
 ```
 
 ## Webhooks
@@ -471,6 +503,12 @@ receivers drop repeats by `event_id` and read the run for anything the summary l
 
 ## Ops
 
-`GET /health/live` · `GET /health/ready` (the database answers). The ticker's probe is
+`GET /health/live` (asks no dependency) · `GET /health/ready` (the database answers within
+3 s; else `503`) · `GET /metrics` (Prometheus: `runs_http_requests_total` and
+`runs_http_request_seconds` by method, route template and status, `runs_claims_total` by
+outcome, `runs_rate_limited_total`, `runs_db_pool_connections` by state). The ticker serves
+`runs_ticker_ticks_total` (by outcome), `runs_ticker_swept_total` (by step) and the pool
+gauges on `RUNS__TICKER__METRICS_PORT` when it is set. Each process has its own registry: with
+several workers a scrape sees one worker's share. The ticker's probe is
 `python -m agent_runs.heartbeat`, which reads
 `RUNS__TICKER__HEARTBEAT_FILE` (set per ticker; compose sets it in the ticker container).

@@ -35,11 +35,22 @@ class RunCreate(RunStart):
         return RunStart.model_validate(self.model_dump(exclude={"queue"}))
 
 
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def bounded_payload(value: Any, *, name: str, limit: int) -> None:
+    """A run's ``input`` or ``output``, refused (413) past ``limit`` bytes of compact JSON
+    (``RUNS__SERVICE__MAX_PAYLOAD_BYTES``): it lives in the run's row and in every read."""
+    if value is not None and (size := _json_size(value)) > limit:
+        raise TooLarge(f"{name} is {size} bytes; the most a run keeps is {limit}")
+
+
 def bounded_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
     """The checkpoint, refused (413) past ``MAX_CHECKPOINT_BYTES`` of compact JSON."""
     if checkpoint is None:
         return None
-    size = len(json.dumps(checkpoint, separators=(",", ":"), ensure_ascii=False).encode())
+    size = _json_size(checkpoint)
     if size > MAX_CHECKPOINT_BYTES:
         raise TooLarge(
             f"checkpoint is {size} bytes; the most a run keeps is {MAX_CHECKPOINT_BYTES}"

@@ -96,7 +96,7 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
 | `POST/GET /v1/webhooks` · `GET/DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
-| `GET /health/live` · `GET /health/ready` | the process is up · the database answers (no key) |
+| `GET /health/live` · `GET /health/ready` · `GET /metrics` | the process is up · the database answers · Prometheus metrics (no key) |
 
 ## The ticker
 
@@ -188,6 +188,9 @@ documented in [.env.example](.env.example); every other number is a named consta
 | `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https`. Only `dev` and `test` may use the filesystem blob store |
 | `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache, rate-limit buckets and metrics |
 | `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
+| `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB |
+| `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` | API | a run's `input` or `output` past this (compact JSON) is `413` |
+| `RUNS__RATE_LIMIT__PER_MINUTE`, `RUNS__RATE_LIMIT__BURST` | `3000`, `500` | API | each tenant's token bucket per worker process (`429` + `Retry-After` when empty); `0` per minute turns it off |
 | `RUNS__MEMORY__URL` | `MEMORY_URL`, else `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self`. `MEMORY_URL` is the platform-wide name; this one wins when both are set |
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
 | `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process (per worker) |
@@ -201,6 +204,7 @@ documented in [.env.example](.env.example); every other number is a named consta
 | `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
 | `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
 | `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |
+| `RUNS__TICKER__METRICS_PORT` | unset | ticker | serve the ticker's Prometheus metrics on this port |
 | `RUNS__OBSERVABILITY__LOG_LEVEL` | `INFO` | API, ticker | log level |
 | `RUNS__OBSERVABILITY__LOG_JSON` | `true` | API, ticker | `false` for the console renderer |
 | `RUNS_PORT`, `RUNS_DB_PORT` | `8090`, `5442` | docker compose | host ports of the API and PostgreSQL |

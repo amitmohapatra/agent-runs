@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from typing import Any
@@ -177,9 +178,13 @@ def blobs(tmp_path: Any) -> FilesystemBlobStore:
     return FilesystemBlobStore(tmp_path / "blobs")
 
 
-@pytest.fixture
-async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) -> AsyncIterator[Any]:
-    application = create_app(SETTINGS)
+@asynccontextmanager
+async def serving(
+    settings: Settings, memory: FakeMemory, blobs: FilesystemBlobStore
+) -> AsyncIterator[Any]:
+    """The app on ``settings``, started, with the fake registry and this test's blob store,
+    over empty tables."""
+    application = create_app(settings)
     async with application.router.lifespan_context(application):
         await application.state.keys.aclose()
         application.state.keys = memory.registry()
@@ -194,13 +199,19 @@ async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) ->
         yield application
 
 
+@pytest.fixture
+async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) -> AsyncIterator[Any]:
+    async with serving(SETTINGS, memory, blobs) as application:
+        yield application
+
+
 def sender(receiver: Receiver, *, allow_http: bool = True) -> WebhookSender:
     """The ticker's sender, delivering to ``receiver``."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle))
     return WebhookSender(client=client, allow_http=allow_http)
 
 
-def _client(app: Any, key: str, **headers: str) -> AsyncClient:
+def client_of(app: Any, key: str = "dev-key", **headers: str) -> AsyncClient:
     return AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://runs",
@@ -210,27 +221,27 @@ def _client(app: Any, key: str, **headers: str) -> AsyncClient:
 
 @pytest.fixture
 async def client(app: Any) -> AsyncIterator[AsyncClient]:
-    async with _client(app, "dev-key") as c:
+    async with client_of(app, "dev-key") as c:
         yield c
 
 
 @pytest.fixture
 async def other_tenant(app: Any) -> AsyncIterator[AsyncClient]:
-    async with _client(app, "other-key") as c:
+    async with client_of(app, "other-key") as c:
         yield c
 
 
 @pytest.fixture
 async def narrow(app: Any) -> AsyncIterator[AsyncClient]:
     """An ordinary acme user: may act only as themself."""
-    async with _client(app, "narrow-key") as c:
+    async with client_of(app, "narrow-key") as c:
         yield c
 
 
 @pytest.fixture
 async def platform(app: Any) -> AsyncIterator[AsyncClient]:
     """A platform key acting for acme."""
-    async with _client(app, "platform-key", **{"X-Trellis-Tenant": "acme"}) as c:
+    async with client_of(app, "platform-key", **{"X-Trellis-Tenant": "acme"}) as c:
         yield c
 
 

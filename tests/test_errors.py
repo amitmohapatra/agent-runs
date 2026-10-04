@@ -163,7 +163,7 @@ async def test_ready_is_a_503_problem_while_the_database_does_not_answer(
     async def silent(*args: Any, **kwargs: Any) -> bool:
         return False
 
-    monkeypatch.setattr("agent_runs.api.app.ping", silent)
+    monkeypatch.setattr("agent_runs.api.routers.ops.ping", silent)
     response = await client.get("/health/ready")
     assert_problem(response, 503, "DEPENDENCY_UNAVAILABLE", retryable=True)
     assert response.headers["retry-after"] == "5"

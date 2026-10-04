@@ -10,9 +10,11 @@ from fastapi import Depends, Header, Request, Security
 from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.constants import HEADER_API_KEY, HEADER_TENANT
-from agent_runs.domain.errors import BadRequest, Forbidden, Unauthorized
+from agent_runs.domain.errors import BadRequest, Forbidden, RateLimited, Unauthorized
 from agent_runs.keys import KeyInfo, KeyRegistry
+from agent_runs.observability.metrics import rate_limited_total
 
 
 @dataclass(frozen=True)
@@ -79,10 +81,31 @@ async def caller(
     if credential.tenant_id is None:
         if not tenant:
             raise BadRequest(f"a platform key names the tenant in {HEADER_TENANT}")
-        return Caller(credential, tenant)
-    if tenant is not None and tenant != credential.tenant_id:
+        acting = Caller(credential, tenant)
+    elif tenant is not None and tenant != credential.tenant_id:
         raise Forbidden(f"{HEADER_TENANT} is not the tenant of this api key")
-    return Caller(credential, credential.tenant_id)
+    else:
+        acting = Caller(credential, credential.tenant_id)
+    _within_budget(request, acting.tenant_id)
+    return acting
+
+
+def _within_budget(request: Request, tenant_id: str) -> None:
+    """Take one of the tenant's tokens (``api/ratelimit.py``), or refuse with 429. The
+    budget headers go on the response either way (the request middleware writes them)."""
+    limiter: TenantRateLimiter = request.app.state.limiter
+    if not limiter.enabled:
+        return
+    decision = limiter.take(tenant_id)
+    request.state.ratelimit = decision.headers()
+    if not decision.allowed:
+        rate_limited_total.inc()
+        raise RateLimited(
+            "this tenant's request budget is spent; retry after Retry-After seconds",
+            retry_after=decision.retry_after,
+            headers=decision.headers(),
+            details={"limit_per_minute": decision.limit},
+        )
 
 
 Session = Annotated[AsyncSession, Depends(session)]

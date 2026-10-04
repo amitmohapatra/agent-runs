@@ -30,6 +30,10 @@ router = APIRouter(tags=["artifacts"])
 
 _CREATED = 201
 _OK = 200
+_NOT_MODIFIED = 304
+#: Checksum-addressed bytes never change under their id: cache them, privately (they are a
+#: tenant's), for as long as a cache will.
+CACHE_CONTROL = "private, max-age=31536000, immutable"
 DEFAULT_MIME = "application/octet-stream"
 _TOO_LARGE = f"an artifact is at most {MAX_ARTIFACT_BYTES} bytes"
 
@@ -51,19 +55,36 @@ def _blobs(request: Request) -> BlobStore:
     return request.app.state.blobs
 
 
-async def _body(request: Request) -> bytes:
-    """The request body, refused (413) past ``MAX_ARTIFACT_BYTES`` before it is all read."""
+async def _body(request: Request) -> AsyncIterator[bytes]:
+    """The request body as it arrives, refused (413) past ``MAX_ARTIFACT_BYTES``: at once
+    when ``Content-Length`` says so, else as soon as the bytes counted pass it. Nothing is
+    held but the chunk in hand; empty chunks are dropped."""
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > MAX_ARTIFACT_BYTES:
         raise TooLarge(_TOO_LARGE)
-    body = bytearray()
+    seen = 0
     async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_ARTIFACT_BYTES:
+        if not chunk:
+            continue
+        seen += len(chunk)
+        if seen > MAX_ARTIFACT_BYTES:
             raise TooLarge(_TOO_LARGE)
-    if not body:
+        yield chunk
+
+
+async def _nonempty(request: Request) -> AsyncIterator[bytes]:
+    """The body (``_body``), refused (422) before anything is stored when it is empty."""
+    chunks = _body(request)
+    first = await anext(chunks, None)
+    if first is None:
         raise Unprocessable("an artifact has at least one byte")
-    return bytes(body)
+
+    async def body() -> AsyncIterator[bytes]:
+        yield first
+        async for chunk in chunks:
+            yield chunk
+
+    return body()
 
 
 @router.post(
@@ -91,11 +112,12 @@ async def upload(
         who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
     )
     await db.commit()
-    data = await _body(request)
+    chunks = await _nonempty(request)
     mime = request.headers.get("content-type") or DEFAULT_MIME
     blobs = _blobs(request)
     artifact_id = new_id("art_")
-    blob = await blobs.put(f"artifacts/{artifact_id}", data, content_type=mime)
+    # streamed to the store as it arrives: a 50 MiB upload never sits whole in memory
+    blob = await blobs.put_stream(f"artifacts/{artifact_id}", chunks, content_type=mime)
     if checksum is not None and checksum != SHA256 + blob.sha256:
         await blobs.delete(blob.key)
         raise Unprocessable(f"the body's checksum is {SHA256}{blob.sha256}, not {checksum}")
@@ -132,9 +154,15 @@ async def upload(
 async def download(artifact_id: str, request: Request, db: Session, who: Who) -> Response:
     """The artifact's bytes, streamed with its mime type, verified against its checksum as
     they are read (a corrupted object is cut short, never served whole). 404 for another
-    tenant's artifact, or one deleted after its run's retention."""
+    tenant's artifact, or one deleted after its run's retention. An artifact never changes
+    (its ETag is its checksum): ``If-None-Match`` naming it is a 304 with no body, and a
+    private cache may keep it for a year."""
     row = await ArtifactStore(db).get(who.tenant_id, artifact_id)
     await db.close()  # nothing more to read: no connection held while streaming
+    etag = f'"{row.checksum}"'
+    cached = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
+    if _matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=_NOT_MODIFIED, headers=cached)
     stream = read(_blobs(request), row.blob_key, sha256=sha256_of(row), size=row.size)
     try:
         first = await anext(stream)
@@ -149,7 +177,13 @@ async def download(artifact_id: str, request: Request, db: Session, who: Who) ->
             yield chunk
 
     return StreamingResponse(
-        body(),
-        media_type=row.mime,
-        headers={"Content-Length": str(row.size), "ETag": f'"{row.checksum}"'},
+        body(), media_type=row.mime, headers={"Content-Length": str(row.size), **cached}
     )
+
+
+def _matches(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 ``If-None-Match``: ``*``, or a list of tags compared weakly."""
+    if if_none_match is None:
+        return False
+    tags = [tag.strip().removeprefix("W/") for tag in if_none_match.split(",")]
+    return "*" in tags or etag in tags
