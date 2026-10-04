@@ -96,7 +96,6 @@ class FireFailed(Unavailable):
                 "error": error.model_dump(mode="json"),
             }
         )
-        self.schedule = schedule
 
 
 def idempotency_key(schedule_id: str, fire_time: datetime) -> str:
