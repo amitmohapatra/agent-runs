@@ -17,7 +17,13 @@ from agent_runs.api.routers.runs import WorkerId
 from agent_runs.blob import BlobCorrupt, BlobNotFound, BlobStore, read
 from agent_runs.config.constants import MAX_ARTIFACT_BYTES
 from agent_runs.domain.errors import NotFound, ServiceError, TooLarge, Unprocessable
-from agent_runs.store.artifacts import SHA256, ArtifactStore, artifact_ref, sha256_of
+from agent_runs.store.artifacts import (
+    ARTIFACTS_PATH,
+    SHA256,
+    ArtifactStore,
+    artifact_ref,
+    sha256_of,
+)
 from agent_runs.store.runs import RunStore
 
 router = APIRouter(tags=["artifacts"])
@@ -109,10 +115,13 @@ async def upload(
     except BaseException:
         await blobs.delete(blob.key)
         raise
-    if not created:
+    ref = artifact_ref(row)
+    if created:
+        response.headers["Location"] = f"{ARTIFACTS_PATH}/{row.artifact_id}"
+    else:
         await blobs.delete(blob.key)
         response.status_code = _OK
-    return artifact_ref(row)
+    return ref
 
 
 @router.get(

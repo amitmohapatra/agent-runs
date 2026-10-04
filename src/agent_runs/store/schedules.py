@@ -16,11 +16,12 @@ the normal case, and the idempotency key alone dedupes only the run, not these c
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +39,7 @@ from agent_runs.domain.cadence import next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
 from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
+from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import ScheduleRow
 
 _UNKEPT = frozenset({"metadata"})
@@ -138,18 +140,28 @@ class ScheduleStore:
         enabled: bool | None = None,
         agent_id: str | None = None,
         limit: int = DEFAULT_PAGE,
-    ) -> list[Schedule]:
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[Schedule]:
+        """This tenant's schedules, newest first, a page at a time (keyset ``created_at,
+        schedule_id``, both descending)."""
+        order = (ScheduleRow.created_at, ScheduleRow.schedule_id)
         query: Select[tuple[ScheduleRow]] = select(ScheduleRow).where(
             ScheduleRow.tenant_id == tenant_id
         )
+        if after is not None:
+            query = query.where(tuple_(*order) < (after["created_at"], after["schedule_id"]))
         if enabled is not None:
             query = query.where(ScheduleRow.enabled.is_(enabled))
         if agent_id is not None:
             query = query.where(ScheduleRow.agent_id == agent_id)
-        rows = await self._session.scalars(
-            query.order_by(ScheduleRow.created_at.desc()).limit(limit)
+        newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
+        rows = (await self._session.scalars(newest)).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=_schedule,
+            position=lambda row: {"created_at": row.created_at, "schedule_id": row.schedule_id},
         )
-        return [_schedule(row) for row in rows.all()]
 
     async def update(
         self, tenant_id: str, schedule_id: str, change: ScheduleUpdate, *, now: datetime

@@ -9,14 +9,20 @@ agent would do everything editing ``on_behalf_of`` would.
 
 from __future__ import annotations
 
-from typing import Annotated
+from datetime import datetime
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Request, Response
 from trellis.contracts.ids import now
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
 from agent_runs.api.deps import Session, Who
-from agent_runs.config.constants import DEFAULT_PAGE, MAX_PAGE
+from agent_runs.api.pagination import (
+    DEFAULT_LIMIT,
+    CursorQuery,
+    LimitQuery,
+    decode_cursor,
+    link_next,
+)
 from agent_runs.domain.schedules import FireFailed, FireRequest, FireResult, ScheduleUpdate
 from agent_runs.firing import Firing
 from agent_runs.store.schedules import ScheduleStore
@@ -36,23 +42,37 @@ async def create(spec: ScheduleSpec, db: Session, who: Who, response: Response) 
     who.require_may_act_for(spec.on_behalf_of)
     schedule, created = await ScheduleStore(db).upsert(spec, created_by=who.principal, now=now())
     await db.commit()
-    if not created:
+    if created:
+        response.headers["Location"] = f"{router.prefix}/{schedule.schedule_id}"
+    else:
         response.status_code = 200
     return schedule
 
 
-@router.get("")
+_CURSOR = {"created_at": datetime, "schedule_id": str}
+
+
+@router.get("", name="list")
 async def listing(
+    request: Request,
+    response: Response,
     db: Session,
     who: Who,
     enabled: bool | None = None,
     agent_id: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_LIMIT,
 ) -> list[Schedule]:
     """This tenant's schedules, newest first."""
-    return await ScheduleStore(db).list(
-        who.tenant_id, enabled=enabled, agent_id=agent_id, limit=limit
+    page = await ScheduleStore(db).list(
+        who.tenant_id,
+        enabled=enabled,
+        agent_id=agent_id,
+        limit=limit,
+        after=decode_cursor(cursor, fields=_CURSOR),
     )
+    link_next(request, response, page.after)
+    return page.items
 
 
 @router.get("/{schedule_id}")

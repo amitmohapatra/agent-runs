@@ -89,13 +89,13 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
-| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role |
+| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role. Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
 | `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
 | `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |
 | `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
-| `POST/GET /v1/webhooks` · `DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
+| `POST/GET /v1/webhooks` · `GET/DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
 | `GET /health/live` · `GET /health/ready` | the process is up · the database answers (no key) |
 
 ## The ticker

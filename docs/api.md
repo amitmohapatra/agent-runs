@@ -44,6 +44,20 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 | `500` | `INTERNAL` | a fault here (an artifact's stored bytes no longer match their checksum, a statement the database refuses, anything unanticipated); the detail says nothing about internals |
 | `503` | `DEPENDENCY_UNAVAILABLE` | PostgreSQL did not answer (no connection, a connection lost, no pooled connection free in time, a statement past its timeout), the key registry (Memory Service) could not be asked, or a schedule fire could not queue its run (recorded on the schedule); retryable, with `Retry-After: 5` (a fire that paused its schedule is not retryable) |
 
+## Pages and locations
+
+Every listing (`GET /v1/runs`, `/v1/runs/{id}/resolutions`, `/v1/schedules`,
+`/v1/webhooks`) takes `cursor` and `limit` (1–500, default 50) and answers a bare JSON array
+with `Link: <url>; rel="next"` (RFC 8288) exactly when there is a next page; the URL is this
+request's with `cursor` set, so the filters and the limit carry over. The cursor is opaque
+(base64url JSON of the position the listing is ordered by: `created_at` and the id, which
+never change, so a record written between two pages is neither skipped nor repeated); one
+this listing did not issue is `422`. Without `cursor`, the first page.
+
+Every create that answers `201` says where the new record lives: `Location: /v1/runs/{id}`,
+`/v1/schedules/{id}`, `/v1/webhooks/{id}`, `/v1/artifacts/{id}`. A repeat answered `200`
+carries none.
+
 ## Every route
 
 `auth` below is the four answers any `/v1` route may give before it looks at the request:
@@ -59,18 +73,19 @@ table have the bodies and the exact semantics.
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `404`, `409` not `PAUSED` or another interrupt, `422` another run |
 | `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
-| `GET /v1/runs/{id}/resolutions` | | `200 [ResolutionEntry]` | `404` |
-| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&limit=` | `200 [RunSummary]` | `422` |
+| `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
+| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
 | `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
-| `GET /v1/schedules` | `?enabled=&agent_id=&limit=` | `200 [Schedule]` | `422` |
+| `GET /v1/schedules` | `?enabled=&agent_id=&cursor=&limit=` | `200 [Schedule]` | `422` |
 | `GET /v1/schedules/{id}` | | `200 Schedule` | `404` |
 | `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` |
 | `DELETE /v1/schedules/{id}` | | `204` | `403` `on_behalf_of`, `404` |
 | `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused, `422` `at` ahead or naive, `503` not queued |
 | `POST /v1/webhooks` | `{url, events}` | `201 WebhookCreated` | `409` 20 already, `422` |
-| `GET /v1/webhooks` | | `200 [Webhook]` | |
+| `GET /v1/webhooks` | `?cursor=&limit=` | `200 [Webhook]` | `422` |
+| `GET /v1/webhooks/{id}` | | `200 Webhook` | `404` |
 | `DELETE /v1/webhooks/{id}` | | `204` | `404` |
 | `GET /health/live` | no key | `200 {"status": "ok"}` | |
 | `GET /health/ready` | no key | `200 {"status": "ok"}` | `503` the database does not answer within 3 s |
@@ -207,7 +222,7 @@ the answer to its pause retries it. Another interrupt, or another worker, is `40
 
 ### `GET /v1/runs/{id}/resolutions` → `200 [ResolutionEntry]`
 
-Every interrupt the run paused on and how it was answered, oldest first:
+Every interrupt the run paused on and how it was answered, oldest first, a page at a time:
 `{"interrupt": Interrupt, "resolution": InterruptResolution, "attempt": 1, "recorded_at": "…"}`.
 Append-only: `last_resolution` is only the latest of these. A row exists exactly when the
 resume took effect; a refused resume (`409`, `422`) leaves none. `404` for a run the caller's
@@ -257,8 +272,8 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 ### Reads
 
 - `GET /v1/runs/{id}` → `RunRecord`, the full record (input, output, error, checkpoint).
-- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&limit=` →
-  `[RunSummary]`, newest first, `limit` 1–500 (default 50). The inbox is
+- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&cursor=&limit=` →
+  `[RunSummary]`, newest first, paged (`Link`). The inbox is
   `status=PAUSED&assignee=role:procurement`.
 
 ```json
@@ -351,10 +366,10 @@ with `PATCH`). Concurrent creates of one identity make one schedule. `name` is a
 need not be unique. This is the one idempotency mechanism: a client repeats the create and
 needs no name, no `409` handling and no follow-up `PATCH`.
 
-### `GET /v1/schedules?enabled=&agent_id=&limit=` · `GET /v1/schedules/{id}` · `DELETE /v1/schedules/{id}` (`204`)
+### `GET /v1/schedules?enabled=&agent_id=&cursor=&limit=` · `GET /v1/schedules/{id}` · `DELETE /v1/schedules/{id}` (`204`)
 
-The listing is this tenant's schedules, newest first, `limit` 1–500 (default 50), filtered by
-`enabled` and `agent_id` when given. Any key of the tenant may list and read a schedule;
+The listing is this tenant's schedules, newest first, paged (`Link`), filtered by `enabled`
+and `agent_id` when given. Any key of the tenant may list and read a schedule;
 deleting one needs a key that may act as its `on_behalf_of` (`404` before `403`).
 
 ### `PATCH /v1/schedules/{id}` → `Schedule`
@@ -412,9 +427,10 @@ dropped, answered sorted). `url` is absolute `https` (`http` too when
 `secret` signs every delivery to this subscription. **It is in this answer only**; a lost
 secret means deleting the subscription and creating a new one.
 
-### `GET /v1/webhooks` → `[Webhook]` · `DELETE /v1/webhooks/{id}` → `204`
+### `GET /v1/webhooks?cursor=&limit=` → `[Webhook]` · `GET /v1/webhooks/{id}` → `Webhook` · `DELETE /v1/webhooks/{id}` → `204`
 
-The listing is the same shape without `secret`, oldest first. Deleting drops the
+The listing and the read are the same shape without `secret`; the listing is oldest first,
+paged (`Link`). Deleting drops the
 deliveries still owed to the subscription. Another tenant's id is `404`.
 
 ### Events and delivery

@@ -9,11 +9,11 @@ interrupt is a test rather than a wait.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -45,6 +45,7 @@ from agent_runs.domain.runs import (
     RunSummary,
 )
 from agent_runs.store.artifacts import ArtifactStore
+from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import ResolutionRow, RunRow
 
 _RECORD_FIELDS = (
@@ -472,25 +473,35 @@ class RunStore:
         await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
 
     # ------------------------------------------------------------------ reads
-    async def resolutions(self, tenant_id: str, run_id: str) -> list[ResolutionEntry]:
-        """Every interrupt the run was asked and how it was answered, oldest first."""
+    async def resolutions(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        limit: int = DEFAULT_PAGE,
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[ResolutionEntry]:
+        """Every interrupt the run was asked and how it was answered, oldest first, a page
+        at a time (keyset ``recorded_at, resolution_id``)."""
         await self.get(tenant_id, run_id)  # 404 for another tenant's run, as everywhere
-        rows = (
-            await self._session.scalars(
-                select(ResolutionRow)
-                .where(ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id)
-                .order_by(ResolutionRow.recorded_at, ResolutionRow.resolution_id)
-            )
-        ).all()
-        return [
-            ResolutionEntry(
+        order = (ResolutionRow.recorded_at, ResolutionRow.resolution_id)
+        query = select(ResolutionRow).where(
+            ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id
+        )
+        if after is not None:
+            query = query.where(tuple_(*order) > (after["recorded_at"], after["resolution_id"]))
+        rows = (await self._session.scalars(query.order_by(*order).limit(limit + 1))).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=lambda r: ResolutionEntry(
                 interrupt=Interrupt.model_validate(r.interrupt),
                 resolution=InterruptResolution.model_validate(r.resolution),
                 attempt=r.attempt,
                 recorded_at=r.recorded_at,
-            )
-            for r in rows
-        ]
+            ),
+            position=lambda r: {"recorded_at": r.recorded_at, "resolution_id": r.resolution_id},
+        )
 
     async def get(self, tenant_id: str, run_id: str) -> RunRecord:
         row = await self._one(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
@@ -508,11 +519,16 @@ class RunStore:
         thread_id: str | None = None,
         parent_run_id: str | None = None,
         limit: int = DEFAULT_PAGE,
-    ) -> list[RunSummary]:
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[RunSummary]:
         """This tenant's runs, newest first, as summaries (only the summary's columns are
-        read). ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served
-        by ``ix_runs_inbox``."""
-        query = select(*_SUMMARY_COLUMNS).where(RunRow.tenant_id == tenant_id)
+        read), a page at a time (keyset ``created_at, run_id``, both descending).
+        ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served by
+        ``ix_runs_inbox``."""
+        order = (RunRow.created_at, RunRow.run_id)
+        query = select(*_SUMMARY_COLUMNS, RunRow.created_at).where(RunRow.tenant_id == tenant_id)
+        if after is not None:
+            query = query.where(tuple_(*order) < (after["created_at"], after["run_id"]))
         filters: dict[Any, Any] = {
             RunRow.status: status.value if status else None,
             RunRow.assignee: assignee,
@@ -523,8 +539,14 @@ class RunStore:
         for column, value in filters.items():
             if value is not None:
                 query = query.where(column == value)
-        rows = await self._session.execute(query.order_by(RunRow.created_at.desc()).limit(limit))
-        return [RunSummary.model_validate(dict(row._mapping)) for row in rows.all()]
+        newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
+        rows = (await self._session.execute(newest)).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=lambda row: RunSummary.model_validate(dict(row._mapping)),
+            position=lambda row: {"created_at": row.created_at, "run_id": row.run_id},
+        )
 
     # ------------------------------------------------------------------ internals
     async def _one(self, *conditions: Any) -> RunRow | None:

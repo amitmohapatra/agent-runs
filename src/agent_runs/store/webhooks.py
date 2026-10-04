@@ -9,17 +9,19 @@ ticker delivers from the outbox (``claim_due`` / ``settle``).
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import new_id, stable_id
 from trellis.contracts.runs import RunRecord
 
 from agent_runs.config.constants import (
+    DEFAULT_PAGE,
     MAX_WEBHOOKS_PER_TENANT,
     WEBHOOK_ATTEMPTS,
     WEBHOOK_LEASE,
@@ -37,6 +39,7 @@ from agent_runs.domain.webhooks import (
     event_of,
 )
 from agent_runs.retry import backoff
+from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import WebhookDeliveryRow, WebhookRow
 
 
@@ -113,13 +116,36 @@ class WebhookStore:
         await self._session.flush()
         return WebhookCreated(**_webhook(row).model_dump(), secret=row.secret)
 
-    async def list(self, tenant_id: str) -> list[Webhook]:
-        rows = await self._session.scalars(
-            select(WebhookRow)
-            .where(WebhookRow.tenant_id == tenant_id)
-            .order_by(WebhookRow.created_at)
+    async def list(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = DEFAULT_PAGE,
+        after: Mapping[str, Any] | None = None,
+    ) -> Page[Webhook]:
+        """This tenant's subscriptions, oldest first, a page at a time (keyset
+        ``created_at, webhook_id``)."""
+        order = (WebhookRow.created_at, WebhookRow.webhook_id)
+        query = select(WebhookRow).where(WebhookRow.tenant_id == tenant_id)
+        if after is not None:
+            query = query.where(tuple_(*order) > (after["created_at"], after["webhook_id"]))
+        rows = (await self._session.scalars(query.order_by(*order).limit(limit + 1))).all()
+        return page_of(
+            rows,
+            limit=limit,
+            item=_webhook,
+            position=lambda row: {"created_at": row.created_at, "webhook_id": row.webhook_id},
         )
-        return [_webhook(row) for row in rows.all()]
+
+    async def get(self, tenant_id: str, webhook_id: str) -> Webhook:
+        row = await self._session.scalar(
+            select(WebhookRow).where(
+                WebhookRow.tenant_id == tenant_id, WebhookRow.webhook_id == webhook_id
+            )
+        )
+        if row is None:
+            raise NotFound(f"no webhook {webhook_id}")
+        return _webhook(row)
 
     async def delete(self, tenant_id: str, webhook_id: str) -> None:
         """The subscription and every delivery still owed to it."""

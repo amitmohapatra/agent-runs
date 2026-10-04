@@ -4,14 +4,21 @@ does, and records here what happened."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
 from agent_runs.api.deps import Session, Who
-from agent_runs.config.constants import DEFAULT_PAGE, MAX_PAGE
+from agent_runs.api.pagination import (
+    DEFAULT_LIMIT,
+    CursorQuery,
+    LimitQuery,
+    decode_cursor,
+    link_next,
+)
 from agent_runs.domain.runs import (
     Claimed,
     ClaimRequest,
@@ -43,7 +50,9 @@ async def start(body: RunCreate, db: Session, who: Who, response: Response) -> R
     who.require_may_act_for(body.on_behalf_of)
     run, created = await RunStore(db).start(body.start(), queue=body.queue, now=now())
     await db.commit()
-    if not created:
+    if created:
+        response.headers["Location"] = f"{router.prefix}/{run.run_id}"
+    else:
         response.status_code = 200
     return run
 
@@ -112,15 +121,36 @@ async def get(run_id: str, db: Session, who: Who) -> RunRecord:
     return await RunStore(db).get(who.tenant_id, run_id)
 
 
+_RESOLUTIONS_CURSOR = {"recorded_at": datetime, "resolution_id": str}
+_RUNS_CURSOR = {"created_at": datetime, "run_id": str}
+
+
 @router.get("/{run_id}/resolutions")
-async def resolutions(run_id: str, db: Session, who: Who) -> list[ResolutionEntry]:
+async def resolutions(
+    run_id: str,
+    request: Request,
+    response: Response,
+    db: Session,
+    who: Who,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_LIMIT,
+) -> list[ResolutionEntry]:
     """Every interrupt the run paused on and how a person answered it, oldest first: the
     audit trail ``last_resolution`` is only the end of."""
-    return await RunStore(db).resolutions(who.tenant_id, run_id)
+    page = await RunStore(db).resolutions(
+        who.tenant_id,
+        run_id,
+        limit=limit,
+        after=decode_cursor(cursor, fields=_RESOLUTIONS_CURSOR),
+    )
+    link_next(request, response, page.after)
+    return page.items
 
 
-@router.get("")
+@router.get("", name="list")
 async def listing(
+    request: Request,
+    response: Response,
     db: Session,
     who: Who,
     status: RunStatus | None = None,
@@ -128,11 +158,12 @@ async def listing(
     agent_id: str | None = None,
     thread_id: str | None = None,
     parent_run_id: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_LIMIT,
 ) -> list[RunSummary]:
     """This tenant's runs, newest first, as summaries; the full record is
     ``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox."""
-    return await RunStore(db).list(
+    page = await RunStore(db).list(
         who.tenant_id,
         status=status,
         assignee=assignee,
@@ -140,4 +171,7 @@ async def listing(
         thread_id=thread_id,
         parent_run_id=parent_run_id,
         limit=limit,
+        after=decode_cursor(cursor, fields=_RUNS_CURSOR),
     )
+    link_next(request, response, page.after)
+    return page.items

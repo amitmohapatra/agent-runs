@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Request, Response
 from trellis.contracts.ids import now
 
 from agent_runs.api.deps import Session, Who
+from agent_runs.api.pagination import (
+    DEFAULT_LIMIT,
+    CursorQuery,
+    LimitQuery,
+    decode_cursor,
+    link_next,
+)
 from agent_runs.domain.webhooks import Webhook, WebhookCreate, WebhookCreated
 from agent_runs.store.webhooks import WebhookStore
 
@@ -16,7 +25,9 @@ _NO_CONTENT = 204
 
 
 @router.post("", status_code=_CREATED)
-async def create(body: WebhookCreate, request: Request, db: Session, who: Who) -> WebhookCreated:
+async def create(
+    body: WebhookCreate, request: Request, response: Response, db: Session, who: Who
+) -> WebhookCreated:
     """Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,
     which signs every delivery to it; it is shown here and never again."""
     body.check_url(allow_http=request.app.state.settings.service.is_dev)
@@ -24,13 +35,34 @@ async def create(body: WebhookCreate, request: Request, db: Session, who: Who) -
         who.tenant_id, body, created_by=who.principal, now=now()
     )
     await db.commit()
+    response.headers["Location"] = f"{router.prefix}/{created.webhook_id}"
     return created
 
 
-@router.get("")
-async def listing(db: Session, who: Who) -> list[Webhook]:
+_CURSOR = {"created_at": datetime, "webhook_id": str}
+
+
+@router.get("", name="list")
+async def listing(
+    request: Request,
+    response: Response,
+    db: Session,
+    who: Who,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_LIMIT,
+) -> list[Webhook]:
     """This tenant's subscriptions, oldest first, without their secrets."""
-    return await WebhookStore(db).list(who.tenant_id)
+    page = await WebhookStore(db).list(
+        who.tenant_id, limit=limit, after=decode_cursor(cursor, fields=_CURSOR)
+    )
+    link_next(request, response, page.after)
+    return page.items
+
+
+@router.get("/{webhook_id}")
+async def get(webhook_id: str, db: Session, who: Who) -> Webhook:
+    """One subscription, without its secret."""
+    return await WebhookStore(db).get(who.tenant_id, webhook_id)
 
 
 @router.delete("/{webhook_id}", status_code=_NO_CONTENT)

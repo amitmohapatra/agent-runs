@@ -361,7 +361,9 @@ erDiagram
   }
 ```
 
-The indexes each serve one query:
+Every listing is a keyset page (`store/paging.py`): ordered by `created_at` (or
+`recorded_at`) and the id, fetched one row past the page, the next page starting strictly
+after the last row returned. The indexes each serve one query:
 
 | Index | Table | Serves |
 |---|---|---|
@@ -399,12 +401,14 @@ src/agent_runs/
   api/app.py           create_app(): routers, middleware, error handlers, health routes
   api/errors.py        Problem, install_error_handlers(): every error as a problem
   api/middleware.py    RequestContextMiddleware: X-Request-ID
+  api/pagination.py    cursor in, Link: rel="next" out
   api/deps.py          Caller, caller(), session(): who is calling, a session per request
   api/routers/         runs.py, artifacts.py, schedules.py, webhooks.py
   domain/              runs.py, schedules.py, webhooks.py (request and answer models),
                        cadence.py (validate_cadence, next_fire_at), errors.py (status, ErrorCode)
   store/               tables.py (the mappings), runs.py, schedules.py, webhooks.py,
-                       artifacts.py, database.py (connect + the head-revision check)
+                       artifacts.py, database.py (connect + the head-revision check),
+                       paging.py (Page, page_of: keyset pages)
   blob/                port.py (BlobStore, read), filesystem.py, gcs.py, open_blob_store()
   config/              settings.py (RUNS__* deployment facts), constants.py (design decisions)
   observability/       logging.py (structlog, JSON or console)
