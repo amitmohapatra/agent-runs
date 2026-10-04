@@ -605,7 +605,7 @@
       },
       "InterruptResolution": {
         "additionalProperties": false,
-        "description": "How an interrupt was answered. The paused run continues (``RunStore.resumed`` moves it\nback to ``RUNNING`` on the same run id, the next attempt); the resolution names the\ninterrupt and the run so a store can refuse an answer to the wrong question.",
+        "description": "How an interrupt was answered. The paused run continues (``RunsClient.resume`` in\n``trellis.runs`` moves it back to ``RUNNING`` on the same run id, the next attempt); the\nresolution names the interrupt and the run so agent-runs can refuse an answer to the wrong\nquestion.",
         "properties": {
           "answer": {
             "description": "The answer to a question, any JSON value shaped by the interrupt's expects; None for a decision about a tool call.",
