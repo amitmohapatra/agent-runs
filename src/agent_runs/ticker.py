@@ -2,14 +2,15 @@
 
 1. fire every due schedule (one ``SKIP LOCKED`` claim at a time, each in its own transaction,
    queueing its run idempotently on ``(schedule_id, fire_time)``);
-2. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
+2. time out runs not yet ended (queued, running or paused) past their own deadline;
+3. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
    lapse);
-3. escalate or time out interrupts past their deadline;
-4. send the webhook deliveries that are due from the outbox (one attempt each);
-5. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
+4. escalate or time out interrupts past their deadline;
+5. send the webhook deliveries that are due from the outbox (one attempt each);
+6. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
    row: a blob delete that fails leaves the row for the next tick).
 
-Steps 2 and 3 write the webhook events they cause into the outbox in their own transaction.
+Steps 2 to 4 write the webhook events they cause into the outbox in their own transaction.
 
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
@@ -27,12 +28,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 import structlog
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from trellis.contracts.ids import now as clock
-from trellis.contracts.runs import RunStatus
+from trellis.contracts.runs import RunRecord, RunStatus
 
 from agent_runs import heartbeat
 from agent_runs.blob import BlobStore, open_blob_store
@@ -60,9 +62,18 @@ log = structlog.get_logger(__name__)
 Sessions = Callable[[], AsyncSession]
 
 
+class RunSweep(Protocol):
+    """One of ``RunStore``'s sweeps: the runs it moved, at most ``limit`` of them."""
+
+    async def __call__(
+        self, store: RunStore, /, *, now: datetime, limit: int
+    ) -> list[RunRecord]: ...
+
+
 @dataclass(frozen=True)
 class TickReport:
     fired: int = 0
+    timed_out: int = 0
     requeued: int = 0
     escalated: int = 0
     sent: int = 0
@@ -96,8 +107,9 @@ class Ticker:
         try:
             report = TickReport(
                 fired=await self._fire_due(now),
-                requeued=await self._requeue_lapsed(now),
-                escalated=await self._escalate_overdue(now),
+                timed_out=await self._sweep_runs(RunStore.time_out_past_deadline, now),
+                requeued=await self._sweep_runs(RunStore.requeue_lapsed, now),
+                escalated=await self._sweep_runs(RunStore.escalate_overdue, now),
                 sent=await self._send_webhooks(now),
                 purged=await self._purge_artifacts(now),
             )
@@ -130,17 +142,12 @@ class Ticker:
             fired += 1
         return fired
 
-    async def _requeue_lapsed(self, now: datetime) -> int:
+    async def _sweep_runs(self, sweep: RunSweep, now: datetime) -> int:
+        """One run sweep and the webhook events of the runs it moved, in one transaction. A
+        run a sweep leaves ``PAUSED`` was escalated; any other announces what its new status
+        does (an ending ``run.finished``, a requeue nothing)."""
         async with self._sessions() as db:
-            moved = await RunStore(db).requeue_lapsed(now=now, limit=SWEEP_BATCH)
-            for run in moved:
-                await WebhookStore(db).announce(run, now=now)
-            await db.commit()
-        return len(moved)
-
-    async def _escalate_overdue(self, now: datetime) -> int:
-        async with self._sessions() as db:
-            moved = await RunStore(db).escalate_overdue(now=now, limit=SWEEP_BATCH)
+            moved = await sweep(RunStore(db), now=now, limit=SWEEP_BATCH)
             for run in moved:
                 event = WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
                 await WebhookStore(db).announce(run, event, now=now)

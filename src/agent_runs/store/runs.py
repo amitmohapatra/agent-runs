@@ -77,6 +77,10 @@ _RECORD_FIELDS = (
 
 _SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
 
+#: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
+#: deadline can still catch.
+_UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
+
 #: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
 #: same key with a different request is a client bug to surface, not a run to hand back.
 #: ``run_id`` is not compared (the contracts mint one when none is sent, so a retry that
@@ -375,6 +379,34 @@ class RunStore:
         return Lease(run_id=row.run_id, worker_id=worker_id, expires_at=expires_at)
 
     # ------------------------------------------------------------------ the ticker's sweeps
+    async def time_out_past_deadline(self, *, now: datetime, limit: int) -> list[RunRecord]:
+        """Runs not yet ended past their own ``deadline`` (``RunStart.deadline``) end as
+        ``TIMEOUT``, queued, running or paused alike: a deadline is when the run must be
+        done by, so time waiting for a worker or a person counts. A worker still running
+        one has lost it: its next heartbeat or write is ``LeaseLost``. Returns every run
+        ended."""
+        rows = await self._sweep(
+            RunRow.status.in_(_UNENDED),
+            RunRow.deadline < now,
+            order=RunRow.deadline,
+            limit=limit,
+        )
+        for row in rows:
+            _move(row, RunStatus.TIMEOUT, now)
+            row.error = _json(
+                AgentError(
+                    code="run_deadline",
+                    category=ErrorCategory.TIMEOUT,
+                    message=f"the run did not end by its deadline, {row.deadline}",
+                    # the category alone would say retryable; a retry would only be later
+                    retryable=False,
+                    source="agent-runs",
+                )
+            )
+        await self._ended(rows, now)
+        await self._session.flush()
+        return [_record(row) for row in rows]
+
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt;
         one whose lease has now lapsed ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead.

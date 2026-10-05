@@ -15,8 +15,9 @@ cannot write over a run another worker has since claimed::
 A claimed run is leased to this worker; a heartbeat extends the lease every third of it while
 the handler runs, and a worker that dies lets the lease lapse, after which agent-runs queues
 the run again as its next attempt. A heartbeat refused with ``LEASE_LOST`` (the lease lapsed
-and another worker took the run, or the run was cancelled) cancels the handler: it must write
-nothing more. Schedules and resumed durable runs arrive the same way: as queued runs.
+and another worker took the run, or the run was cancelled or ran past its deadline) cancels
+the handler: it must write nothing more. Schedules and resumed durable runs arrive the same
+way: as queued runs.
 
 An idle worker asks again after a growing pause (exponential, jittered, at most
 :data:`IDLE_MAX_SECONDS`), and asks at once again after it got work. :meth:`Worker.stop`

@@ -199,6 +199,14 @@ CONFLICT` that says only that the id cannot be used, not that or by whom it is h
 `details.differing` naming the fields, and no run. `on_behalf_of` must be a principal the key
 may act as.
 
+`deadline` (optional) is when the run must be done by. Nothing needs to watch it: within a
+tick of it passing, the ticker ends a run that has not ended (`QUEUED`, `RUNNING` or
+`PAUSED`: time in the queue and time waiting for a person count) as `TIMEOUT`, with the
+error `{"code": "run_deadline", "category": "TIMEOUT", "retryable": false}`, announced as
+`run.finished`. A worker still running it gets `409 LEASE_LOST` on its next heartbeat or
+write and must stop. An interrupt's own `deadline` (below) is separate: it escalates or
+ends one wait; the run's ends the run.
+
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
 ```json
@@ -264,7 +272,8 @@ a worker pausing a run lets go of it.
 interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.checkpoint` on
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` answer, a
-`TIMEOUT`, a run failed on its `MAX_LEASE_LAPSES`-th lapsed lease) clears it. Larger than 1 MiB as compact JSON
+`TIMEOUT`, a run past its deadline, a run failed on its `MAX_LEASE_LAPSES`-th lapsed lease)
+clears it. Larger than 1 MiB as compact JSON
 (`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
 
@@ -528,7 +537,7 @@ deliveries still owed to the subscription. Another tenant's id is `404`.
 |---|---|
 | `run.paused` | a run pauses (`/pause`) |
 | `run.escalated` | the ticker moves an overdue interrupt to `escalate_to` |
-| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a lease lapsed `MAX_LEASE_LAPSES` times |
+| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a run past its own `deadline`, a lease lapsed `MAX_LEASE_LAPSES` times |
 
 The event is written to an outbox in the same transaction as the run change, one row per
 subscription of the tenant that wants it, and the ticker sends it (so within one tick,

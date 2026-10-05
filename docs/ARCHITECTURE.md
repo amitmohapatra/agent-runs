@@ -35,7 +35,7 @@ flowchart LR
       routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
-      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · requeue · escalate<br/>send webhooks · purge artifacts"]
+      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out · requeue · escalate<br/>send webhooks · purge artifacts"]
       sender["WebhookSender<br/>(webhooks.py)"]
     end
     keys["KeyRegistry (keys.py)<br/>TTL cache of key answers"]
@@ -97,7 +97,7 @@ The one transition check is `trellis-contracts` `RunStatus.can_become`, called b
 `store/runs.py` `_move` under a row lock; a refused transition is `409` and changes nothing.
 The arrows are exactly the transitions some route or ticker step makes:
 `tests/test_state_machine.py` asserts every route's transition and every refusal, and
-`tests/test_queue.py` and `tests/test_escalation.py` the ticker's.
+`tests/test_queue.py`, `tests/test_deadline.py` and `tests/test_escalation.py` the ticker's.
 
 ```mermaid
 stateDiagram-v2
@@ -106,7 +106,7 @@ stateDiagram-v2
 
   QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
   QUEUED --> CANCELLED: finish CANCELLED
-  QUEUED --> TIMEOUT: finish TIMEOUT
+  QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
   RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
@@ -114,15 +114,15 @@ stateDiagram-v2
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish
+  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
   RUNNING --> CANCELLED: finish
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
   PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
-  PAUSED --> TIMEOUT: finish TIMEOUT, or ticker past deadline with no escalate_to
-  PAUSED --> PAUSED: ticker past deadline, assignee becomes escalate_to (once)
+  PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
+  PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
   SUCCESS --> [*]
   PARTIAL --> [*]
@@ -302,7 +302,7 @@ erDiagram
     timestamptz awaiting_deadline "from awaiting, for escalation"
     int attempt "executions: resumes and requeues add one"
     int lease_lapses "only lapsed leases; MAX_LEASE_LAPSES fails the run"
-    timestamptz deadline "RunStart.deadline"
+    timestamptz deadline "RunStart.deadline, for the deadline sweep"
     varchar idempotency_key UK
     jsonb run_metadata
     timestamptz queued_at "set once the run entered the queue"
@@ -395,6 +395,7 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
+| `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
 | `ix_run_resolutions_run` | `run_resolutions (tenant_id, run_id, recorded_at)` | `GET /v1/runs/{id}/resolutions` |
 | `ix_run_artifacts_expiry` | `run_artifacts (expires_at) WHERE expires_at IS NOT NULL` | `ArtifactStore.expired` |
 | `ix_schedules_tenant_created` | `agent_schedules (tenant_id, created_at)` | `GET /v1/schedules`, newest first |

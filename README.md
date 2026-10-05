@@ -85,7 +85,7 @@ stateDiagram-v2
 
   QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
   QUEUED --> CANCELLED: finish CANCELLED
-  QUEUED --> TIMEOUT: finish TIMEOUT
+  QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
   RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
@@ -93,15 +93,15 @@ stateDiagram-v2
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish
+  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
   RUNNING --> CANCELLED: finish
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
   PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
-  PAUSED --> TIMEOUT: finish TIMEOUT, or ticker past deadline with no escalate_to
-  PAUSED --> PAUSED: ticker past deadline, assignee becomes escalate_to (once)
+  PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
+  PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
   SUCCESS --> [*]
   PARTIAL --> [*]
@@ -120,6 +120,7 @@ stateDiagram-v2
 | make a retried start harmless | the same `run_id`, or an `idempotency_key` (one run per tenant and key) |
 | stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume` |
 | move an unanswered question up, or give up on it | the interrupt's `deadline` and `escalate_to`: the ticker reassigns it once, else ends the run `TIMEOUT` |
+| make sure a run is done by a time, whatever happens | `RunStart.deadline`: past it the ticker ends the run `TIMEOUT` (`run_deadline`, not retryable), queued, running or waiting for a person; a worker still running it is told `LEASE_LOST` and stops |
 | show a reviewer something too big for a question (a table, a diff) | `POST /v1/runs/{id}/artifacts`, then the `ArtifactRef` as `Interrupt.payload_ref`; the UI reads `GET /v1/artifacts/{id}` |
 | build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…` |
 | prove who approved what, and when | `GET /v1/runs/{id}/resolutions` (append-only) |
@@ -189,15 +190,21 @@ exact claim, heartbeat and resume semantics a worker implements.
    run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
    fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
    (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
-2. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
+2. **Run deadlines.** A run not yet ended (`QUEUED`, `RUNNING` or `PAUSED`) past its own
+   `deadline` (`RunStart.deadline`) ends in `TIMEOUT` with an `AgentError` of code
+   `run_deadline` (`retryable: false`: a retry would only be later). The deadline is when
+   the run must be done by, so time in the queue and time waiting for a person count. A
+   worker still running it loses the run: its next heartbeat or write is `409 LEASE_LOST`,
+   and the SDK's `Worker` cancels its handler.
+3. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
    back to `QUEUED` as the next attempt, or ends in `ERROR` (`lease_expired`) on its
    `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses count toward that, never a person's answers:
    a run reviewed ten times still survives four crashes.
-3. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
+4. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
    (once) or ends in `TIMEOUT`, with a webhook event either way.
-4. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
+5. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
    then removed, or rescheduled with backoff.
-5. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
+6. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
    are deleted: the blob, then the record.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole

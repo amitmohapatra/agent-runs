@@ -268,7 +268,8 @@ async with RunsClient() as runs:
 ```
 
 - The lease is renewed every third of `lease_seconds` (60) while the handler runs. A
-  heartbeat refused with `LEASE_LOST` cancels the handler: another worker has the run.
+  heartbeat refused with `LEASE_LOST` cancels the handler: another worker has the run, or
+  it was cancelled or ran past its `deadline` (agent-runs ended it `TIMEOUT`).
 - `concurrency` handlers run at once (default: the CPU count, 1 to 8). An idle worker asks
   again after 0.5 s, doubling to 10 s, jittered.
 - `serve()` stops on SIGTERM or SIGINT: no new claims, the runs held get 25 s to finish,
