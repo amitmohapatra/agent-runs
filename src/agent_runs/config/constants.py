@@ -73,6 +73,17 @@ DEFAULT_LEASE_SECONDS: Final = 60
 #: worker that claims it would otherwise take the fleet down in turn. Only lapses count, not
 #: attempts: a person's answer starts an attempt too, and review rounds are not crashes.
 MAX_LEASE_LAPSES: Final = 5
+#: The wait before a run whose lease lapsed may be claimed again, doubling per lapse up to the
+#: cap (jittered): a run that kills its worker is not handed straight to the next one.
+LAPSE_RETRY_BASE: Final = timedelta(seconds=5)
+LAPSE_RETRY_CAP: Final = timedelta(minutes=1)
+#: Times a queued run that its worker ended ``ERROR`` with a retryable error goes back on the
+#: queue before the error stands: a blip (a model's rate limit, a dependency restarting) is
+#: retried, a failure that keeps coming back is not retried forever.
+MAX_ERROR_RETRIES: Final = 3
+#: The wait before each of those retries, doubling up to the cap (jittered): 10 s, 20 s, 40 s.
+ERROR_RETRY_BASE: Final = timedelta(seconds=10)
+ERROR_RETRY_CAP: Final = timedelta(minutes=10)
 
 # --------------------------------------------------------------------------- the ticker
 

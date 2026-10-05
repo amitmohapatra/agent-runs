@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -32,6 +32,11 @@ from agent_runs.answering import require_may_answer
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     DEFAULT_PAGE,
+    ERROR_RETRY_BASE,
+    ERROR_RETRY_CAP,
+    LAPSE_RETRY_BASE,
+    LAPSE_RETRY_CAP,
+    MAX_ERROR_RETRIES,
     MAX_LEASE_LAPSES,
     PAUSED_ARTIFACT_ROLE,
 )
@@ -48,6 +53,7 @@ from agent_runs.domain.runs import (
     bounded_checkpoint,
 )
 from agent_runs.keys import KeyInfo
+from agent_runs.retry import backoff, jittered
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import ResolutionRow, RunRow
@@ -144,6 +150,8 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     row.status = to.value
     row.updated_at = now
     row.settled_by = None
+    if to is not RunStatus.QUEUED:
+        row.available_at = None
     if to is not RunStatus.RUNNING:
         row.lease_owner = row.lease_expires_at = None
     if to is not RunStatus.PAUSED:
@@ -171,11 +179,36 @@ def _resolution_id(resolution: InterruptResolution) -> str:
     return stable_id(resolution.run_id, resolution.interrupt_id, prefix="res_")
 
 
-def _requeue(row: RunRow, now: datetime) -> None:
-    """Back on the queue for a worker, as the next attempt."""
+def _requeue(row: RunRow, now: datetime, *, wait: timedelta | None = None) -> None:
+    """Back on the queue for a worker, as the next attempt; claimed only once ``wait`` (a
+    retry's backoff) has passed."""
     _move(row, RunStatus.QUEUED, now)
     row.attempt += 1
     row.queued_at = now
+    row.available_at = None if wait is None else now + wait
+
+
+def _retried(row: RunRow, ending: RunFinish) -> bool:
+    """Does this ending put the run back on the queue instead? It does for a durable run (one
+    a worker took from the queue) that failed with a retryable error, ``MAX_ERROR_RETRIES``
+    times at most. A run kept in its caller's process is never retried here."""
+    error = ending.error
+    return (
+        ending.status is RunStatus.ERROR
+        and error is not None
+        and error.retryable
+        and row.status == RunStatus.RUNNING
+        and row.queued_at is not None
+        and row.error_retries < MAX_ERROR_RETRIES
+    )
+
+
+def _counted(error: AgentError | None, retries: int) -> AgentError | None:
+    """The error a run ends with, saying how often agent-runs retried the run before it."""
+    if error is None or not retries:
+        return error
+    retried = f"(after {retries} of {MAX_ERROR_RETRIES} retries)"
+    return error.model_copy(update={"message": f"{error.message} {retried}"})
 
 
 class RunStore:
@@ -382,14 +415,30 @@ class RunStore:
     ) -> tuple[RunRecord, bool]:
         """End the run. Returns ``(run, ended)``: a repeat of the finish that ended it (the
         same caller, the same status) answers the stored run with ``ended`` false, changing
-        nothing, so a worker that never saw the answer may retry."""
+        nothing, so a worker that never saw the answer may retry.
+
+        A durable run its worker ends ``ERROR`` with a retryable error goes back on the queue
+        instead (``_retried``), as the next attempt after a jittered backoff; its
+        ``MAX_ERROR_RETRIES``-th such error stands, saying how often the run was retried. A
+        worker's repeat of that finish answers the requeued run."""
         row = await self._locked(tenant_id, run_id, worker_id=None)
-        if _settled(row, ending.status, worker_id):
+        requeued = (
+            ending.status is RunStatus.ERROR
+            and worker_id is not None
+            and _settled(row, RunStatus.QUEUED, worker_id)
+        )
+        if _settled(row, ending.status, worker_id) or requeued:
             return _record(row, now), False
         _fence(row, worker_id)
+        if _retried(row, ending):
+            row.error_retries += 1
+            wait = backoff(ERROR_RETRY_BASE, row.error_retries, cap=ERROR_RETRY_CAP)
+            _requeue(row, now, wait=jittered(wait))
+            row.settled_by = worker_id
+            return await self._flushed(row, now), True
         _move(row, ending.status, now)
         row.output = ending.output
-        row.error = _json(ending.error)
+        row.error = _json(_counted(ending.error, row.error_retries))
         row.settled_by = worker_id
         await self._ended([row], now)
         return await self._flushed(row, now), True
@@ -398,16 +447,17 @@ class RunStore:
     async def claim(
         self, tenant_id: str, request: ClaimRequest, *, now: datetime
     ) -> Claimed | None:
-        """The oldest queued run of the worker's agents, leased to it; ``None`` when the
-        queue is empty. ``SKIP LOCKED`` is what lets many workers claim at once without two
-        of them ever getting one run: a row another claim holds is passed over, not waited
-        on."""
+        """The oldest queued run of the worker's agents that is available (no retry's
+        backoff still holding it back), leased to it; ``None`` when there is none. ``SKIP
+        LOCKED`` is what lets many workers claim at once without two of them ever getting one
+        run: a row another claim holds is passed over, not waited on."""
         row = await self._session.scalar(
             select(RunRow)
             .where(
                 RunRow.tenant_id == tenant_id,
                 RunRow.status == RunStatus.QUEUED.value,
                 RunRow.agent_id.in_(request.agent_ids),
+                or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
             )
             .order_by(RunRow.queued_at)
             .limit(1)
@@ -513,10 +563,10 @@ class RunStore:
         return [_record(row, now) for row in rows]
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
-        """Runs whose worker stopped heartbeating go back on the queue as the next attempt;
-        one whose lease has now lapsed ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead.
-        Only lapses count: a person's answer starts an attempt too, and is no crash. Returns
-        every run moved."""
+        """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
+        after a short backoff growing with each lapse; one whose lease has now lapsed
+        ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead. Only lapses count: a person's
+        answer starts an attempt too, and is no crash. Returns every run moved."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.lease_expires_at < now,
@@ -537,7 +587,8 @@ class RunStore:
                     )
                 )
             else:
-                _requeue(row, now)
+                wait = backoff(LAPSE_RETRY_BASE, row.lease_lapses, cap=LAPSE_RETRY_CAP)
+                _requeue(row, now, wait=jittered(wait))
         await self._ended(rows, now)
         await self._session.flush()
         return [_record(row, now) for row in rows]

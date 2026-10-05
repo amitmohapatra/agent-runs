@@ -9,10 +9,15 @@ from datetime import timedelta
 from sqlalchemy import text
 from trellis.contracts.ids import now
 
-from agent_runs.config.constants import MAX_CHECKPOINT_BYTES, MAX_LEASE_LAPSES
+from agent_runs.config.constants import (
+    LAPSE_RETRY_BASE,
+    LAPSE_RETRY_CAP,
+    MAX_CHECKPOINT_BYTES,
+    MAX_LEASE_LAPSES,
+)
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore
-from tests.conftest import pause, resolution, started
+from tests.conftest import backoff_passed, pause, resolution, started
 
 
 def claim(worker: str = "w1", agents: tuple[str, ...] = ("triage",), lease: int = 30) -> dict:
@@ -141,25 +146,59 @@ async def test_a_lapsed_lease_puts_the_run_back_on_the_queue_as_the_next_attempt
     await queued(client)
     rid = (await client.post("/v1/runs/claim", json=claim(lease=10))).json()["run"]["run_id"]
 
+    lapsed_at = now() + timedelta(seconds=11)
     async with app.state.sessions() as db:
         assert await RunStore(db).requeue_lapsed(now=now(), limit=10) == [], "not lapsed yet"
-        moved = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=11), limit=10)
+        moved = await RunStore(db).requeue_lapsed(now=lapsed_at, limit=10)
         await db.commit()
     assert [(r.run_id, r.status.value, r.attempt) for r in moved] == [(rid, "QUEUED", 2)]
 
     assert (
         await client.post(f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1"})
     ).status_code == 409
-    again = (await client.post("/v1/runs/claim", json=claim("w2"))).json()
-    assert (again["run"]["run_id"], again["run"]["attempt"]) == (rid, 2)
+    # a short backoff first: a run that kills its worker is not handed straight to the next
+    async with app.state.engine.connect() as conn:
+        available_at = await conn.scalar(
+            text("SELECT available_at FROM agent_runs WHERE run_id = :r"), {"r": rid}
+        )
+    assert lapsed_at + LAPSE_RETRY_BASE / 2 <= available_at <= lapsed_at + LAPSE_RETRY_BASE
+    assert (await client.post("/v1/runs/claim", json=claim("w2"))).status_code == 204
+    async with app.state.sessions() as db:
+        request = ClaimRequest(**claim("w2"))
+        again = await RunStore(db).claim("acme", request, now=available_at)
+        await db.commit()
+    assert again is not None and (again.run.run_id, again.run.attempt) == (rid, 2)
+    assert again.run.status.value == "RUNNING"
 
 
 async def _lapse(app) -> list:
-    """The ticker's lease sweep, past every lease a test hands out."""
+    """The ticker's lease sweep, past every lease a test hands out, and the backoff after."""
     async with app.state.sessions() as db:
         moved = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=10)
         await db.commit()
+    await backoff_passed(app)
     return moved
+
+
+async def test_the_backoff_after_each_lapse_doubles(app, client) -> None:
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()["run"]["run_id"]
+    waits = []
+    for lapses in range(1, MAX_LEASE_LAPSES):
+        lapsed_at = now() + timedelta(seconds=6)
+        async with app.state.sessions() as db:
+            await RunStore(db).requeue_lapsed(now=lapsed_at, limit=10)
+            await db.commit()
+        async with app.state.engine.begin() as conn:
+            available_at = await conn.scalar(
+                text("SELECT available_at FROM agent_runs WHERE run_id = :r"), {"r": rid}
+            )
+            await conn.execute(text("UPDATE agent_runs SET available_at = NULL"))
+        wait = min(LAPSE_RETRY_BASE * 2 ** (lapses - 1), LAPSE_RETRY_CAP)
+        assert wait / 2 <= available_at - lapsed_at <= wait
+        waits.append(wait)
+        await client.post("/v1/runs/claim", json=claim(lease=5))
+    assert waits == sorted(waits)
 
 
 async def test_a_run_whose_lease_keeps_lapsing_ends_in_error(app, client) -> None:
@@ -440,6 +479,7 @@ async def test_a_heartbeat_saves_progress_the_next_attempt_resumes_from(
     assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == journal, "kept"
 
     await ticker.tick(now=now() + timedelta(hours=2))  # the worker died: the lease lapses
+    await backoff_passed(app)
     reclaimed = (await client.post("/v1/runs/claim", json=claim("w2"))).json()["run"]
     assert (reclaimed["run_id"], reclaimed["attempt"]) == (rid, 2)
     assert reclaimed["checkpoint"] == journal

@@ -61,6 +61,9 @@ class RunRow(Base):
     #: the times the run's lease lapsed (its worker stopped heartbeating), which alone decide
     #: when the ticker gives up on it (``MAX_LEASE_LAPSES``)
     lease_lapses: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    #: the times the run went back on the queue after its worker ended it ERROR with a
+    #: retryable error (``MAX_ERROR_RETRIES``)
+    error_retries: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the most working time the run may take (RunStart.timeout_seconds)
@@ -76,6 +79,8 @@ class RunRow(Base):
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: a QUEUED run is not claimed before this (a retry's backoff); null: at once
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(200))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the worker_id whose pause or finish made the current state (null: no worker), so a

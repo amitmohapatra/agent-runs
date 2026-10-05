@@ -14,7 +14,7 @@ from trellis.contracts.errors import ErrorCategory
 from trellis.contracts.ids import now
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import pause, resolution, started
+from tests.conftest import backoff_passed, pause, resolution, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 600}
 
@@ -136,6 +136,7 @@ async def test_the_clock_survives_a_crash(app, client) -> None:
         [requeued] = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=9)
         await db.commit()
     assert 50 <= requeued.worked_seconds < 57
+    await backoff_passed(app)
     again = await _claimed(client)
     assert again["run"]["attempt"] == 2
     assert 3 < again["lease"]["remaining_seconds"] <= 10
