@@ -37,7 +37,7 @@ from trellis.runs.schedules import SchedulesAPI
 from trellis.runs.webhooks import WebhooksAPI, parse_delivery, sign, verify_signature
 from trellis.runs.worker import RELEASED, Job, Worker, WorkerStore
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "RELEASED",

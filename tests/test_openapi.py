@@ -49,7 +49,7 @@ def test_the_export_writes_the_committed_form(tmp_path, capsys) -> None:
 
 def test_the_document_says_what_the_service_is(spec) -> None:
     info = spec["info"]
-    assert (info["title"], info["version"]) == ("agent-runs", "0.3.2")
+    assert (info["title"], info["version"]) == ("agent-runs", "0.4.0")
     assert info["description"].strip() and info["summary"]
     assert info["contact"]["url"] and info["license"]["name"]
     assert spec["servers"]

@@ -1,4 +1,4 @@
-# agent-runs API (0.3.2)
+# agent-runs API (0.4.0)
 
 Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
 same header), a key issued by the Memory Service (the one key registry; see
@@ -40,6 +40,20 @@ queued run's retryable `ERROR` retried later, and a lapsed lease requeued after 
 webhook dead letters (`GET /v1/webhooks/deliveries`, `…/redeliver`), secret rotation
 (`POST /v1/webhooks/{id}/rotate-secret`, two signatures during the overlap) and the address
 guard on subscription URLs.
+
+0.4.0 adds to the wire (trellis-contracts 0.6, ADR 0006 there): interrupts offer labelled
+options (`{value, label, description}`, plain strings still valid), several picks
+(`multiple`), form widget hints (`ui_schema`) and the asker's own screen (`component`,
+`props`), and every answer is checked against them; a resolution carries a `comment` and how
+far an approval reaches (`remember`). A run has a `priority` and a `concurrency_key` that a
+claim honours, a platform key may claim from every tenant (a fair share), and the operator
+may cap a tenant's running runs. A run's events are kept and served from any replica
+(`POST`/`GET /v1/runs/{id}/events`, `GET …/events/stream`). `GET /v1/runs` takes
+`top_level`. A schedule's `timeout_seconds` and `agent_version` go into every run it fires.
+The rate limit is one budget per tenant shared by every replica, and an operator may set a
+run retention. Every new field has a default that keeps the old behaviour; a run store on
+0.3 refuses a body that sets one (the contracts' models refuse unknown fields), so the
+service moves first.
 
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
@@ -88,6 +102,10 @@ request's with `cursor` set, so the filters and the limit carry over. The cursor
 never change, so a record written between two pages is neither skipped nor repeated); one
 this listing did not issue is `422`. Without `cursor`, the first page.
 
+A run's event log (`GET /v1/runs/{id}/events`) is the one exception: it is read by
+position (`after`, the last `position` seen, and `limit`), the number its stream
+(`…/events/stream`) sends as each event's `id`, so a reader moves between the two freely.
+
 Every create that answers `201` says where the new record lives: `Location: /v1/runs/{id}`,
 `/v1/schedules/{id}`, `/v1/webhooks/{id}`, `/v1/artifacts/{id}`. A repeat answered `200`
 carries none.
@@ -102,14 +120,15 @@ carries none.
   the run's row and in every read of it. Anything larger belongs in an artifact.
 - **Checkpoints** are at most 1 MiB (`MAX_CHECKPOINT_BYTES`), **artifacts** at most 50 MiB
   (`MAX_ARTIFACT_BYTES`), streamed to the blob store as they arrive.
-- **Rate.** Each tenant's `/v1` requests draw on a token bucket refilled at
+- **Rate.** Each tenant's `/v1` requests draw on one budget, refilled at
   `RUNS__RATE_LIMIT__PER_MINUTE` (default 3000) a minute and holding at most
   `RUNS__RATE_LIMIT__BURST` (500). Every counted response carries `X-RateLimit-Limit` (the
-  budget a minute) and `X-RateLimit-Remaining`; an empty bucket is `429 RATE_LIMIT` with
-  `Retry-After` (seconds until a token is back). The buckets live in each worker process
-  (agent-runs has no shared cache, and a limiter writing to PostgreSQL on every request
-  would load what it protects), so a tenant really gets the budget times the number of
-  workers and replicas: a guard against a runaway client, not a quota. `0` turns it off.
+  budget a minute) and `X-RateLimit-Remaining`; an empty budget is `429 RATE_LIMIT` with
+  `Retry-After` (seconds until a request is allowed again). The budget is kept in
+  PostgreSQL (`rate_limit_buckets`, one row per tenant, moved by one upsert per request
+  under the database's clock), so every worker of every replica draws on the same one: the
+  limit is the limit, however many replicas run. A platform key claiming from every tenant
+  draws on its own budget (`key:<key_id>`). `0` turns it off.
 - **Compression.** A response of 1 KiB or more is gzipped for a client that sends
   `Accept-Encoding: gzip`, except artifact bytes, served as stored.
 
@@ -123,7 +142,7 @@ sections after the table have the bodies and the exact semantics.
 | Method and path | Body / query | Success | Errors besides `auth` |
 |---|---|---|---|
 | `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
-| `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` | `200 Claimed`, `204` nothing queued | `422` |
+| `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` (a platform key may omit `X-Trellis-Tenant`) | `200 Claimed`, `204` nothing queued that may run now | `422` |
 | `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/release` | `{worker_id, checkpoint?}` | `200 RunRecord` (`QUEUED`; a repeat answers the run) | `404`, `409 LEASE_LOST` not the lease holder or run not `RUNNING`, `413`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
@@ -132,7 +151,10 @@ sections after the table have the bodies and the exact semantics.
 | `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
 | `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
-| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&cursor=&limit=` | `200 [RunSummary]` | `422` |
+| `POST /v1/runs/{id}/events` | `{events: [RunEvent]}` (1–500), `?worker_id=` | `200 {appended, position}` | `404`, `409` not `RUNNING` or leased (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` an event of another run |
+| `GET /v1/runs/{id}/events` | `?after=&limit=` | `200 [RunEventEntry]` | `404`, `422` |
+| `GET /v1/runs/{id}/events/stream` | `?after=`, `Last-Event-ID` | `200 text/event-stream` | `404`, `422` |
+| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
 | `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
@@ -206,7 +228,8 @@ Body: `RunStart` plus `queue`.
 {"tenant_id": "acme", "agent_id": "triage", "run_id": "run_…", "parent_run_id": null,
  "thread_id": null, "user_id": null, "workspace_id": null, "on_behalf_of": null,
  "input": {}, "deadline": null, "timeout_seconds": 600, "idempotency_key": null,
- "agent_version": "2026.10.05-3f2a1c", "metadata": {}, "queue": false}
+ "agent_version": "2026.10.05-3f2a1c", "priority": 0, "concurrency_key": null,
+ "metadata": {}, "queue": false}
 ```
 
 Only `tenant_id` and `agent_id` are required; `run_id` is minted when absent. `queue: false`
@@ -216,7 +239,7 @@ exists answers `200` with the existing run. A run id held by another tenant is `
 CONFLICT` that says only that the id cannot be used, not that or by whom it is held. An
 `idempotency_key` repeated with a different start (any of `agent_id`, `parent_run_id`,
 `thread_id`, `user_id`, `workspace_id`, `on_behalf_of`, `input`, `deadline`,
-`timeout_seconds`, `metadata`, `queue`; not `run_id`, which is minted when absent, nor
+`timeout_seconds`, `priority`, `concurrency_key`, `metadata`, `queue`; not `run_id`, which is minted when absent, nor
 `agent_version`, which a retry from a newer deploy may change) is `409 CONFLICT` with
 `details.differing` naming the fields, and no run. `agent_version` (optional) is kept as the
 first start gave it: which code started the run. `on_behalf_of` must be a principal the key
@@ -239,7 +262,15 @@ run working past its limit, the ticker ends it `TIMEOUT` with
 `run.finished`, and its worker is fenced off as for a deadline. The limit is
 `timeout_seconds` or the operator's `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; with neither
 there is none. Both a deadline and a limit may be set. Every lease answers the working time
-left (`remaining_seconds`), so a worker stops in time.
+left (`remaining_seconds`), so a worker stops in time (the SDK's `Worker` stops its handler
+there and finishes the run `TIMEOUT` with the same `run_timeout` error).
+
+`priority` (`-1000` to `1000`, default `0`) and `concurrency_key` (optional, 1–200
+characters) say how a queued run waits its turn ([the claim](#post-v1runsclaim--200-claimed-or-204)):
+higher priority first, and at most `RUNS__RUNS__CONCURRENCY_PER_KEY` (default 1) of the
+tenant's runs sharing a key `RUNNING` at once, the others waiting `QUEUED`. A run recorded
+`RUNNING` in its caller's process takes its key's place too (it runs), but is never held
+back: only a claim waits.
 
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
@@ -248,8 +279,24 @@ left (`remaining_seconds`), so a worker stops in time.
 ```
 
 `lease_seconds` is 5–3600 (default 60); `agent_ids` 1–100; `worker_id` 1–200 characters
-(surrounding whitespace dropped, blank refused). Takes the oldest `QUEUED` run
-(by `queued_at`) of those agents in the tenant, sets it `RUNNING` and leases it:
+(surrounding whitespace dropped, blank refused). Takes the next `QUEUED` run of those agents
+in the tenant, sets it `RUNNING` and leases it. The next run is, among the available ones
+(no retry's backoff holding it back) **with room**, the one with the highest `priority`,
+then the oldest (`queued_at`). A run has room when fewer than
+`RUNS__RUNS__CONCURRENCY_PER_KEY` (default 1) runs of its tenant sharing its
+`concurrency_key` are `RUNNING`, and its tenant's workers hold fewer runs (`RUNNING` with a
+lease) than `RUNS__RUNS__MAX_RUNNING_PER_TENANT` (unset: no cap). The room is counted again
+under a transaction lock on the key (and on the tenant, when capped), so two claims at once
+never both take the last place; a key or tenant another claim is counting at that moment is
+passed over for this claim, as a locked row is.
+
+**Fair share.** A platform key that sends no `X-Trellis-Tenant` claims from every tenant's
+queue: the run is taken from the tenant whose workers hold the fewest runs of these agents
+(then by priority and age), so a tenant takes more of a shared fleet only while no tenant
+holding fewer has work waiting. Nothing is set for it. The claimed run names its tenant
+(`run.tenant_id`); the worker's heartbeat, pause, finish and appends for it send that tenant
+in `X-Trellis-Tenant` (the SDK's `Worker` does). Such a claim draws on the platform key's own
+rate budget.
 
 ```json
 {"run": {…RunRecord…}, "lease": {"run_id": "run_…", "worker_id": "w-1", "expires_at": "…"}}
@@ -266,8 +313,8 @@ within a tick the ticker puts the run back on the queue as the next attempt, cla
 after a short backoff (5 s, doubling per lapse, at most 1 min, jittered), and on its 5th
 lapse (`MAX_LEASE_LAPSES`) ends it `ERROR` with code `lease_expired` instead. Lapses are
 counted on their own, not by `attempt`, so answering a run many times never brings it closer
-to failing. `204` means nothing is queued (or available yet) for those agents; poll again
-later.
+to failing. `204` means nothing is queued for those agents that may run now (none queued,
+none available yet, or none with room); poll again later.
 
 ### `POST /v1/runs/{id}/heartbeat` → `200 Lease`
 
@@ -376,10 +423,17 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
 ```
 
 `decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`).
+`comment` (optional, any decision) is the reviewer's remark, kept with the resolution.
+`remember` is `once` (default) or `run`: an `APPROVE` of a tool call that also approves calls
+like it for the rest of the run; the harness, which sees the calls, keeps that promise, and
+this service keeps the record.
 **The answer must fit the question** (`trellis.runs.answers`, checked before anything is
-written): an `ANSWER` fits the interrupt's `expects`, or, with no `expects`, is one of its
-`options` when it has some; an `EDIT` of a question (no `tool_call`) carries a `payload` that
-fits `expects`; `APPROVE`, `REJECT` and `CANCEL` carry nothing to check. A misfit is `422
+written): an `ANSWER` fits the interrupt's `expects`, or, with no `expects`, picks among its
+`options` when it has some: one option's `value` (never its `label`), or with `multiple` a
+list of distinct values. An answer the asker's own screen (`component`) collected is held to
+the same. An `EDIT` of a question (no `tool_call`) carries a `payload` that fits `expects`;
+`APPROVE`, `REJECT` and `CANCEL` carry nothing to check, and `remember: "run"` is refused for
+an interrupt that has no tool call. A misfit is `422
 VALIDATION` whose detail says what does not fit, and the run keeps waiting. The
 resolution is kept as `last_resolution`, appended to the run's resolution history in the
 same transaction (`GET /v1/runs/{id}/resolutions`), and:
@@ -481,9 +535,10 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 
 - `GET /v1/runs/{id}` → `RunRecord`, the full record (input, output, error, checkpoint,
   `worked_seconds` counting the stretch it is running now).
-- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&cursor=&limit=` →
+- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` →
   `[RunSummary]`, newest first, paged (`Link`). The inbox is
-  `status=PAUSED&assignee=role:procurement`.
+  `status=PAUSED&assignee=role:procurement`; `top_level=true` keeps only runs with no
+  `parent_run_id`, so a paused sub-agent is not listed next to the parent that waits on it.
 
 ```json
 [{"run_id": "run_…", "agent_id": "triage", "status": "PAUSED",
@@ -494,6 +549,33 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 `awaiting` is the interrupt a paused run waits on (`null` otherwise; its own `deadline` is
 when the answer is due), `assignee` whose inbox it is in, `deadline` the run's own deadline
 (`RunStart.deadline`). Nothing else is in a summary; read the run for the rest.
+
+### Events
+
+A run's events (`RunEvent`: AG-UI's vocabulary plus `CONTEXT_LOADED` and `INTERRUPT`) are
+kept in the run's log, so any replica serves any run's events.
+
+- `POST /v1/runs/{id}/events?worker_id=` with `{"events": [RunEvent, …]}` (1–500) →
+  `{"appended": 2, "position": 7}`. Only while the run is `RUNNING`, fenced as a heartbeat
+  is: by the worker holding its lease (`worker_id`), or, when no worker holds it (a run in
+  its caller's process), by a call that names none; `409` otherwise (`LEASE_LOST` for a
+  worker). Each event must name this run and tenant (`422`). Each takes the next `position`
+  (1, 2, …), assigned under the run's row lock, so positions are never committed out of
+  order. An event already logged (the same `attempt` and `sequence`) is not added again: a
+  retried append is safe. Append before pausing or finishing: the log takes nothing after.
+- `GET /v1/runs/{id}/events?after=&limit=` → `[{"position": 3, "event": RunEvent}]`, the
+  events past `after` (default 0), oldest first.
+- `GET /v1/runs/{id}/events/stream?after=` → `text/event-stream`: the events past `after`
+  (or the `Last-Event-ID` header, whichever is larger), then each new one as it is appended
+  to any replica, as `id: <position>`, `event: <type>`, `data: <the entry as JSON>`. Once
+  the run has ended and its last event was sent: `event: end` with `data: {"status": …}`, and
+  the stream closes. A paused run's stream stays open. A comment (`: keepalive`) every 15 s
+  keeps idle connections open; after 5 minutes the service closes the stream without `end`,
+  and the client reconnects with the last position (an `EventSource` does on its own; the
+  SDK's `stream_events` does). Each look for new events is a short read of its own, every
+  0.5 s: a stream holds no database connection while it waits.
+
+The log is deleted with its run ([run retention](#run-retention)).
 
 ## Artifacts
 
@@ -549,6 +631,13 @@ When a run ends (`finish`, `cancel`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` aft
 until then they are still readable. The ticker deletes each expired artifact's blob, then its record; a blob
 that cannot be deleted keeps its record for the next tick.
 
+### Run retention
+
+Runs are kept forever unless the operator sets `RUNS__RUNS__RETENTION_DAYS`. Then the
+ticker deletes the runs that ended (`SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`,
+`REJECTED`) longer ago than that, with their resolutions and their event log; a run whose
+artifacts are still kept is deleted after them. A deleted run is `404` like any other.
+
 ## Schedules
 
 A schedule fires runs as `on_behalf_of`, the person who set it, while nobody is present.
@@ -562,8 +651,12 @@ Body: a `ScheduleSpec` (`created_by` is refused; it is the key's principal):
 ```json
 {"tenant_id": "acme", "agent_id": "briefing", "name": "morning briefing",
  "cadence": "0 8 * * 1-5", "timezone": "Europe/Berlin", "on_behalf_of": "user_ada",
- "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true, "metadata": {}}
+ "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true,
+ "timeout_seconds": 600, "agent_version": "2026.10.05-3f2a1c", "metadata": {}}
 ```
+
+`timeout_seconds` and `agent_version` (optional) are copied into the `RunStart` of every run
+the schedule fires: its working-time limit and which code set the schedule up.
 
 `cadence` is `hourly | daily | weekly | weekdays | manual` (local midnight; weekly on Monday;
 `manual` never fires on its own) or a cron expression firing at most once an hour.
@@ -587,8 +680,8 @@ deleting one needs a key that may act as its `on_behalf_of` (`404` before `403`)
 
 ### `PATCH /v1/schedules/{id}` → `Schedule`
 
-Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, metadata`
-(`metadata` is merged). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
+Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, timeout_seconds,
+agent_version, metadata` (`metadata` is merged; `null` removes a limit or a version). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
 cadence or zone re-arms the next fire. A change that would give the schedule the identity of
 another one is `409`.
 

@@ -91,7 +91,7 @@ are grouped:
 | Operation | Call | Answers |
 |---|---|---|
 | `runs.start` | `start(start, *, queue=False)` | `RunRecord` (the existing one for a repeated `run_id` or `idempotency_key`) |
-| `runs.claim` | `claim(worker_id, agent_ids, *, lease_seconds=60)` | `Claimed` (`run`, `lease`), or `None` when nothing is queued |
+| `runs.claim` | `claim(worker_id, agent_ids, *, lease_seconds=60)` | `Claimed` (`run`, `lease`): the highest `priority`, then the oldest, with room under its `concurrency_key`; or `None` when none may run now. A platform key with no tenant claims from every tenant, fairly |
 | `runs.heartbeat` | `heartbeat(run_id, worker_id, *, lease_seconds=60, checkpoint=None)` | `Lease` (`remaining_seconds`, `cancel_requested`) |
 | `runs.release` | `release(run_id, worker_id, *, checkpoint=None)` | `RunRecord` (`QUEUED` for another worker) |
 | `runs.pause` | `pause(interrupt, *, checkpoint=None, worker_id=None)` | `RunRecord` (`PAUSED`) |
@@ -99,9 +99,12 @@ are grouped:
 | `runs.cancel` | `cancel(run_id, *, reason=None)` | `RunRecord` (`CANCELLED`, or `RUNNING` until its worker stops) |
 | `runs.finish` | `finish(run_id, status, *, output=None, error=None, worker_id=None)` | `RunRecord` (`QUEUED` when a retryable `ERROR` is retried) |
 | `runs.get` | `get(run_id)` | `RunRecord`, or `None` |
-| `runs.list` | `list(*, status, assignee, agent_id, thread_id, parent_run_id, cursor, limit=50)` | `Page[RunSummary]` |
+| `runs.list` | `list(*, status, assignee, agent_id, thread_id, parent_run_id, top_level=False, cursor, limit=50)` | `Page[RunSummary]` (`top_level=True`: no sub-agents) |
 | | `iterate(..., max_pages=None)` | every `RunSummary`, page after page |
 | `runs.resolutions` | `resolutions(run_id, *, cursor, limit=50)` | `Page[ResolutionEntry]` |
+| `runs.append_events` | `append_events(run_id, events, *, worker_id=None)` | `EventsAppended` (`appended`, the log's last `position`); a repeated event is stored once |
+| `runs.events` | `events(run_id, *, after=0, limit=50)` | `list[RunEventEntry]` (`position`, `event`) |
+| `runs.stream_events` | `stream_events(run_id, *, after=0)` | an async iterator of `RunEventEntry`, live, until the run has ended; it reconnects from the last position on its own |
 | `artifacts.upload` | `artifacts.upload(run_id, data, *, mime_type="application/json", worker_id=None)` | `ArtifactRef` (its SHA-256 is sent and checked) |
 | `artifacts.download` | `artifacts.download(artifact_id)` | `bytes`, or `None` |
 | `schedules.*` | `schedules.create(spec)`, `list(...)`, `get(id)`, `update(id, ScheduleUpdate(...))`, `delete(id)`, `fire(id, *, at=None)` | `Schedule`, `Page[Schedule]`, `Schedule` or `None`, `Schedule`, `None`, `FireResult` |
@@ -148,8 +151,10 @@ async with RunsClient() as runs:
             status=RunStatus.PAUSED, assignee="role:procurement", cursor=page.next_cursor
         )
 
-    # or every page (at most ten here):
-    async for summary in runs.iterate(status=RunStatus.PAUSED, assignee="user:alice", max_pages=10):
+    # or every page (at most ten here), without the sub-agents a paused parent waits on:
+    async for summary in runs.iterate(
+        status=RunStatus.PAUSED, assignee="user:alice", top_level=True, max_pages=10
+    ):
         ...
 ```
 
@@ -157,6 +162,30 @@ A summary carries the question (`awaiting`); read the run with `get` for its inp
 checkpoint and output, and the audit trail with `resolutions`. A large payload to review (a
 table, a diff) is an artifact: the interrupt's `payload_ref` is its `ArtifactRef`, and
 `runs.artifacts.download(ref.artifact_id)` its bytes.
+
+A question's options are plain strings or `Option(value, label, description)`
+(`trellis.contracts.runs`); the answer carries the value, and with `multiple=True` a list of
+values. `component` and `props` name the asker's own screen (render `ui` when you have none),
+and `ui_schema` gives form widget hints for `expects`. A resolution may carry a `comment`,
+and an approval of a tool call `remember="run"` (approve calls like it for the rest of the
+run). `trellis.runs.answers.answer_problem(interrupt, resolution)` says, before you send it,
+whether agent-runs will take the answer (it answers `422` otherwise).
+
+## A run's events, from any replica
+
+The worker running a run appends its `RunEvent`s; anyone with a key of the tenant reads or
+follows them, whichever replica they reach:
+
+```python
+await runs.append_events(job.record.run_id, events, worker_id=job.worker_id)  # in a handler
+
+async for entry in runs.stream_events(run_id):  # a UI backend: live, to the end of the run
+    print(entry.position, entry.event.type, entry.event.data)
+```
+
+Append while the run runs, before pausing or finishing it; a retried append adds nothing.
+`events(run_id, after=n)` reads the log from a position; `stream_events` yields the log and
+then each new event, reconnecting from the last position it yielded.
 
 Any key of the tenant reads every inbox, but answering is checked. A key that may act for
 anyone (the default) or an admin key answers any run. A key restricted to listed people
@@ -309,8 +338,10 @@ async with RunsClient() as runs:
   it ran past its `deadline` or its working-time limit (agent-runs ended it `TIMEOUT`).
 - `job.remaining_seconds` is the working time the run has left now (its `timeout_seconds`
   or the operator's maximum, the lesser, less what every attempt worked; `None` without a
-  limit), kept current by every lease. Bound your own steps by it to stop in time; past it
-  agent-runs ends the run `TIMEOUT` and the next heartbeat cancels the handler.
+  limit), kept current by every lease. The worker stops a handler still running when the
+  time the claim gave is used up and finishes the run `TIMEOUT` (`run_timeout`, not
+  retried); bound your own steps by it to end cleanly first. A `TimeoutError` of your own
+  (a model call) still ends the run `ERROR`.
 - Cancelling a run (`runs.cancel(run_id, reason=...)`, from anywhere) reaches its worker
   through the next heartbeat (`cancel_requested`): the handler is cancelled and the worker
   finishes the run `CANCELLED`. In the handler, `job.cancel_requested` tells that
@@ -335,7 +366,9 @@ async with RunsClient() as runs:
   was lost they raise `LeaseLostError`. A handler that records a cancellation as the run's
   ending checks for `RELEASED in exc.args` and writes nothing then.
 - `store` is anything with `claim`, `heartbeat`, `release`, `pause` and `finish` as
-  `RunsClient` has them (the `WorkerStore` protocol). `tenant=` names the tenant a platform key claims for.
+  `RunsClient` has them (the `WorkerStore` protocol). `tenant=` names the tenant a platform
+  key claims for; a platform key with none serves every tenant, the one whose workers hold
+  the fewest runs first, and each run's later calls name its own tenant.
 
 ## Errors and retries
 
