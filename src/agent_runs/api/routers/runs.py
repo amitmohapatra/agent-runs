@@ -28,6 +28,7 @@ from agent_runs.domain.runs import (
     HeartbeatRequest,
     Lease,
     ResolutionEntry,
+    RunCancel,
     RunCreate,
     RunFinish,
     RunPause,
@@ -237,6 +238,48 @@ async def resume(
         who.tenant_id, run_id, body, answerer=who.credential, now=at
     )
     if resumed:
+        await WebhookStore(db).announce(run, now=at)
+    await db.commit()
+    return run
+
+
+@router.post(
+    "/{run_id}/cancel",
+    summary="Cancel a run, whatever its status",
+    response_description="The run: `CANCELLED`, or `RUNNING` with its cancel asked of the "
+    "worker holding it; for a repeat, the run as it is.",
+    responses={
+        403: {
+            "description": "AUTHORIZATION: the key may not cancel this run: the keys that may "
+            "answer it may cancel it (a key restricted to listed people, only a run assigned "
+            "to one of them or to nobody). Or the key registry refuses the key, or "
+            "X-Trellis-Tenant names a tenant the key may not act for."
+        },
+        **conflict("CONFLICT: the run already ended (other than by this very cancel)."),
+    },
+)
+async def cancel(
+    run_id: RunId,
+    body: Annotated[RunCancel, Body(openapi_examples=examples.CANCEL)],
+    db: Session,
+    who: Who,
+) -> RunRecord:
+    """Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or
+    ``PAUSED`` run, and a ``RUNNING`` one no worker holds (kept in its caller's process),
+    ends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING`` run a worker
+    holds is asked to stop: the worker's next heartbeat answers ``cancel_requested: true``
+    and no longer extends its lease; the worker finishes the run ``CANCELLED``, and if it
+    has not when the lease runs out, the ticker cancels the run.
+
+    Who may cancel: the keys that may answer the run (``resume``), checked against its
+    assignee now, before anything is written; 403 otherwise. A cancel already asked for, or
+    repeated after the run was cancelled by the same principal for the same reason, answers
+    the run as it is; an ended run is otherwise 409."""
+    at = now()
+    run, changed = await RunStore(db).cancel(
+        who.tenant_id, run_id, body, canceller=who.credential, now=at
+    )
+    if changed:
         await WebhookStore(db).announce(run, now=at)
     await db.commit()
     return run

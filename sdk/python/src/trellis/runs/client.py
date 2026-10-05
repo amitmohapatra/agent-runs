@@ -175,6 +175,21 @@ class RunsClient:
         )
         return RunRecord.model_validate(data)
 
+    async def cancel(
+        self, run_id: str, *, reason: str | None = None, tenant: str | None = None
+    ) -> RunRecord:
+        """Cancel the run, whatever its status, keeping ``reason`` with it. A queued or
+        waiting run (or one in its caller's process) is ``CANCELLED`` at once; a run a worker
+        holds stays ``RUNNING`` until its worker stops (its next heartbeat says
+        ``cancel_requested``; :class:`Worker` cancels the handler and finishes the run
+        ``CANCELLED``), or agent-runs cancels it when the lease runs out. The keys that may
+        answer a run may cancel it (:class:`AuthorizationError` otherwise); an ended run
+        raises :class:`ConflictError`. Safe to retry."""
+        data = await self._transport.json(
+            "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json={"reason": reason}
+        )
+        return RunRecord.model_validate(data)
+
     async def finish(
         self,
         run_id: str,

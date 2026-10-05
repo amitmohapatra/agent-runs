@@ -1,6 +1,8 @@
 """Who may answer a paused run: the one rule ``POST /v1/runs/{run_id}/resume`` applies, under
 the run's lock and before anything is written, to the assignee the run waits on now (an
-escalation may have moved it). A ``CANCEL`` is an answer like any other.
+escalation may have moved it). A ``CANCEL`` is an answer like any other, and who may answer
+a run may cancel it, whatever its status (``POST /v1/runs/{run_id}/cancel``; a run that is
+not paused is assigned to nobody).
 
 1. A key that administers the tenant (``admin``, or the operator's ``platform`` key) answers
    any run.
@@ -57,3 +59,10 @@ def require_may_answer(key: KeyInfo, assignee: str | None, reviewer: str | None)
             f"the run is assigned to {assigned}, not {answering}; this key may act only for "
             f"{allowed}"
         )
+
+
+def require_may_cancel(key: KeyInfo, assignee: str | None) -> None:
+    """Refuse (403) a key that could not answer a run assigned to ``assignee`` as any
+    principal it may act for: who may answer a run may cancel it."""
+    as_assignee = assignee if assignee and key.may_act_for(as_principal(assignee)) else None
+    require_may_answer(key, assignee, as_assignee)

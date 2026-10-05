@@ -86,6 +86,11 @@ class RunRow(Base):
     #: the worker_id whose pause or finish made the current state (null: no worker), so a
     #: repeat of that call answers the stored run instead of a conflict
     settled_by: Mapped[str | None] = mapped_column(String(200))
+    #: when someone asked to cancel the run while a worker held it; set only while RUNNING
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: why the run was cancelled (POST /v1/runs/{run_id}/cancel), and the principal who asked
+    cancel_reason: Mapped[str | None] = mapped_column(String(1000))
+    cancelled_by: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
 

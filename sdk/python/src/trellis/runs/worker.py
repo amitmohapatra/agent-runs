@@ -15,14 +15,17 @@ cannot write over a run another worker has since claimed::
 A claimed run is leased to this worker; a heartbeat extends the lease every third of it while
 the handler runs, and a worker that dies lets the lease lapse, after which agent-runs queues
 the run again as its next attempt. A heartbeat refused with ``LEASE_LOST`` (the lease lapsed
-and another worker took the run, or the run was cancelled or ran past its deadline) cancels
-the handler: it must write nothing more. Schedules and resumed durable runs arrive the same
-way: as queued runs.
+and another worker took the run, or the run ended: past its deadline or its working time)
+cancels the handler: it must write nothing more. A heartbeat that says ``cancel_requested``
+(someone cancelled the run: ``RunsClient.cancel``) cancels the handler too, and the worker
+then finishes the run ``CANCELLED`` (:attr:`Job.cancel_requested` tells the handler why it
+was cancelled). Schedules and resumed durable runs arrive the same way: as queued runs.
 
 A handler that raises (anything but a lost lease or a cancellation) ends its run at once as
 ``ERROR``, the exception recorded as the contracts classify it (``AgentError.of``: its code,
 category and whether it is retryable), instead of leaving the run to wait for its lease to
-lapse. Should that finish fail too (agent-runs unreachable), the lease lapses as for a dead
+lapse; agent-runs puts a run whose error is retryable back on the queue for a later attempt.
+Should that finish fail too (agent-runs unreachable), the lease lapses as for a dead
 worker.
 
 An idle worker asks again after a growing pause (exponential, jittered, at most
@@ -148,6 +151,14 @@ class Job:
         if lease is None or lease.remaining_seconds is None:
             return None
         return max(0.0, lease.remaining_seconds - (_clock() - self._renewed.at))
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Someone asked to cancel the run (a heartbeat said so). The worker cancels the
+        handler and finishes the run ``CANCELLED``; a handler that records the cancellation
+        itself checks this to tell it from a lost lease."""
+        lease = self._renewed.lease
+        return lease is not None and lease.cancel_requested
 
     def _renew(self, lease: Lease) -> None:
         """Take in a lease agent-runs answered for the run (the worker calls it)."""
@@ -357,27 +368,31 @@ class Worker:
         except asyncio.CancelledError:
             if not execution.cancelled():
                 raise
+            if job.cancel_requested:
+                await self._end(job, RunStatus.CANCELLED)
         except LeaseLostError:
             log.warning("lease on %s lost while the handler wrote: stopped it", record.run_id)
         except Exception as exc:
             log.exception("run %s failed in the worker", record.run_id)
-            await self._fail(job, exc)
+            await self._end(job, RunStatus.ERROR, error=AgentError.of(exc))
         finally:
             self._held.pop(record.run_id, None)
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
 
-    async def _fail(self, job: Job, exc: Exception) -> None:
-        """End the run ``ERROR`` with what its handler raised; when even that is refused or
-        cannot be sent, its lease lapses and agent-runs takes the run back."""
+    async def _end(self, job: Job, status: RunStatus, *, error: AgentError | None = None) -> None:
+        """End the run for its handler: ``ERROR`` with what it raised, or ``CANCELLED`` as
+        asked (a repeat when the handler recorded it). When even that is refused or cannot
+        be sent, its lease lapses and agent-runs takes the run back (or cancels it)."""
         try:
-            await job.finish(RunStatus.ERROR, error=AgentError.of(exc))
-        except Exception as error:
+            await job.finish(status, error=error)
+        except Exception as refused:
             log.warning(
-                "run %s could not be ended as ERROR (%s): its lease lapses instead",
+                "run %s could not be ended as %s (%s): its lease lapses instead",
                 job.record.run_id,
-                error,
+                status.value,
+                refused,
             )
 
     async def _heartbeat(self, job: Job, execution: asyncio.Future[object]) -> None:
@@ -399,3 +414,7 @@ class Worker:
                 log.warning("heartbeat for %s failed: %s", record.run_id, exc)
             else:
                 job._renew(lease)
+                if lease.cancel_requested:
+                    log.warning("run %s cancelled: stopping it", record.run_id)
+                    execution.cancel()
+                    return

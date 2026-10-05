@@ -40,7 +40,9 @@ class Lease(BaseModel):
     """A worker's hold on a running run, until ``expires_at`` unless it heartbeats.
     ``remaining_seconds`` is the working time the run had left when the lease was given (its
     ``timeout_seconds`` or the service's maximum, the lesser, less what it worked; ``None``:
-    no limit): past it agent-runs ends the run ``TIMEOUT``."""
+    no limit): past it agent-runs ends the run ``TIMEOUT``. ``cancel_requested``: someone
+    asked to cancel the run; stop and finish it ``CANCELLED`` (the lease is no longer
+    extended, and agent-runs cancels the run when it runs out)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -48,6 +50,7 @@ class Lease(BaseModel):
     worker_id: str
     expires_at: datetime
     remaining_seconds: float | None = None
+    cancel_requested: bool = False
 
 
 class Claimed(BaseModel):

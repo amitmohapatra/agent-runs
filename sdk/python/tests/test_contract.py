@@ -107,6 +107,7 @@ ANSWERS: dict[str, tuple[int, Any]] = {
     "runs.heartbeat": (200, lease()),
     "runs.pause": (200, record(status="PAUSED")),
     "runs.resume": (200, record()),
+    "runs.cancel": (200, record(status="CANCELLED")),
     "runs.finish": (200, record(status="SUCCESS", output={"po": "PO-17"})),
     "runs.get": (200, record()),
     "runs.list": (200, []),
@@ -194,6 +195,8 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
             interrupt_id="int_1", run_id="run_1", decision=InterruptDecision.EDIT, payload={"a": 1}
         )
         await runs.resume(answer)
+        await runs.cancel("run_1", reason="the customer withdrew the request")
+        await runs.cancel("run_1")
         await runs.finish("run_1", RunStatus.SUCCESS, output={"po": "PO-17"}, worker_id="w-1")
         failed = AgentError(code="ToolFailed", category=ErrorCategory.TOOL, message="no")
         await runs.finish("run_1", RunStatus.ERROR, error=failed)

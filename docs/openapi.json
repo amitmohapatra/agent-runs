@@ -671,6 +671,12 @@
       "Lease": {
         "description": "A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what\nthe worker must know to stop in time: the working time the run has left.",
         "properties": {
+          "cancel_requested": {
+            "default": false,
+            "description": "Someone asked to cancel the run: stop working it and finish it CANCELLED. The lease is no longer extended; when it runs out the ticker cancels the run.",
+            "title": "Cancel Requested",
+            "type": "boolean"
+          },
           "expires_at": {
             "description": "When the lease lapses without a heartbeat.",
             "format": "date-time",
@@ -822,6 +828,27 @@
           "recorded_at"
         ],
         "title": "ResolutionEntry",
+        "type": "object"
+      },
+      "RunCancel": {
+        "additionalProperties": false,
+        "description": "Why a run is cancelled: kept with the run, with the principal of the key that asked.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the run is cancelled (optional).",
+            "title": "Reason"
+          }
+        },
+        "title": "RunCancel",
         "type": "object"
       },
       "RunCreate": {
@@ -4363,6 +4390,403 @@
         "summary": "Store an artifact of a run",
         "tags": [
           "artifacts"
+        ]
+      }
+    },
+    "/v1/runs/{run_id}/cancel": {
+      "post": {
+        "description": "Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or\n``PAUSED`` run, and a ``RUNNING`` one no worker holds (kept in its caller's process),\nends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING`` run a worker\nholds is asked to stop: the worker's next heartbeat answers ``cancel_requested: true``\nand no longer extends its lease; the worker finishes the run ``CANCELLED``, and if it\nhas not when the lease runs out, the ticker cancels the run.\n\nWho may cancel: the keys that may answer the run (``resume``), checked against its\nassignee now, before anything is written; 403 otherwise. A cancel already asked for, or\nrepeated after the run was cancelled by the same principal for the same reason, answers\nthe run as it is; an ended run is otherwise 409.",
+        "operationId": "runs.cancel",
+        "parameters": [
+          {
+            "description": "The run's id (`run_…`, or the caller's own).",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "The run's id (`run_…`, or the caller's own).",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "plain": {
+                  "summary": "Cancel",
+                  "value": {}
+                },
+                "why": {
+                  "summary": "Cancel, saying why",
+                  "value": {
+                    "reason": "the customer withdrew the request"
+                  }
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/RunCancel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunRecord"
+                }
+              }
+            },
+            "description": "The run: `CANCELLED`, or `RUNNING` with its cancel asked of the worker holding it; for a repeat, the run as it is.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key may not cancel this run: the keys that may answer it may cancel it (a key restricted to listed people, only a run assigned to one of them or to nobody). Or the key registry refuses the key, or X-Trellis-Tenant names a tenant the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "CONFLICT",
+                  "detail": "run run_01J8 cannot move from SUCCESS to CANCELLED",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 409,
+                  "title": "Conflict",
+                  "type": "urn:trellis:problem:conflict"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "CONFLICT: the run already ended (other than by this very cancel).",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "PAYLOAD_TOO_LARGE",
+                  "detail": "the body is larger than 4194304 bytes",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 413,
+                  "title": "Payload too large",
+                  "type": "urn:trellis:problem:payload-too-large"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/cancel",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Cancel a run, whatever its status",
+        "tags": [
+          "runs"
         ]
       }
     },

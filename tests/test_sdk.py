@@ -214,6 +214,35 @@ async def test_a_run_past_its_deadline_stops_the_workers_handler(
     assert done.error is not None and done.error.code == "run_deadline"
 
 
+async def test_a_run_cancelled_while_a_worker_runs_it_ends_cancelled(
+    runs: RunsClient, monkeypatch
+) -> None:
+    """``RunsClient.cancel`` asks; the worker's next heartbeat hears it, cancels the handler
+    (which can tell it was cancelled, not lost) and finishes the run ``CANCELLED``."""
+    from trellis.runs import worker as worker_module
+
+    async def soon(seconds: float) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(worker_module, "_sleep", soon)
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+    told: list[bool] = []
+
+    async def handler(job: Job) -> None:
+        asked = await runs.cancel(job.record.run_id, reason="withdrawn", tenant="acme")
+        assert asked.status is RunStatus.RUNNING
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            told.append(job.cancel_requested)
+            raise
+
+    assert await Worker(runs, handler, ["triage"], tenant="acme").run_once()
+    assert told == [True]
+    done = await runs.get(queued.run_id, tenant="acme")
+    assert done is not None and done.status is RunStatus.CANCELLED
+
+
 async def test_schedules_through_the_sdk(runs: RunsClient) -> None:
     spec = ScheduleSpec(
         tenant_id="acme",

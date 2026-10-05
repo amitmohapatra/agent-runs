@@ -114,6 +114,14 @@ FINISH: Final[dict[str, Any]] = {
     "cancel": {"summary": "Cancel a queued or waiting run", "value": {"status": "CANCELLED"}},
 }
 
+CANCEL: Final[dict[str, Any]] = {
+    "why": {
+        "summary": "Cancel, saying why",
+        "value": {"reason": "the customer withdrew the request"},
+    },
+    "plain": {"summary": "Cancel", "value": {}},
+}
+
 SCHEDULE: Final[dict[str, Any]] = {
     "weekday_briefing": {
         "summary": "A weekday morning briefing, as Ada",

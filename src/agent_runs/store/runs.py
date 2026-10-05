@@ -28,7 +28,7 @@ from trellis.contracts.runs import (
 )
 from trellis.runs.answers import answer_problem, schema_problem
 
-from agent_runs.answering import require_may_answer
+from agent_runs.answering import require_may_answer, require_may_cancel
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     DEFAULT_PAGE,
@@ -47,6 +47,7 @@ from agent_runs.domain.runs import (
     HeartbeatRequest,
     Lease,
     ResolutionEntry,
+    RunCancel,
     RunFinish,
     RunPause,
     RunSummary,
@@ -153,7 +154,7 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     if to is not RunStatus.QUEUED:
         row.available_at = None
     if to is not RunStatus.RUNNING:
-        row.lease_owner = row.lease_expires_at = None
+        row.lease_owner = row.lease_expires_at = row.cancel_requested_at = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.assignee = row.awaiting_deadline = None
     if to.final:
@@ -200,7 +201,17 @@ def _retried(row: RunRow, ending: RunFinish) -> bool:
         and row.status == RunStatus.RUNNING
         and row.queued_at is not None
         and row.error_retries < MAX_ERROR_RETRIES
+        and row.cancel_requested_at is None
     )
+
+
+def _cancelled_instead(row: RunRow, now: datetime) -> bool:
+    """A running run whose cancel was asked for ends ``CANCELLED`` where it would otherwise
+    pause or go back on the queue: a worker that lets go of it lets go for good."""
+    if row.cancel_requested_at is None:
+        return False
+    _move(row, RunStatus.CANCELLED, now)
+    return True
 
 
 def _counted(error: AgentError | None, retries: int) -> AgentError | None:
@@ -308,9 +319,9 @@ class RunStore:
     ) -> tuple[RunRecord, bool]:
         """The run waits on ``pause.interrupt``, whose ``expects`` must be a JSON Schema
         (``Unprocessable`` otherwise: a question nobody could answer fails where it is
-        asked). Returns ``(run, paused)``: a repeat of the pause that made the current state
-        (the same caller, the same interrupt) answers the stored run with ``paused`` false,
-        changing nothing."""
+        asked); a run whose cancel was asked for ends ``CANCELLED`` instead. Returns ``(run,
+        paused)``: a repeat of the pause that made the current state (the same caller, the
+        same interrupt) answers the stored run with ``paused`` false, changing nothing."""
         interrupt = pause.interrupt
         if (interrupt.tenant_id, interrupt.run_id) != (tenant_id, run_id):
             raise Unprocessable("the interrupt belongs to another run")
@@ -322,6 +333,10 @@ class RunStore:
         if _settled(row, RunStatus.PAUSED, worker_id) and waiting_on == interrupt.interrupt_id:
             return _record(row, now), False
         _fence(row, worker_id)
+        if _cancelled_instead(row, now):
+            row.settled_by = worker_id
+            await self._ended([row], now)
+            return await self._flushed(row, now), True
         _move(row, RunStatus.PAUSED, now)
         row.checkpoint = checkpoint
         row.awaiting = interrupt.awaiting()
@@ -403,6 +418,41 @@ class RunStore:
             )
         )
         return kept == _json(resolution)
+
+    async def cancel(
+        self,
+        tenant_id: str,
+        run_id: str,
+        cancel: RunCancel,
+        *,
+        canceller: KeyInfo,
+        now: datetime,
+    ) -> tuple[RunRecord, bool]:
+        """Cancel the run, whatever its status, as ``canceller`` may: a key that may answer
+        it (``answering.py``, against its assignee now), checked before anything is
+        written. Why and who asked are kept with the run.
+
+        A queued or waiting run, and a running one no worker holds (kept in its caller's
+        process), ends ``CANCELLED`` at once. A run a worker holds is asked to stop
+        (``cancel_requested_at``): from then on its heartbeats say ``cancel_requested`` and
+        no longer extend the lease, the worker finishes it ``CANCELLED``, and if it has not
+        when the lease runs out, the ticker cancels it (``requeue_lapsed``).
+
+        Returns ``(run, changed)``: a cancel already asked for, or the run already cancelled
+        by the same principal for the same reason (a retried request), answers the run as it
+        is with ``changed`` false. An ended run is otherwise a ``Conflict``."""
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        require_may_cancel(canceller, row.assignee)
+        asked = (row.cancelled_by, row.cancel_reason) == (canceller.principal, cancel.reason)
+        if row.cancel_requested_at is not None or (row.status == RunStatus.CANCELLED and asked):
+            return _record(row, now), False
+        if row.status == RunStatus.RUNNING and row.lease_owner is not None:
+            row.cancel_requested_at = row.updated_at = now
+        else:
+            _move(row, RunStatus.CANCELLED, now)
+            await self._ended([row], now)
+        row.cancel_reason, row.cancelled_by = cancel.reason, canceller.principal
+        return await self._flushed(row, now), True
 
     async def finish(
         self,
@@ -487,8 +537,12 @@ class RunStore:
         return lease
 
     def _lease(self, row: RunRow, worker_id: str, seconds: int, now: datetime) -> Lease:
-        """Lease the run to ``worker_id`` for ``seconds``, telling it the working time left."""
-        expires_at = now + timedelta(seconds=seconds)
+        """Lease the run to ``worker_id`` for ``seconds``, telling it the working time left,
+        and whether it was asked to cancel the run: then the lease runs from the request, not
+        from now, so the run is cancelled within one lease even by a worker that ignores
+        it."""
+        cancelling = row.cancel_requested_at
+        expires_at = (cancelling or now) + timedelta(seconds=seconds)
         row.lease_owner, row.lease_expires_at = worker_id, expires_at
         limit = self._limit(row)
         remaining = None if limit is None else max(0.0, limit - _worked(row, now))
@@ -497,6 +551,7 @@ class RunStore:
             worker_id=worker_id,
             expires_at=expires_at,
             remaining_seconds=remaining,
+            cancel_requested=cancelling is not None,
         )
 
     # ------------------------------------------------------------------ the ticker's sweeps
@@ -565,8 +620,9 @@ class RunStore:
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
         after a short backoff growing with each lapse; one whose lease has now lapsed
-        ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead. Only lapses count: a person's
-        answer starts an attempt too, and is no crash. Returns every run moved."""
+        ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead, and one whose cancel was asked
+        for ends ``CANCELLED``. Only lapses count: a person's answer starts an attempt too,
+        and is no crash. Returns every run moved."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.lease_expires_at < now,
@@ -574,6 +630,8 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
+            if _cancelled_instead(row, now):
+                continue
             row.lease_lapses += 1
             if row.lease_lapses >= MAX_LEASE_LAPSES:
                 _move(row, RunStatus.ERROR, now)

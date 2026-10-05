@@ -49,8 +49,9 @@ class Store:
         self.claim_error: Exception | None = None
         self.beat_error: Exception | None = None
         self.finish_error: Exception | None = None
-        #: the working time left that every lease reports
+        #: the working time left that every lease reports, and whether a cancel was asked
         self.remaining: float | None = None
+        self.cancelling = False
         #: set on every claim and heartbeat, for a test waiting until enough of them came
         self.changed = asyncio.Event()
 
@@ -92,7 +93,11 @@ class Store:
         if self.beat_error is not None:
             raise self.beat_error
         return Lease(
-            run_id=run_id, worker_id=worker_id, expires_at=NOW, remaining_seconds=self.remaining
+            run_id=run_id,
+            worker_id=worker_id,
+            expires_at=NOW,
+            remaining_seconds=self.remaining,
+            cancel_requested=self.cancelling,
         )
 
     async def pause(
@@ -331,6 +336,40 @@ async def test_a_lost_lease_cancels_the_handler(caplog: pytest.LogCaptureFixture
         assert await Worker(store, handler, ["triage"]).run_once()
     assert cancelled.is_set() and len(store.beats) == 1
     assert "lease on run_1 lost: stopping it" in caplog.text
+
+
+async def test_a_cancel_asked_for_stops_the_handler_and_ends_the_run_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = Store(run())
+    store.cancelling = True
+    told: list[bool] = []
+
+    async def handler(job: Job) -> None:
+        told.append(job.cancel_requested)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            told.append(job.cancel_requested)  # cancelled, not a lost lease: may record it
+            raise
+
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, handler, ["triage"], worker_id="w-1").run_once()
+    assert told == [False, True] and len(store.beats) == 1  # no heartbeat after it
+    [(verb, ended)] = store.writes
+    assert (verb, ended["status"], ended["worker_id"]) == ("finish", RunStatus.CANCELLED, "w-1")
+    assert "run run_1 cancelled: stopping it" in caplog.text
+
+
+async def test_a_cancel_that_cannot_be_recorded_is_left_to_the_lease(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = Store(run())
+    store.cancelling = True
+    store.finish_error = ConnectionError("agent-runs is down")
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, forever(), ["triage"]).run_once()
+    assert "run run_1 could not be ended as CANCELLED (agent-runs is down)" in caplog.text
 
 
 async def test_a_handler_whose_write_lost_the_lease_is_logged(

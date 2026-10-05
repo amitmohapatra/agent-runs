@@ -105,6 +105,16 @@ class RunFinish(BaseModel):
         return self
 
 
+class RunCancel(BaseModel):
+    """Why a run is cancelled: kept with the run, with the principal of the key that asked."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reason: str | None = Field(
+        default=None, max_length=1000, description="Why the run is cancelled (optional)."
+    )
+
+
 class ClaimRequest(BaseModel):
     """A worker asking for the oldest queued run of one of its agents."""
 
@@ -153,6 +163,11 @@ class Lease(BaseModel):
         description="Working time the run has left as of this answer, in seconds: the lesser "
         "of its timeout_seconds and the service's maximum, less what it has worked. Past it "
         "the ticker ends the run TIMEOUT (run_timeout). Null: no limit.",
+    )
+    cancel_requested: bool = Field(
+        default=False,
+        description="Someone asked to cancel the run: stop working it and finish it CANCELLED. "
+        "The lease is no longer extended; when it runs out the ticker cancels the run.",
     )
 
 
