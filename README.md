@@ -134,7 +134,7 @@ stateDiagram-v2
 ## The Python SDK
 
 [`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
-Python client of this API, versioned with it (0.3.0). It depends on `httpx`, `pydantic` and
+Python client of this API, versioned with it (0.3.1). It depends on `httpx`, `pydantic` and
 `trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
 plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
 into agent-harness, whose run store it is (Way 1):

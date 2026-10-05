@@ -1,4 +1,4 @@
-# agent-runs API (0.3.0)
+# agent-runs API (0.3.1)
 
 Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
 same header), a key issued by the Memory Service (the one key registry; see
@@ -25,6 +25,12 @@ semantics of [Runs](#runs).
 0.3.0 changed the wire in place (its consumers are the platform's own repositories): errors
 are problems instead of `{"detail": …}`, listings page with `cursor` and `Link`, and the
 limits, the rate limit and the repeat semantics below are new.
+
+0.3.1 keeps every shape and changes what happens: a run's own `deadline` is enforced (the
+ticker ends it `TIMEOUT`); only lapsed leases count toward failing a run, not answers; the
+very same resolution repeated answers the run instead of `409`; an answer that does not fit
+its question, and a question whose `expects` is no JSON Schema, are `422`. The SDK's
+`Worker` ends a run whose handler raised as `ERROR` at once.
 
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
