@@ -140,6 +140,14 @@ class RunRow(Base):
             "running_since",
             postgresql_where=text("status = 'RUNNING'"),
         ),
+        # the retention sweep: ended runs, by when they ended
+        Index(
+            "ix_runs_ended",
+            "updated_at",
+            postgresql_where=text(
+                "status IN ('SUCCESS', 'PARTIAL', 'ERROR', 'TIMEOUT', 'CANCELLED', 'REJECTED')"
+            ),
+        ),
         # the claim: RUNNING runs sharing a concurrency key
         Index(
             "ix_runs_concurrency",

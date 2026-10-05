@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select, tuple_
+from sqlalchemy import Select, delete, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -64,7 +64,7 @@ from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import ResolutionRow, RunEventRow, RunRow
+from agent_runs.store.tables import ArtifactRow, ResolutionRow, RunEventRow, RunRow
 
 _RECORD_FIELDS = (
     "run_id",
@@ -98,6 +98,9 @@ _SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fiel
 
 #: A run a worker holds: what fair share and the per-tenant cap count.
 _LEASED = (RunRow.status == RunStatus.RUNNING.value, RunRow.lease_owner.is_not(None))
+
+#: The statuses a run ends in, as ``ix_runs_ended`` names them: the runs retention deletes.
+_ENDED = tuple(status.value for status in RunStatus if status.final)
 
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
@@ -826,6 +829,25 @@ class RunStore:
         await self._ended(rows, now)
         await self._session.flush()
         return [_record(row, now) for row in rows]
+
+    async def purge_ended(self, *, before: datetime, limit: int) -> int:
+        """Delete the runs that ended before ``before``, with their resolutions and their
+        events (``ON DELETE CASCADE``); a run whose artifacts are still kept waits until the
+        artifact sweep has deleted them. Returns how many runs went."""
+        kept = select(ArtifactRow.artifact_id).where(ArtifactRow.run_id == RunRow.run_id)
+        gone = (
+            await self._session.scalars(
+                select(RunRow.run_id)
+                .where(RunRow.status.in_(_ENDED), RunRow.updated_at < before, ~kept.exists())
+                .order_by(RunRow.updated_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        if gone:
+            await self._session.execute(delete(ResolutionRow).where(ResolutionRow.run_id.in_(gone)))
+            await self._session.execute(delete(RunRow).where(RunRow.run_id.in_(gone)))
+        return len(gone)
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (

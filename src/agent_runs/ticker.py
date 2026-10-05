@@ -12,7 +12,9 @@
    given up on as dead;
 7. drop the dead deliveries older than their retention (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``);
 8. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
-   row: a blob delete that fails leaves the row for the next tick).
+   row: a blob delete that fails leaves the row for the next tick);
+9. when the deployment sets a retention (``RUNS__RUNS__RETENTION_DAYS``), delete the runs that
+   ended before it, with their resolutions and events (after their artifacts).
 
 Steps 2 to 5 write the webhook events they cause into the outbox in their own transaction.
 
@@ -85,6 +87,7 @@ class TickReport:
     sent: int = 0
     dropped: int = 0
     purged: int = 0
+    runs_purged: int = 0
 
 
 class Ticker:
@@ -98,6 +101,7 @@ class Ticker:
         interval: float = TICK_SECONDS,
         max_run_seconds: float | None = None,
         dead_retention: timedelta = WEBHOOK_DEAD_RETENTION,
+        run_retention: timedelta | None = None,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
@@ -106,6 +110,7 @@ class Ticker:
         self._interval = interval
         self._max_run_seconds = max_run_seconds
         self._dead_retention = dead_retention
+        self._run_retention = run_retention
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
     async def tick(self, *, now: datetime | None = None) -> TickReport:
@@ -125,6 +130,7 @@ class Ticker:
                 sent=await self._send_webhooks(now),
                 dropped=await self._drop_dead(now),
                 purged=await self._purge_artifacts(now),
+                runs_purged=await self._purge_runs(now),
             )
         except (DBAPIError, OSError) as exc:
             self.breaker.record_failure(now)
@@ -217,6 +223,17 @@ class Ticker:
             await db.commit()
         return len(gone)
 
+    async def _purge_runs(self, now: datetime) -> int:
+        """Delete the runs that ended before the retention window; none without one."""
+        if self._run_retention is None:
+            return 0
+        async with self._sessions() as db:
+            purged = await RunStore(db).purge_ended(
+                before=now - self._run_retention, limit=SWEEP_BATCH
+            )
+            await db.commit()
+        return purged
+
     def beat(self) -> None:
         """Record that the loop came round. Never raises: a full disk on the liveness file
         must not stop work that is still going through."""
@@ -266,6 +283,7 @@ async def run() -> None:
             heartbeat_path=beat,
             max_run_seconds=settings.runs.max_run_seconds,
             dead_retention=settings.webhooks.dead_retention,
+            run_retention=settings.runs.retention,
         )
         await ticker.run_forever(stop)
     finally:

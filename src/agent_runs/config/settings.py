@@ -134,6 +134,13 @@ class RunsSettings(BaseModel):
     #: claims: a claim past it answers 204. Unset: no cap (a claim across tenants still
     #: shares the fleet fairly).
     max_running_per_tenant: int | None = Field(default=None, ge=1)
+    #: Days an ended run is kept, with its resolutions and events, before the ticker deletes
+    #: it (a run whose artifacts are still kept goes after them). Unset: kept forever.
+    retention_days: int | None = Field(default=None, ge=1)
+
+    @property
+    def retention(self) -> timedelta | None:
+        return None if self.retention_days is None else timedelta(days=self.retention_days)
 
 
 class WebhookSettings(BaseModel):
