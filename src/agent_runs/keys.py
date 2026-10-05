@@ -41,9 +41,9 @@ _FORBIDDEN = 403
 class KeyInfo(BaseModel):
     """The introspection answer. The key *is* the caller: it names the tenant it speaks for
     (``None`` for a platform key, which then names the tenant in ``X-Trellis-Tenant``), the
-    principal recorded as ``created_by``, and the principals it may make runs execute as
-    (``on_behalf_of``; ``"*"`` is any). ``role`` is the registry's (``platform``, ``admin``,
-    ``service``, …), carried for the record."""
+    principal recorded as ``created_by``, and the principals it may act for: make runs
+    execute as (``on_behalf_of``) and answer paused runs as (``answering.py``); ``"*"`` is
+    any. ``role`` is the registry's (``platform``, ``admin``, ``service``, …)."""
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 

@@ -52,7 +52,7 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 |---|---|---|
 | `400` | `VALIDATION` | a platform key named no tenant |
 | `401` | `AUTHENTICATION` | missing `X-API-Key`, or one the key registry does not know (or revoked, expired) |
-| `403` | `AUTHORIZATION` | the registry refuses the key (a suspended tenant), the body or header names another tenant, `on_behalf_of` the key may not act as, or an artifact for a paused run from a key whose role is not `service` |
+| `403` | `AUTHORIZATION` | the registry refuses the key (a suspended tenant), the body or header names another tenant, `on_behalf_of` the key may not act as, an answer to a paused run the key may not give ([who may](#who-may-answer-a-paused-run)), or an artifact for a paused run from a key whose role is not `service` |
 | `404` | `NOT_FOUND` | no such run, schedule, webhook or artifact in this tenant (or no such route) |
 | `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
 | `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled or finished. **Stop working the run.** |
@@ -111,7 +111,7 @@ sections after the table have the bodies and the exact semantics.
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` | `200 Claimed`, `204` nothing queued | `422` |
 | `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
-| `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `404`, `409` not `PAUSED` or another interrupt, `422` another run |
+| `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `403` the key may not answer this run ([who may](#who-may-answer-a-paused-run)), `404`, `409` not `PAUSED` or another interrupt, `422` another run |
 | `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
 | `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
@@ -166,8 +166,8 @@ Answers (anything else, a timeout of 3 s or an unreachable service is `503` here
 | `key_id` | string | the key's id (never the secret) |
 | `tenant_id` | string or `null` | the tenant the key speaks for; `null` for a platform key, which then names the tenant per request in `X-Trellis-Tenant` |
 | `principal` | string | who the caller is: recorded as `created_by` on schedules and webhooks, and a principal the key may always act as |
-| `role` | string | the registry's role (`platform`, `admin`, `service`, …); carried, not interpreted here |
-| `may_act_as` | array of strings | the principals the key may put in `on_behalf_of` (a run then executes as them); `"*"` is any principal of the tenant; empty means only `principal` |
+| `role` | string | the registry's role (`platform`, `admin`, `service`, …): an `admin` or `platform` key answers any paused run ([who may](#who-may-answer-a-paused-run)); only a `service` key adds an artifact to a paused run |
+| `may_act_as` | array of strings | the principals the key may put in `on_behalf_of` (a run then executes as them) and answer paused runs as (`reviewer`); `"*"` is any principal of the tenant; empty means only `principal` |
 
 Other fields are ignored. A missing required field is a malformed answer (`503`).
 
@@ -279,7 +279,7 @@ the answer to its pause retries it. Another interrupt, or another worker, is `40
 Every interrupt the run paused on and how it was answered, oldest first, a page at a time:
 `{"interrupt": Interrupt, "resolution": InterruptResolution, "attempt": 1, "recorded_at": "…"}`.
 Append-only: `last_resolution` is only the latest of these. A row exists exactly when the
-resume took effect; a refused resume (`409`, `422`) leaves none. `404` for a run the caller's
+resume took effect; a refused resume (`403`, `409`, `422`) leaves none. `404` for a run the caller's
 tenant does not hold.
 
 ### `POST /v1/runs/{id}/resume` → `200 RunRecord`
@@ -302,8 +302,31 @@ same transaction (`GET /v1/runs/{id}/resolutions`), and:
   - a run recorded in process goes to `RUNNING`, for the process that resumes it.
 
 `409` when the run is not `PAUSED` (a second answer) or waits on a different
-`interrupt_id`; `422` when `run_id` names another run. Announced as `run.finished` only for
-`CANCEL`.
+`interrupt_id`; `422` when `run_id` names another run; `403` when the key may not answer it
+(below). Announced as `run.finished` only for `CANCEL`.
+
+#### Who may answer a paused run
+
+Checked before anything is written, against the run's `assignee` at that moment (after any
+escalation); a `CANCEL` is an answer like any other. Principals compare as `kind:id`, a bare
+id being a user's (`priya` is `user:priya`); `reviewer` is stored as given.
+
+| The key ([`KeyInfo`](#authentication)) | May answer |
+|---|---|
+| `role` `admin` or `platform` | any run |
+| `may_act_as` holds `"*"` (the Memory Service's default) | any run: the application vouches for the `reviewer` it names |
+| any other (restricted to listed principals) | as one of them (`reviewer`; none is the key's own `principal`), and only a run assigned to that principal or to nobody; never a run assigned to a group (`role:…`, any kind but `user`, `agent`, `key`) |
+
+The refusal is `403 AUTHORIZATION`, its detail one of:
+
+```
+this key may not act for user:raj; it may act only for user:priya
+the run is assigned to user:raj, not user:priya; this key may act only for user:priya
+the run is assigned to role:finance, a group: a key restricted to listed people cannot answer it; answer with the application's key or an admin key
+```
+
+Nothing else is restricted this way: every key of the tenant reads every run, lists every
+inbox (`assignee` is a filter, not a lock) and works the queue.
 
 ### `POST /v1/runs/{id}/finish?worker_id=` → `200 RunRecord`
 

@@ -151,6 +151,30 @@ checkpoint and output, and the audit trail with `resolutions`. A large payload t
 table, a diff) is an artifact: the interrupt's `payload_ref` is its `ArtifactRef`, and
 `runs.artifacts.download(ref.artifact_id)` its bytes.
 
+Any key of the tenant reads every inbox, but answering is checked. A key that may act for
+anyone (the default) or an admin key answers any run. A key restricted to listed people
+answers only as one of them (`reviewer`), and only a run assigned to that person or to
+nobody, never one assigned to a group; anything else raises `AuthorizationError` saying why
+([who may answer a paused run](../../README.md#who-may-answer-a-paused-run)):
+
+```python
+from trellis.contracts.runs import InterruptDecision, InterruptResolution
+from trellis.runs import AuthorizationError, RunsClient
+
+async with RunsClient(api_key=priya_key) as runs:  # a key with may_act_as=["user:priya"]
+    run = await runs.get(run_id)
+    answer = InterruptResolution(
+        interrupt_id=run.awaiting.interrupt_id,
+        run_id=run.run_id,
+        decision=InterruptDecision.APPROVE,
+        reviewer="priya",  # user:priya
+    )
+    try:
+        await runs.resume(answer)
+    except AuthorizationError as refused:
+        print(refused.message)  # ...: the run is assigned to user:raj, not user:priya; ...
+```
+
 ## Schedules
 
 ```python
@@ -268,7 +292,7 @@ its status). Every error has `message`, `code`, `status` (0 without a response),
 |---|---|---|
 | `RunsError` | `INTERNAL` / 500, any other | the base class |
 | `AuthenticationError` | `AUTHENTICATION` / 401 | no key, or one the registry does not know |
-| `AuthorizationError` | `AUTHORIZATION` / 403 | another tenant, an `on_behalf_of` the key may not act as |
+| `AuthorizationError` | `AUTHORIZATION` / 403 | another tenant, an `on_behalf_of` the key may not act as, a paused run the key may not answer |
 | `NotFoundError` | `NOT_FOUND` / 404 | no such record (reads by id answer `None` instead) |
 | `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt |
 | `LeaseLostError` | `LEASE_LOST` / 409 | the worker no longer holds the run: stop, write nothing more. **Not** a `ConflictError` |

@@ -133,6 +133,12 @@ def test_the_conflicts_say_what_they_mean_where_they_happen(spec) -> None:
     assert "CONFLICT" in resume["description"] and "LEASE_LOST" not in resume["description"]
 
 
+def test_resume_says_who_may_answer(spec) -> None:
+    resume = spec["paths"]["/v1/runs/{run_id}/resume"]["post"]
+    assert "may not answer this run" in resume["responses"]["403"]["description"]
+    assert "Who may answer" in resume["description"]
+
+
 def test_listings_document_their_cursor_and_link(spec) -> None:
     for path in ("/v1/runs", "/v1/schedules", "/v1/webhooks", "/v1/runs/{run_id}/resolutions"):
         op = spec["paths"][path]["get"]
