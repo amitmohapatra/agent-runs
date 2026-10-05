@@ -268,7 +268,8 @@ async with RunsClient() as runs:
 ```
 
 - The lease is renewed every third of `lease_seconds` (60) while the handler runs. A
-  heartbeat refused with `LEASE_LOST` cancels the handler: another worker has the run.
+  heartbeat refused with `LEASE_LOST` cancels the handler: another worker has the run, or
+  it was cancelled or ran past its `deadline` (agent-runs ended it `TIMEOUT`).
 - `concurrency` handlers run at once (default: the CPU count, 1 to 8). An idle worker asks
   again after 0.5 s, doubling to 10 s, jittered.
 - `serve()` stops on SIGTERM or SIGINT: no new claims, the runs held get 25 s to finish,
@@ -276,6 +277,10 @@ async with RunsClient() as runs:
   and another worker runs them again). A second signal releases them at once. `run()` is the
   same loop without signal handling (stop it with `stop()`), and `run_once()` claims and
   executes one run.
+- A handler that raises ends its run at once as `ERROR`, with the exception as the run's
+  `AgentError` (`AgentError.of`: its class as `code`, its text, and `retryable` as the
+  contracts classify it); you need not catch anything to record a failure. Only if that
+  finish fails too does the run wait for its lease to lapse, as for a worker that died.
 - `job.pause(interrupt, checkpoint=...)` and `job.finish(...)` are fenced: after the lease
   was lost they raise `LeaseLostError`. A handler that records a cancellation as the run's
   ending checks for `RELEASED in exc.args` and writes nothing then.
@@ -296,7 +301,7 @@ its status). Every error has `message`, `code`, `status` (0 without a response),
 | `NotFoundError` | `NOT_FOUND` / 404 | no such record (reads by id answer `None` instead) |
 | `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt |
 | `LeaseLostError` | `LEASE_LOST` / 409 | the worker no longer holds the run: stop, write nothing more. **Not** a `ConflictError` |
-| `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid |
+| `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid, an answer that does not fit its question included (the message says what) |
 | `PayloadTooLargeError` | `PAYLOAD_TOO_LARGE` / 413 | a `ValidationError`: a body, payload, checkpoint or artifact too large |
 | `RateLimitedError` | `RATE_LIMIT` / 429 | the tenant's budget is spent for now (`retry_after`) |
 | `DependencyUnavailableError` | `DEPENDENCY_UNAVAILABLE` / 502, 503, 504, or no response | the service or its database could not answer |
@@ -305,5 +310,7 @@ A call that fails on the way (no response, `429`, `502`, `503`, `504`) is sent a
 `max_retries` times, after the `Retry-After` the service asked for (at most 30 s) or a
 full-jitter backoff from 0.25 s doubling to 5 s, unless the problem says
 `retryable: false`. Every write agent-runs takes is safe to repeat: a start is idempotent on
-its id, a repeated pause or finish answers the stored run, the same artifact bytes are the
-same artifact, a schedule create is an upsert.
+its id, a repeated pause or finish answers the stored run, a repeated resume with the same
+`InterruptResolution` object answers the run as it is now (a new resolution for an
+interrupt already answered, a second click, is a `ConflictError`), the same artifact bytes
+are the same artifact, a schedule create is an upsert.

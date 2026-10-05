@@ -26,9 +26,13 @@ from trellis.runs import (
     NotFoundError,
     RunsClient,
     ScheduleUpdate,
+    ValidationError,
     WebhookEvent,
     Worker,
 )
+
+from agent_runs.store.runs import RunStore
+from tests.conftest import at
 
 
 @pytest.fixture
@@ -102,8 +106,31 @@ async def test_a_durable_run_through_the_sdk(runs: RunsClient) -> None:
     trail = await runs.resolutions(queued.run_id, tenant="acme")
     assert [e.resolution.reviewer for e in trail.items] == ["user:alice"]
     assert await runs.get("run_missing", tenant="acme") is None
+    retried = await runs.resume(answer, tenant="acme")  # the same answer, sent again
+    assert (retried.status, retried.updated_at) == (RunStatus.SUCCESS, done.updated_at)
+    second = answer.model_copy(update={"decision": InterruptDecision.REJECT})
     with pytest.raises(ConflictError):  # a second answer: the run is no longer paused
+        await runs.resume(second, tenant="acme")
+
+
+async def test_an_answer_that_does_not_fit_is_a_validation_error_saying_why(
+    runs: RunsClient,
+) -> None:
+    run = await runs.start(RunStart(tenant_id="acme", agent_id="triage"))
+    asked = Interrupt(
+        tenant_id="acme", run_id=run.run_id, question="How many?", expects={"type": "integer"}
+    )
+    await runs.pause(asked)
+    answer = InterruptResolution(
+        interrupt_id=asked.interrupt_id,
+        run_id=run.run_id,
+        decision=InterruptDecision.ANSWER,
+        answer="a few",
+    )
+    with pytest.raises(ValidationError) as refused:
         await runs.resume(answer, tenant="acme")
+    assert refused.value.status == 422 and not refused.value.retryable
+    assert "does not fit what was asked" in refused.value.message
 
 
 async def test_a_lost_lease_is_a_lease_lost_error_not_a_conflict(runs: RunsClient) -> None:
@@ -141,6 +168,50 @@ async def test_a_lost_lease_stops_the_workers_handler(runs: RunsClient, monkeypa
     assert stopped.is_set()
     done = await runs.get(queued.run_id, tenant="acme")
     assert done is not None and done.status is RunStatus.CANCELLED
+
+
+async def test_a_handler_that_raises_ends_its_run_as_error_at_once(runs: RunsClient) -> None:
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+
+    async def handler(job: Job) -> None:
+        raise ConnectionRefusedError("the CRM refused")
+
+    assert await Worker(runs, handler, ["triage"], tenant="acme").run_once()
+    done = await runs.get(queued.run_id, tenant="acme")
+    assert done is not None and done.status is RunStatus.ERROR and done.error is not None
+    assert (done.error.code, done.error.message) == ("ConnectionRefusedError", "the CRM refused")
+
+
+async def test_a_run_past_its_deadline_stops_the_workers_handler(
+    app: Any, runs: RunsClient, monkeypatch
+) -> None:
+    """The ticker times the run out under the worker; its next heartbeat is refused and the
+    handler is cancelled, so it writes nothing more."""
+    from trellis.runs import worker as worker_module
+
+    async def soon(seconds: float) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(worker_module, "_sleep", soon)
+    start = RunStart(tenant_id="acme", agent_id="triage", deadline=at(1))
+    queued = await runs.start(start, queue=True)
+    stopped = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        async with app.state.sessions() as db:
+            await RunStore(db).time_out_past_deadline(now=at(2), limit=10)
+            await db.commit()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stopped.set()
+            raise
+
+    assert await Worker(runs, handler, ["triage"], tenant="acme").run_once()
+    assert stopped.is_set()
+    done = await runs.get(queued.run_id, tenant="acme")
+    assert done is not None and done.status is RunStatus.TIMEOUT
+    assert done.error is not None and done.error.code == "run_deadline"
 
 
 async def test_schedules_through_the_sdk(runs: RunsClient) -> None:

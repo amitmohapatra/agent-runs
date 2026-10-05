@@ -170,11 +170,12 @@ async def test_an_answer_to_another_question_is_a_conflict(client) -> None:
 
 
 async def test_a_second_answer_is_a_conflict(client) -> None:
-    """Two clicks, one pause: the second finds nothing waiting."""
+    """Two clicks, one pause: each click is its own resolution, and the second finds nothing
+    waiting."""
     run = await paused(client)
-    body = resolution(run)
-    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 200
-    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 409
+    url = f"/v1/runs/{run['run_id']}/resume"
+    assert (await client.post(url, json=resolution(run))).status_code == 200
+    assert (await client.post(url, json=resolution(run, reviewer="bob"))).status_code == 409
 
 
 async def test_a_resolution_for_another_run_is_refused(client) -> None:
@@ -381,3 +382,54 @@ async def test_every_route_needs_a_key(app) -> None:
             assert response.headers["content-type"] == "application/problem+json"
             problem = response.json()
             assert (problem["code"], problem["detail"]) == ("AUTHENTICATION", "missing X-API-Key")
+
+
+# ------------------------------------------------------------------ an answer fits its question
+
+_QTY = {"type": "object", "properties": {"qty": {"type": "integer"}}, "required": ["qty"]}
+
+
+async def _asked(client, **question) -> dict:
+    run = (await client.post("/v1/runs", json=started())).json()
+    response = await client.post(
+        f"/v1/runs/{run['run_id']}/pause", json=pause(run["run_id"], **question)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _refused(client, run: dict, body: dict, why: str) -> None:
+    """Refused with 422 saying ``why``, and nothing written: the run still waits, unanswered."""
+    response = await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "VALIDATION" and why in response.json()["detail"]
+    stored = (await client.get(f"/v1/runs/{run['run_id']}")).json()
+    assert (stored["status"], stored["last_resolution"]) == ("PAUSED", None)
+    assert (await client.get(f"/v1/runs/{run['run_id']}/resolutions")).json() == []
+
+
+async def test_an_answer_that_does_not_fit_expects_is_refused(client) -> None:
+    run = await _asked(client, expects=_QTY)
+    await _refused(
+        client, run, resolution(run, "ANSWER", answer={"qty": "two"}), "['qty'] does not fit"
+    )
+    await _refused(client, run, resolution(run, "EDIT", payload={"qty": 2.5}), "does not fit")
+    fits = resolution(run, "ANSWER", answer={"qty": 2})
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=fits)).status_code == 200
+
+
+async def test_an_answer_to_a_choice_is_one_of_its_options(client) -> None:
+    run = await _asked(client, reason="CHOICE", options=["yes", "no"])
+    await _refused(client, run, resolution(run, "ANSWER", answer="maybe"), "not one of the options")
+    chosen = resolution(run, "ANSWER", answer="no")
+    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=chosen)).status_code == 200
+
+
+async def test_a_question_whose_expects_is_no_json_schema_is_refused(client) -> None:
+    """Refused where it is asked, not when someone tries to answer it."""
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = pause(run["run_id"], expects={"type": "integer", "minimum": "zero"})
+    response = await client.post(f"/v1/runs/{run['run_id']}/pause", json=body)
+    assert response.status_code == 422
+    assert "expects is not a valid JSON Schema" in response.json()["detail"]
+    assert (await client.get(f"/v1/runs/{run['run_id']}")).json()["status"] == "RUNNING"

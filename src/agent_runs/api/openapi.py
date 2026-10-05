@@ -46,8 +46,9 @@ run. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503
 
 ### Retries
 Starting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause` or
-`finish` by the caller that made it answers the stored run; claims and heartbeats are safe to
-repeat. A client may retry transport errors, 429, 502, 503 and 504.
+`finish` by the caller that made it answers the stored run, and a repeated `resume` with the
+very same resolution answers the run as it is now; claims and heartbeats are safe to repeat.
+A client may retry transport errors, 429, 502, 503 and 504.
 
 ### Pages
 Every listing takes `cursor` and `limit` and answers `Link: <url>; rel="next"` when there is

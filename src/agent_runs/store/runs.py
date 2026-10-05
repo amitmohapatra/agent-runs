@@ -26,12 +26,13 @@ from trellis.contracts.runs import (
     RunStart,
     RunStatus,
 )
+from trellis.runs.answers import answer_problem, schema_problem
 
 from agent_runs.answering import require_may_answer
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     DEFAULT_PAGE,
-    MAX_ATTEMPTS,
+    MAX_LEASE_LAPSES,
     PAUSED_ARTIFACT_ROLE,
 )
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
@@ -76,6 +77,10 @@ _RECORD_FIELDS = (
 
 
 _SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
+
+#: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
+#: deadline can still catch.
+_UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
 
 #: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
 #: same key with a different request is a client bug to surface, not a run to hand back.
@@ -142,6 +147,11 @@ def _settled(row: RunRow, status: RunStatus, worker_id: str | None) -> bool:
     """Is the run already in ``status``, put there by this caller? Then a pause or finish
     to it is a repeat: the caller never saw the answer to the first one."""
     return row.status == status.value and row.settled_by == worker_id
+
+
+def _resolution_id(resolution: InterruptResolution) -> str:
+    """The one id an interrupt's answer is kept under: an interrupt is answered once."""
+    return stable_id(resolution.run_id, resolution.interrupt_id, prefix="res_")
 
 
 def _requeue(row: RunRow, now: datetime) -> None:
@@ -234,12 +244,16 @@ class RunStore:
         worker_id: str | None,
         now: datetime,
     ) -> tuple[RunRecord, bool]:
-        """The run waits on ``pause.interrupt``. Returns ``(run, paused)``: a repeat of the
-        pause that made the current state (the same caller, the same interrupt) answers the
-        stored run with ``paused`` false, changing nothing."""
+        """The run waits on ``pause.interrupt``, whose ``expects`` must be a JSON Schema
+        (``Unprocessable`` otherwise: a question nobody could answer fails where it is
+        asked). Returns ``(run, paused)``: a repeat of the pause that made the current state
+        (the same caller, the same interrupt) answers the stored run with ``paused`` false,
+        changing nothing."""
         interrupt = pause.interrupt
         if (interrupt.tenant_id, interrupt.run_id) != (tenant_id, run_id):
             raise Unprocessable("the interrupt belongs to another run")
+        if problem := schema_problem(interrupt.expects):
+            raise Unprocessable(problem)
         checkpoint = pause.bounded_checkpoint()
         row = await self._locked(tenant_id, run_id, worker_id=None)
         waiting_on = (row.awaiting or {}).get("interrupt_id")
@@ -262,25 +276,38 @@ class RunStore:
         *,
         answerer: KeyInfo,
         now: datetime,
-    ) -> RunRecord:
+    ) -> tuple[RunRecord, bool]:
         """Answer the interrupt a paused run waits on, as ``answerer`` may
-        (``answering.py``: checked against the run's assignee now, before anything is
-        written). ``CANCEL`` ends the run; any other decision continues it as the next
-        attempt: back on the queue when the run is durable (it was ever queued, so a worker
-        resumes it), else ``RUNNING`` in the caller's process."""
+        (``answering.py``: checked against the run's assignee now) and with an answer that
+        fits the question (``trellis.runs.answers``: an ``ANSWER`` fits ``expects`` or is one
+        of ``options``, an ``EDIT`` of a question fits ``expects``; ``Unprocessable``
+        otherwise), both before anything is written. ``CANCEL`` ends the run; any other
+        decision continues it as the next attempt: back on the queue when the run is durable
+        (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
+        process.
+
+        Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
+        very same resolution, as a client retries it after losing the answer) answers the
+        run as it is now with ``resumed`` false, changing nothing. Any other answer to an
+        interrupt the run no longer waits on is a ``Conflict``: a second click must not
+        continue the run twice."""
         if resolution.run_id != run_id:
             raise Unprocessable("the resolution answers another run")
         row = await self._locked(tenant_id, run_id, worker_id=None)
-        if row.status != RunStatus.PAUSED or row.awaiting is None:
-            raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
-        asked = Interrupt.model_validate(row.awaiting)
-        if asked.interrupt_id != resolution.interrupt_id:
+        if (row.awaiting or {}).get("interrupt_id") != resolution.interrupt_id:
+            if await self._answered_by(tenant_id, resolution):
+                return _record(row), False
+            if row.status != RunStatus.PAUSED:
+                raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
             raise Conflict(f"run {run_id} is waiting on another interrupt")
+        asked = Interrupt.model_validate(row.awaiting)
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
+        if problem := answer_problem(asked, resolution):
+            raise Unprocessable(problem)
         row.last_resolution = _json(resolution)
         self._session.add(
             ResolutionRow(
-                resolution_id=stable_id(run_id, resolution.interrupt_id, prefix="res_"),
+                resolution_id=_resolution_id(resolution),
                 run_id=run_id,
                 tenant_id=tenant_id,
                 interrupt_id=resolution.interrupt_id,
@@ -301,7 +328,19 @@ class RunStore:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
         await self._ended([row], now)
-        return await self._flushed(row)
+        return await self._flushed(row), True
+
+    async def _answered_by(self, tenant_id: str, resolution: InterruptResolution) -> bool:
+        """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
+        when the answer is made, so a retried resume sends the same JSON and a second
+        answer (another click, another person) never does."""
+        kept = await self._session.scalar(
+            select(ResolutionRow.resolution).where(
+                ResolutionRow.tenant_id == tenant_id,
+                ResolutionRow.resolution_id == _resolution_id(resolution),
+            )
+        )
+        return kept == _json(resolution)
 
     async def finish(
         self,
@@ -375,10 +414,39 @@ class RunStore:
         return Lease(run_id=row.run_id, worker_id=worker_id, expires_at=expires_at)
 
     # ------------------------------------------------------------------ the ticker's sweeps
+    async def time_out_past_deadline(self, *, now: datetime, limit: int) -> list[RunRecord]:
+        """Runs not yet ended past their own ``deadline`` (``RunStart.deadline``) end as
+        ``TIMEOUT``, queued, running or paused alike: a deadline is when the run must be
+        done by, so time waiting for a worker or a person counts. A worker still running
+        one has lost it: its next heartbeat or write is ``LeaseLost``. Returns every run
+        ended."""
+        rows = await self._sweep(
+            RunRow.status.in_(_UNENDED),
+            RunRow.deadline < now,
+            order=RunRow.deadline,
+            limit=limit,
+        )
+        for row in rows:
+            _move(row, RunStatus.TIMEOUT, now)
+            row.error = _json(
+                AgentError(
+                    code="run_deadline",
+                    category=ErrorCategory.TIMEOUT,
+                    message=f"the run did not end by its deadline, {row.deadline}",
+                    # the category alone would say retryable; a retry would only be later
+                    retryable=False,
+                    source="agent-runs",
+                )
+            )
+        await self._ended(rows, now)
+        await self._session.flush()
+        return [_record(row) for row in rows]
+
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt;
-        one that has used up ``MAX_ATTEMPTS`` ends as ``ERROR`` instead. Returns every run
-        moved."""
+        one whose lease has now lapsed ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead.
+        Only lapses count: a person's answer starts an attempt too, and is no crash. Returns
+        every run moved."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.lease_expires_at < now,
@@ -386,13 +454,15 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
-            if row.attempt >= MAX_ATTEMPTS:
+            row.lease_lapses += 1
+            if row.lease_lapses >= MAX_LEASE_LAPSES:
                 _move(row, RunStatus.ERROR, now)
                 row.error = _json(
                     AgentError(
                         code="lease_expired",
                         category=ErrorCategory.TIMEOUT,
-                        message=f"the lease lapsed on each of {row.attempt} attempts",
+                        message=f"the lease lapsed {row.lease_lapses} times: every worker "
+                        "that claimed the run stopped heartbeating",
                         source="agent-runs",
                     )
                 )

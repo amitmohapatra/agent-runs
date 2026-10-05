@@ -15,8 +15,15 @@ cannot write over a run another worker has since claimed::
 A claimed run is leased to this worker; a heartbeat extends the lease every third of it while
 the handler runs, and a worker that dies lets the lease lapse, after which agent-runs queues
 the run again as its next attempt. A heartbeat refused with ``LEASE_LOST`` (the lease lapsed
-and another worker took the run, or the run was cancelled) cancels the handler: it must write
-nothing more. Schedules and resumed durable runs arrive the same way: as queued runs.
+and another worker took the run, or the run was cancelled or ran past its deadline) cancels
+the handler: it must write nothing more. Schedules and resumed durable runs arrive the same
+way: as queued runs.
+
+A handler that raises (anything but a lost lease or a cancellation) ends its run at once as
+``ERROR``, the exception recorded as the contracts classify it (``AgentError.of``: its code,
+category and whether it is retryable), instead of leaving the run to wait for its lease to
+lapse. Should that finish fail too (agent-runs unreachable), the lease lapses as for a dead
+worker.
 
 An idle worker asks again after a growing pause (exponential, jittered, at most
 :data:`IDLE_MAX_SECONDS`), and asks at once again after it got work. :meth:`Worker.stop`
@@ -319,13 +326,26 @@ class Worker:
                 raise
         except LeaseLostError:
             log.warning("lease on %s lost while the handler wrote: stopped it", record.run_id)
-        except Exception:
+        except Exception as exc:
             log.exception("run %s failed in the worker", record.run_id)
+            await self._fail(job, exc)
         finally:
             self._held.pop(record.run_id, None)
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+
+    async def _fail(self, job: Job, exc: Exception) -> None:
+        """End the run ``ERROR`` with what its handler raised; when even that is refused or
+        cannot be sent, its lease lapses and agent-runs takes the run back."""
+        try:
+            await job.finish(RunStatus.ERROR, error=AgentError.of(exc))
+        except Exception as error:
+            log.warning(
+                "run %s could not be ended as ERROR (%s): its lease lapses instead",
+                job.record.run_id,
+                error,
+            )
 
     async def _heartbeat(self, record: RunRecord, execution: asyncio.Future[object]) -> None:
         while True:

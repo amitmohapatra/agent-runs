@@ -35,7 +35,7 @@ flowchart LR
       routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
-      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · requeue · escalate<br/>send webhooks · purge artifacts"]
+      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out · requeue · escalate<br/>send webhooks · purge artifacts"]
       sender["WebhookSender<br/>(webhooks.py)"]
     end
     keys["KeyRegistry (keys.py)<br/>TTL cache of key answers"]
@@ -81,7 +81,7 @@ flowchart LR
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
-| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing |
+| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
@@ -97,7 +97,7 @@ The one transition check is `trellis-contracts` `RunStatus.can_become`, called b
 `store/runs.py` `_move` under a row lock; a refused transition is `409` and changes nothing.
 The arrows are exactly the transitions some route or ticker step makes:
 `tests/test_state_machine.py` asserts every route's transition and every refusal, and
-`tests/test_queue.py` and `tests/test_escalation.py` the ticker's.
+`tests/test_queue.py`, `tests/test_deadline.py` and `tests/test_escalation.py` the ticker's.
 
 ```mermaid
 stateDiagram-v2
@@ -106,23 +106,23 @@ stateDiagram-v2
 
   QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
   QUEUED --> CANCELLED: finish CANCELLED
-  QUEUED --> TIMEOUT: finish TIMEOUT
+  QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed and attempt < MAX_ATTEMPTS (attempt + 1)
-  RUNNING --> ERROR: ticker, lease lapsed and attempt ≥ MAX_ATTEMPTS (lease_expired)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish
+  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
   RUNNING --> CANCELLED: finish
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
   PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
-  PAUSED --> TIMEOUT: finish TIMEOUT, or ticker past deadline with no escalate_to
-  PAUSED --> PAUSED: ticker past deadline, assignee becomes escalate_to (once)
+  PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
+  PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
   SUCCESS --> [*]
   PARTIAL --> [*]
@@ -140,11 +140,13 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
 - `attempt` counts executions: `+1` on a resume that continues the run and on a lapsed
-  lease's requeue, never on a claim.
+  lease's requeue, never on a claim. `lease_lapses` counts only the lapses (`+1` on each,
+  in `requeue_lapsed`), and only it decides when the ticker gives up on a run: review
+  rounds are attempts, not crashes.
 - Events go to the outbox in the same transaction: `run.paused` on a pause, `run.escalated`
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
-- `MAX_ATTEMPTS` is 5 (`config/constants.py`).
+- `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
 - `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat; a
   requeue keeps it, so the next attempt's claim resumes from it; only an ending clears it.
 - A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
@@ -153,6 +155,12 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   so a worker that lost the answer may retry. Otherwise a fenced write (`worker_id`) on a
   run whose lease the worker no longer holds is `LeaseLost` (`409 LEASE_LOST`, `_fence`),
   checked before the transition.
+- A resume to a run no longer waiting on its interrupt is a repeat when the resolution kept
+  for that interrupt (`run_resolutions`, read under the row lock) is the very same
+  (`_answered_by`; `resolved_at` is set once per answer): the run is answered as it is and
+  nothing moves. Any other is `409`. An answer that does not fit the question
+  (`trellis.runs.answers.answer_problem`) is `422`, and a pause whose `expects` is not a
+  JSON Schema (`schema_problem`) too, both before anything is written.
 
 ## Start, interrupt, resume
 
@@ -206,7 +214,7 @@ sequenceDiagram
   A->>B: read, verified against the SHA-256
   A-->>U: 200 bytes
   U->>A: POST /v1/runs/{id}/resume {InterruptResolution APPROVE, reviewer}
-  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt, and may this key answer its assignee now (403 if not)
+  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt (else the same resolution kept: 200 as is; another: 409), may this key answer its assignee now (403 if not), does the answer fit (422 if not)
   A->>DB: INSERT run_resolutions, then last_resolution, then PAUSED → QUEUED, attempt 2
   A-->>U: 200 RunRecord (QUEUED)
 
@@ -298,8 +306,9 @@ erDiagram
     jsonb checkpoint "executor resume state, cleared on ending"
     varchar assignee "from awaiting, for the inbox"
     timestamptz awaiting_deadline "from awaiting, for escalation"
-    int attempt
-    timestamptz deadline "RunStart.deadline"
+    int attempt "executions: resumes and requeues add one"
+    int lease_lapses "only lapsed leases; MAX_LEASE_LAPSES fails the run"
+    timestamptz deadline "RunStart.deadline, for the deadline sweep"
     varchar idempotency_key UK
     jsonb run_metadata
     timestamptz queued_at "set once the run entered the queue"
@@ -392,6 +401,7 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
+| `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
 | `ix_run_resolutions_run` | `run_resolutions (tenant_id, run_id, recorded_at)` | `GET /v1/runs/{id}/resolutions` |
 | `ix_run_artifacts_expiry` | `run_artifacts (expires_at) WHERE expires_at IS NOT NULL` | `ArtifactStore.expired` |
 | `ix_schedules_tenant_created` | `agent_schedules (tenant_id, created_at)` | `GET /v1/schedules`, newest first |

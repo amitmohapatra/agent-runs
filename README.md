@@ -85,23 +85,23 @@ stateDiagram-v2
 
   QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
   QUEUED --> CANCELLED: finish CANCELLED
-  QUEUED --> TIMEOUT: finish TIMEOUT
+  QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed and attempt < MAX_ATTEMPTS (attempt + 1)
-  RUNNING --> ERROR: ticker, lease lapsed and attempt ≥ MAX_ATTEMPTS (lease_expired)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish
+  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
   RUNNING --> CANCELLED: finish
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
   PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
-  PAUSED --> TIMEOUT: finish TIMEOUT, or ticker past deadline with no escalate_to
-  PAUSED --> PAUSED: ticker past deadline, assignee becomes escalate_to (once)
+  PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
+  PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
   SUCCESS --> [*]
   PARTIAL --> [*]
@@ -120,6 +120,7 @@ stateDiagram-v2
 | make a retried start harmless | the same `run_id`, or an `idempotency_key` (one run per tenant and key) |
 | stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume` |
 | move an unanswered question up, or give up on it | the interrupt's `deadline` and `escalate_to`: the ticker reassigns it once, else ends the run `TIMEOUT` |
+| make sure a run is done by a time, whatever happens | `RunStart.deadline`: past it the ticker ends the run `TIMEOUT` (`run_deadline`, not retryable), queued, running or waiting for a person; a worker still running it is told `LEASE_LOST` and stops |
 | show a reviewer something too big for a question (a table, a diff) | `POST /v1/runs/{id}/artifacts`, then the `ArtifactRef` as `Interrupt.payload_ref`; the UI reads `GET /v1/artifacts/{id}` |
 | build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…` |
 | prove who approved what, and when | `GET /v1/runs/{id}/resolutions` (append-only) |
@@ -133,7 +134,7 @@ stateDiagram-v2
 ## The Python SDK
 
 [`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
-Python client of this API, versioned with it (0.3.0). It depends on `httpx`, `pydantic` and
+Python client of this API, versioned with it (0.3.1). It depends on `httpx`, `pydantic` and
 `trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
 plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
 into agent-harness, whose run store it is (Way 1):
@@ -144,8 +145,9 @@ into agent-harness, whose run store it is (Way 1):
   raise typed errors (`LeaseLostError`, `ConflictError`, …); failures on the way are
   retried, honouring `Retry-After`.
 - `Worker`: the claim loop: a heartbeat every third of the lease, a lost lease cancels the
-  handler, bounded concurrency, idle backoff, a graceful stop that releases what is still
-  running after 25 s.
+  handler, a handler that raises ends its run `ERROR` at once (the exception as the run's
+  `AgentError`), bounded concurrency, idle backoff, a graceful stop that releases what is
+  still running after 25 s.
 - `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
   `verify_signature` and `parse_delivery` for a receiver.
 
@@ -168,7 +170,7 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
 | `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
-| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
+| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution`; the same resolution repeated answers the run as it is now |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
@@ -189,13 +191,21 @@ exact claim, heartbeat and resume semantics a worker implements.
    run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
    fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
    (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
-2. **Leases.** A `RUNNING` run whose lease lapsed goes back to `QUEUED` as the next attempt,
-   or ends in `ERROR` after `MAX_ATTEMPTS`.
-3. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
+2. **Run deadlines.** A run not yet ended (`QUEUED`, `RUNNING` or `PAUSED`) past its own
+   `deadline` (`RunStart.deadline`) ends in `TIMEOUT` with an `AgentError` of code
+   `run_deadline` (`retryable: false`: a retry would only be later). The deadline is when
+   the run must be done by, so time in the queue and time waiting for a person count. A
+   worker still running it loses the run: its next heartbeat or write is `409 LEASE_LOST`,
+   and the SDK's `Worker` cancels its handler.
+3. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
+   back to `QUEUED` as the next attempt, or ends in `ERROR` (`lease_expired`) on its
+   `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses count toward that, never a person's answers:
+   a run reviewed ten times still survives four crashes.
+4. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
    (once) or ends in `TIMEOUT`, with a webhook event either way.
-4. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
+5. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
    then removed, or rescheduled with backoff.
-5. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
+6. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
    are deleted: the blob, then the record.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
@@ -272,6 +282,39 @@ async with RunsClient(api_key=priya_key) as runs:
 ```
 
 The rule is `answering.py`, one function.
+
+### An answer is taken once
+
+A paused run continues once per question, automatically safe against retries and double
+clicks alike:
+
+- **The same answer sent again** (the SDK resends a resume whose answer it lost: no
+  response, `502`, `503`, `504`) answers `200` with the run as it is now and changes
+  nothing: no second resolution, no second event, no second attempt. "The same" means the
+  very same `InterruptResolution`, `resolved_at` included, which is set once, when the
+  person answered.
+- **Any other answer** to a question already answered (a second click, a second reviewer,
+  the same decision made again later) is `409 CONFLICT` (`ConflictError`): the run never
+  continues twice.
+
+### An answer must fit the question
+
+agent-runs checks every answer against what was asked before anything is written, so a
+run never continues on an answer its agent cannot use. The check is
+`trellis.runs.answers`, the same one the harness makes for a run it keeps in its own
+process:
+
+- An `ANSWER` must fit the interrupt's `expects` (a JSON Schema); without `expects`, an
+  interrupt with `options` takes only one of them.
+- An `EDIT` of a question (an interrupt with no `tool_call`) carries a `payload` that fits
+  `expects`. Edited tool-call arguments are checked by the harness, which knows the tool's
+  schema.
+- `APPROVE`, `REJECT` and `CANCEL` carry nothing to check.
+
+A misfit is `422 VALIDATION` (`ValidationError` in the SDK), its detail saying what does not
+fit (`the answer['qty'] does not fit what was asked: 'two' is not of type 'integer'`), and
+the run keeps waiting for a good answer. A question whose `expects` is not a JSON Schema at
+all is refused when it is asked: the `pause` is `422`, and the run keeps running.
 
 ## Artifacts
 

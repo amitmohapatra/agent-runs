@@ -1,4 +1,4 @@
-# agent-runs API (0.3.0)
+# agent-runs API (0.3.1)
 
 Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
 same header), a key issued by the Memory Service (the one key registry; see
@@ -25,6 +25,12 @@ semantics of [Runs](#runs).
 0.3.0 changed the wire in place (its consumers are the platform's own repositories): errors
 are problems instead of `{"detail": …}`, listings page with `cursor` and `Link`, and the
 limits, the rate limit and the repeat semantics below are new.
+
+0.3.1 keeps every shape and changes what happens: a run's own `deadline` is enforced (the
+ticker ends it `TIMEOUT`); only lapsed leases count toward failing a run, not answers; the
+very same resolution repeated answers the run instead of `409`; an answer that does not fit
+its question, and a question whose `expects` is no JSON Schema, are `422`. The SDK's
+`Worker` ends a run whose handler raised as `ERROR` at once.
 
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
@@ -199,6 +205,14 @@ CONFLICT` that says only that the id cannot be used, not that or by whom it is h
 `details.differing` naming the fields, and no run. `on_behalf_of` must be a principal the key
 may act as.
 
+`deadline` (optional) is when the run must be done by. Nothing needs to watch it: within a
+tick of it passing, the ticker ends a run that has not ended (`QUEUED`, `RUNNING` or
+`PAUSED`: time in the queue and time waiting for a person count) as `TIMEOUT`, with the
+error `{"code": "run_deadline", "category": "TIMEOUT", "retryable": false}`, announced as
+`run.finished`. A worker still running it gets `409 LEASE_LOST` on its next heartbeat or
+write and must stop. An interrupt's own `deadline` (below) is separate: it escalates or
+ends one wait; the run's ends the run.
+
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
 ```json
@@ -215,8 +229,12 @@ may act as.
 
 Claims use `SELECT … FOR UPDATE SKIP LOCKED`: concurrent claimers never receive the same run
 and never wait on each other. `attempt` is not changed by a claim; it counts executions and
-was already incremented when the run was put back on the queue. `204` means nothing is
-queued for those agents; poll again later.
+was already incremented when the run was put back on the queue. A lease nobody extends in
+time lapses: within a tick the ticker puts the run back on the queue as the next attempt,
+and on its 5th lapse (`MAX_LEASE_LAPSES`) ends it `ERROR` with code `lease_expired` instead.
+Lapses are counted on their own, not by `attempt`, so answering a run many times never
+brings it closer to failing. `204` means nothing is queued for those agents; poll again
+later.
 
 ### `POST /v1/runs/{id}/heartbeat` → `200 Lease`
 
@@ -251,6 +269,10 @@ otherwise), and optionally the executor's `checkpoint`:
  "checkpoint": {"asks": {…}, "tools": {…}, "framework": {…}}}
 ```
 
+`interrupt.expects`, when given, must be a JSON Schema: one that is not is `422`, the detail
+saying why (`expects is not a valid JSON Schema: …`), and the run is not paused. Answers are
+checked against it on `resume`.
+
 `RUNNING → PAUSED`. The interrupt is kept as `awaiting`; `assignee` and `deadline` are
 indexed for the inbox and the escalation sweep. Announced as `run.paused`. The lease ends:
 a worker pausing a run lets go of it.
@@ -260,7 +282,8 @@ a worker pausing a run lets go of it.
 interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.checkpoint` on
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` answer, a
-`TIMEOUT`, a run failed after `MAX_ATTEMPTS`) clears it. Larger than 1 MiB as compact JSON
+`TIMEOUT`, a run past its deadline, a run failed on its `MAX_LEASE_LAPSES`-th lapsed lease)
+clears it. Larger than 1 MiB as compact JSON
 (`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
 
@@ -291,7 +314,12 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
  "answer": null, "reviewer": "user:alice", "payload": null}
 ```
 
-`decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`). The
+`decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`).
+**The answer must fit the question** (`trellis.runs.answers`, checked before anything is
+written): an `ANSWER` fits the interrupt's `expects`, or, with no `expects`, is one of its
+`options` when it has some; an `EDIT` of a question (no `tool_call`) carries a `payload` that
+fits `expects`; `APPROVE`, `REJECT` and `CANCEL` carry nothing to check. A misfit is `422
+VALIDATION` whose detail says what does not fit, and the run keeps waiting. The
 resolution is kept as `last_resolution`, appended to the run's resolution history in the
 same transaction (`GET /v1/runs/{id}/resolutions`), and:
 
@@ -301,9 +329,15 @@ same transaction (`GET /v1/runs/{id}/resolutions`), and:
     `QUEUED` and a worker claims it again, finding the answer in `run.last_resolution`;
   - a run recorded in process goes to `RUNNING`, for the process that resumes it.
 
-`409` when the run is not `PAUSED` (a second answer) or waits on a different
-`interrupt_id`; `422` when `run_id` names another run; `403` when the key may not answer it
-(below). Announced as `run.finished` only for `CANCEL`.
+**A retried resume is not an error.** The very same resolution sent again (every field,
+`resolved_at` included: it is set once, when the answer is made, so a client's retry after
+a lost answer sends it unchanged) answers `200` with the run as it is now, even after the
+run moved on, and changes nothing: no second resolution, no event, no attempt.
+
+`409` for any other answer to an interrupt already answered (a second click or a second
+reviewer: its `resolved_at` differs), or when the run is not `PAUSED` or waits on a
+different `interrupt_id`; `422` when `run_id` names another run or the answer does not fit
+the question; `403` when the key may not answer it (below), checked first. Announced as `run.finished` only for `CANCEL`.
 
 #### Who may answer a paused run
 
@@ -412,7 +446,7 @@ already deleted.
 
 ### Retention
 
-When a run ends (`finish`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` after `MAX_ATTEMPTS`),
+When a run ends (`finish`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` after `MAX_LEASE_LAPSES`),
 its artifacts get `expires_at = ended + 7 days` (`ARTIFACT_RETENTION`); until then they are
 still readable. The ticker deletes each expired artifact's blob, then its record; a blob
 that cannot be deleted keeps its record for the next tick.
@@ -524,7 +558,7 @@ deliveries still owed to the subscription. Another tenant's id is `404`.
 |---|---|
 | `run.paused` | a run pauses (`/pause`) |
 | `run.escalated` | the ticker moves an overdue interrupt to `escalate_to` |
-| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a lease lapsed `MAX_ATTEMPTS` times |
+| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a run past its own `deadline`, a lease lapsed `MAX_LEASE_LAPSES` times |
 
 The event is written to an outbox in the same transaction as the run change, one row per
 subscription of the tenant that wants it, and the ticker sends it (so within one tick,

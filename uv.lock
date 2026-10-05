@@ -14,7 +14,7 @@ members = [
 
 [[package]]
 name = "agent-runs"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -1611,17 +1611,17 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "trellis-runs"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "sdk/python" }
 dependencies = [
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "pydantic" },
     { name = "trellis-contracts" },
 ]
 
 [package.optional-dependencies]
 dev = [
-    { name = "jsonschema" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -1631,7 +1631,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
-    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.23" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "pydantic", specifier = ">=2.13,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },

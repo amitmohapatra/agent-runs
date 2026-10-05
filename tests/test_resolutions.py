@@ -3,6 +3,10 @@ HITL audit trail. A row exists exactly when the resume took effect."""
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta
+
+from sqlalchemy import text
 from trellis.contracts.runs import ToolCall
 
 from tests.conftest import pause, resolution, started
@@ -109,3 +113,75 @@ async def test_a_queued_run_answered_back_onto_the_queue_is_kept_too(client) -> 
     assert resumed["status"] == "QUEUED"
     [entry] = await _history(client, run["run_id"])
     assert entry["resolution"]["decision"] == "APPROVE" and entry["attempt"] == 1
+
+
+# ------------------------------------------------------------------ a retried resume
+
+
+def _later(body: dict) -> dict:
+    """The same answer, made a second later: what a second click sends."""
+    when = datetime.fromisoformat(body["resolved_at"]) + timedelta(seconds=1)
+    return {**body, "resolved_at": when.isoformat()}
+
+
+async def test_a_retried_resume_answers_the_run_and_changes_nothing(client) -> None:
+    """A client that lost the answer to its resume sends the very same resolution again: it
+    gets the run, not a conflict, and the run moves on once."""
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = resolution(await _pause(client, run["run_id"]), "ANSWER", answer="yes")
+    url = f"/v1/runs/{run['run_id']}/resume"
+    first = await client.post(url, json=body)
+    again = await client.post(url, json=body)
+    assert first.status_code == again.status_code == 200, again.text
+    assert again.json() == first.json()
+    assert (again.json()["status"], again.json()["attempt"]) == ("RUNNING", 2)
+    assert len(await _history(client, run["run_id"])) == 1
+
+
+async def test_a_retry_after_the_run_moved_on_answers_it_as_it_is_now(client) -> None:
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = resolution(await _pause(client, run["run_id"]))
+    url = f"/v1/runs/{run['run_id']}/resume"
+    await client.post(url, json=body)
+    asked_again = await _pause(client, run["run_id"])
+    retried = await client.post(url, json=body)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["awaiting"] == asked_again["awaiting"]
+    assert len(await _history(client, run["run_id"])) == 1
+
+
+async def test_any_other_answer_to_an_answered_interrupt_is_a_conflict(client) -> None:
+    """Only the very same resolution is a repeat: answered a second later, by someone else or
+    otherwise, it is a second answer and is refused, so the run never continues twice."""
+    run = (await client.post("/v1/runs", json=started())).json()
+    waiting = await _pause(client, run["run_id"])
+    body = resolution(waiting, reviewer="alice")
+    url = f"/v1/runs/{run['run_id']}/resume"
+    await client.post(url, json=body)
+    for second in (_later(body), {**body, "reviewer": "bob"}, {**body, "decision": "REJECT"}):
+        refused = await client.post(url, json=second)
+        assert refused.status_code == 409 and refused.json()["code"] == "CONFLICT"
+    assert len(await _history(client, run["run_id"])) == 1
+
+
+async def test_concurrent_resumes_continue_the_run_once(app, client) -> None:
+    """Under the row lock the second of two simultaneous resumes sees the first's answer: the
+    same resolution twice answers both with the run, two different ones refuse one."""
+    hook = {"url": "https://ui.example/h", "events": ["run.finished"]}
+    assert (await client.post("/v1/webhooks", json=hook)).status_code == 201
+    run = (await client.post("/v1/runs", json=started())).json()
+    body = resolution(await _pause(client, run["run_id"]), "CANCEL")
+    url = f"/v1/runs/{run['run_id']}/resume"
+    both = await asyncio.gather(client.post(url, json=body), client.post(url, json=body))
+    assert [r.status_code for r in both] == [200, 200]
+    assert both[0].json() == both[1].json()
+    async with app.state.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM webhook_deliveries")) == 1
+
+    other = (await client.post("/v1/runs", json=started())).json()
+    body = resolution(await _pause(client, other["run_id"]))
+    url = f"/v1/runs/{other['run_id']}/resume"
+    raced = await asyncio.gather(client.post(url, json=body), client.post(url, json=_later(body)))
+    assert sorted(r.status_code for r in raced) == [200, 409]
+    for history in (await _history(client, run["run_id"]), await _history(client, other["run_id"])):
+        assert len(history) == 1
