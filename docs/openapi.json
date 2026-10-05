@@ -517,7 +517,7 @@
       },
       "Interrupt": {
         "additionalProperties": false,
-        "description": "The framework-neutral record of a paused run: what is asked, what shape an answer\ntakes, what the UI needs, who must answer by when, and the tool call under approval when\nthere is one. Surfaces translate it (AG-UI ``RunFinished{outcome: interrupt}``, A2A\n``input-required``, a webhook) and the run store keeps it as ``awaiting``.\n\n``ui`` is the control a surface renders; ``assignee`` is a principal (``user:u1``,\n``role:procurement``) an inbox is filtered by; past ``deadline`` the run goes to\n``escalate_to``, or times out when nobody is named. Data too large to travel with the\nquestion (a table, a diff) goes by reference in ``payload_ref``.",
+        "description": "The framework-neutral record of a paused run: what is asked, what shape an answer\ntakes, what the UI needs, who must answer by when, and the tool call under approval when\nthere is one. Surfaces translate it (AG-UI ``RunFinished{outcome: interrupt}``, A2A\n``input-required``, a webhook) and the run store keeps it as ``awaiting``.\n\n``ui`` is the control a surface renders; ``component`` names the asker's own screen, which\na surface that has it renders instead (with ``props`` as they are), ``ui`` staying the\nfallback; ``ui_schema`` gives widget hints for the form ``expects`` describes.\n``options`` are plain strings or :class:`Option` objects; with ``multiple`` the answer is a\nlist of their values. ``assignee`` is a principal (``user:u1``, ``role:procurement``) an\ninbox is filtered by; past ``deadline`` the run goes to ``escalate_to``, or times out when\nnobody is named. Data too large to travel with the question (a table, a diff) goes by\nreference in ``payload_ref``.",
         "properties": {
           "assignee": {
             "anyOf": [
@@ -534,6 +534,23 @@
               "role:procurement"
             ],
             "title": "Assignee"
+          },
+          "component": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name of the asker's own screen, rendered instead of ui by a surface that has it; needs no expects, but an answer still fits expects when given.",
+            "examples": [
+              "refund-review"
+            ],
+            "title": "Component"
           },
           "created_at": {
             "description": "When the run paused (ISO 8601, timezone-aware; UTC unless given).",
@@ -595,10 +612,32 @@
             "title": "Interrupt Id",
             "type": "string"
           },
+          "multiple": {
+            "default": false,
+            "description": "Whether several may be picked: the answer is then a list of distinct option values (or what expects describes); needs options or expects.",
+            "title": "Multiple",
+            "type": "boolean"
+          },
           "options": {
-            "description": "Choices offered, in display order; required (non-empty) for CHOICE.",
+            "description": "Choices offered, in display order: plain strings or Option objects (value, label, description), with distinct values; required (non-empty) for CHOICE.",
+            "examples": [
+              [
+                "EU",
+                {
+                  "label": "United States",
+                  "value": "us"
+                }
+              ]
+            ],
             "items": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/Option"
+                }
+              ]
             },
             "title": "Options",
             "type": "array"
@@ -626,6 +665,19 @@
               }
             ],
             "description": "Reference to data too large to travel with the question (a table, a diff), stored as a run artifact."
+          },
+          "props": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Data for component, passed to it as is and never interpreted (JSON object, unredacted); needs component.",
+            "title": "Props"
           },
           "question": {
             "description": "What the person is asked, shown as is; must not be blank.",
@@ -663,7 +715,7 @@
           },
           "ui": {
             "default": "approve",
-            "description": "Control a surface renders: approve (yes/no), form (fields shaped by expects), table, diff, or choice (one of options).",
+            "description": "Control a surface renders: approve (yes/no), form (fields shaped by expects), table, diff, or choice (one of options); the fallback when component is set.",
             "enum": [
               "approve",
               "form",
@@ -673,6 +725,26 @@
             ],
             "title": "Ui",
             "type": "string"
+          },
+          "ui_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Widget hints for the form expects describes, in the react-jsonschema-form uiSchema convention; None for the surface's defaults.",
+            "examples": [
+              {
+                "reason": {
+                  "ui:widget": "textarea"
+                }
+              }
+            ],
+            "title": "Ui Schema"
           }
         },
         "required": [
@@ -714,6 +786,22 @@
             "description": "The answer to a question, any JSON value shaped by the interrupt's expects; None for a decision about a tool call.",
             "title": "Answer"
           },
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The reviewer's remark on the decision, whatever it is; carried into the feedback record. None for none.",
+            "examples": [
+              "Fine this once; refunds over EUR 500 need finance."
+            ],
+            "title": "Comment"
+          },
           "decision": {
             "$ref": "#/components/schemas/InterruptDecision",
             "description": "What was decided. EDIT carries the edited arguments in payload."
@@ -735,6 +823,16 @@
             ],
             "description": "For EDIT, the tool call's edited arguments (required, non-empty); otherwise optional extra data.",
             "title": "Payload"
+          },
+          "remember": {
+            "default": "once",
+            "description": "once: the decision covers this call only. run: approve calls like it for the rest of the run without asking again (APPROVE of a tool call only).",
+            "enum": [
+              "once",
+              "run"
+            ],
+            "title": "Remember",
+            "type": "string"
           },
           "resolved_at": {
             "description": "When it was answered (ISO 8601, timezone-aware; UTC unless given).",
@@ -815,6 +913,52 @@
           "expires_at"
         ],
         "title": "Lease",
+        "type": "object"
+      },
+      "Option": {
+        "additionalProperties": false,
+        "description": "One choice an interrupt offers. ``value`` is what an answer that picks it carries;\n``label`` and ``description`` are what a person sees. A plain string among\n``Interrupt.options`` is an option whose value is that string, shown as it is.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A longer explanation shown with the label; None for none.",
+            "title": "Description"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What a person sees for it; None shows the value.",
+            "examples": [
+              "Europe (Frankfurt)"
+            ],
+            "title": "Label"
+          },
+          "value": {
+            "description": "What an answer that picks this option carries; not blank.",
+            "examples": [
+              "eu"
+            ],
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "Option",
         "type": "object"
       },
       "Problem": {
@@ -1013,6 +1157,23 @@
             ],
             "title": "Agent Version"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
+          },
           "deadline": {
             "anyOf": [
               {
@@ -1074,6 +1235,17 @@
             ],
             "description": "Run that started this one as a nested agent run; None for a top-level run.",
             "title": "Parent Run Id"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "queue": {
             "default": false,
@@ -1270,6 +1442,23 @@
             "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; never on a final run. Size bounded by the service.",
             "title": "Checkpoint"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
+          },
           "created_at": {
             "description": "When the run was created (ISO 8601, timezone-aware; UTC unless given).",
             "format": "date-time",
@@ -1363,6 +1552,17 @@
             ],
             "description": "Run that started this one as a nested agent run; None for a top-level run.",
             "title": "Parent Run Id"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "run_id": {
             "description": "Run id: the caller's context agent_run_id, or 'run_' plus 32 hex characters minted here.",
@@ -1548,6 +1748,22 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that set the schedule, copied into each fired run's RunStart.agent_version; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
+          },
           "cadence": {
             "description": "When it fires: a cron expression or a named bucket (hourly, daily, weekly, weekdays, manual), evaluated in timezone.",
             "examples": [
@@ -1690,6 +1906,22 @@
             "title": "Tenant Id",
             "type": "string"
           },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time each fired run may take, in seconds, copied into its RunStart.timeout_seconds; None: no limit of its own.",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
+          },
           "timezone": {
             "default": "UTC",
             "description": "IANA time zone the cadence is evaluated in.",
@@ -1731,12 +1963,28 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider.",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``\nand ``agent_version`` are copied into the :class:`RunStart` of every fire.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
             "title": "Agent Id",
             "type": "string"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that set the schedule, copied into each fired run's RunStart.agent_version; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
           },
           "cadence": {
             "description": "When it fires: a cron expression or a named bucket (hourly, daily, weekly, weekdays, manual), evaluated in timezone.",
@@ -1786,6 +2034,22 @@
             "title": "Tenant Id",
             "type": "string"
           },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time each fired run may take, in seconds, copied into its RunStart.timeout_seconds; None: no limit of its own.",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
+          },
           "timezone": {
             "default": "UTC",
             "description": "IANA time zone the cadence is evaluated in.",
@@ -1834,6 +2098,19 @@
             ],
             "description": "Fire runs of this agent instead.",
             "title": "Agent Id"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent version its runs record; null removes it.",
+            "title": "Agent Version"
           },
           "cadence": {
             "anyOf": [
@@ -1887,6 +2164,19 @@
             ],
             "description": "A new label (need not be unique).",
             "title": "Name"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The working-time limit of the runs it fires, in seconds; null removes it.",
+            "title": "Timeout Seconds"
           },
           "timezone": {
             "anyOf": [

@@ -42,6 +42,16 @@ class ScheduleUpdate(BaseModel):
     enabled: bool | None = Field(
         default=None, description="false pauses; true resumes (clearing an auto-pause)."
     )
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="The working-time limit of the runs it fires, in seconds; null removes it.",
+    )
+    agent_version: str | None = Field(
+        default=None,
+        max_length=128,
+        description="The agent version its runs record; null removes it.",
+    )
     metadata: dict[str, Any] | None = Field(
         default=None, description="Merged into the schedule's metadata."
     )

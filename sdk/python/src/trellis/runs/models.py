@@ -88,6 +88,8 @@ class ScheduleUpdate(BaseModel):
     input: Any = None
     workspace_id: str | None = None
     enabled: bool | None = None
+    timeout_seconds: float | None = None
+    agent_version: str | None = None
     metadata: dict[str, Any] | None = None
 
 

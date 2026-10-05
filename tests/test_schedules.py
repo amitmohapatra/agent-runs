@@ -107,6 +107,33 @@ async def test_a_fire_sends_todays_instruction_not_the_one_frozen_at_creation(ap
     assert (await queued_runs(app))[-1]["input"] == {"topic": "calendar"}
 
 
+async def test_a_fired_run_takes_the_schedules_working_time_limit_and_agent_version(
+    app, client
+) -> None:
+    body = scheduled(timeout_seconds=600, agent_version="2026.10.05-3f2a1c")
+    schedule = (await client.post("/v1/schedules", json=body)).json()
+    assert (schedule["timeout_seconds"], schedule["agent_version"]) == (600, "2026.10.05-3f2a1c")
+    fired = (await client.post(f"/v1/schedules/{schedule['schedule_id']}/fire")).json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    assert (run["timeout_seconds"], run["agent_version"]) == (600, "2026.10.05-3f2a1c")
+    # an update changes what the next fire copies; null removes it
+    sid = schedule["schedule_id"]
+    changed = await client.patch(
+        f"/v1/schedules/{sid}", json={"timeout_seconds": None, "agent_version": "v8"}
+    )
+    assert (changed.json()["timeout_seconds"], changed.json()["agent_version"]) == (None, "v8")
+    again = (await client.post(f"/v1/schedules/{sid}/fire")).json()
+    run = (await client.get(f"/v1/runs/{again['run_id']}")).json()
+    assert (run["timeout_seconds"], run["agent_version"]) == (None, "v8")
+    refused = await client.patch(f"/v1/schedules/{sid}", json={"timeout_seconds": 0})
+    assert refused.status_code == 422
+    # a schedule that sets neither fires runs that carry neither
+    plain = (await client.post("/v1/schedules", json=scheduled())).json()
+    fired = (await client.post(f"/v1/schedules/{plain['schedule_id']}/fire")).json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    assert run["timeout_seconds"] is None and run["agent_version"] is None
+
+
 async def test_on_behalf_of_is_required_and_not_blank(client) -> None:
     body = scheduled()
     body.pop("on_behalf_of")

@@ -1,9 +1,10 @@
 """Firing a schedule: queue one run for one tick, in the same transaction that advances the
 schedule, idempotent on ``(schedule_id, fire_time)``.
 
-The run is built from the stored schedule and nothing else (tenant, agent, input and above
-all ``on_behalf_of``), so no request can make a schedule fire as someone it was not made
-for. A repeated fire for the same tick finds the run the first one queued.
+The run is built from the stored schedule and nothing else (tenant, agent, input, its
+working-time limit and agent version, and above all ``on_behalf_of``), so no request can make
+a schedule fire as someone it was not made for. A repeated fire for the same tick finds the
+run the first one queued.
 """
 
 from __future__ import annotations
@@ -68,6 +69,8 @@ class Firing:
             workspace_id=schedule.workspace_id,
             on_behalf_of=schedule.on_behalf_of,
             input=schedule.input,
+            timeout_seconds=schedule.timeout_seconds,
+            agent_version=schedule.agent_version,
             idempotency_key=key,
             metadata={
                 "schedule_id": schedule.schedule_id,
