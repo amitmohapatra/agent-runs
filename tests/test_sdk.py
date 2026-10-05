@@ -105,8 +105,11 @@ async def test_a_durable_run_through_the_sdk(runs: RunsClient) -> None:
     trail = await runs.resolutions(queued.run_id, tenant="acme")
     assert [e.resolution.reviewer for e in trail.items] == ["user:alice"]
     assert await runs.get("run_missing", tenant="acme") is None
+    retried = await runs.resume(answer, tenant="acme")  # the same answer, sent again
+    assert (retried.status, retried.updated_at) == (RunStatus.SUCCESS, done.updated_at)
+    second = answer.model_copy(update={"decision": InterruptDecision.REJECT})
     with pytest.raises(ConflictError):  # a second answer: the run is no longer paused
-        await runs.resume(answer, tenant="acme")
+        await runs.resume(second, tenant="acme")
 
 
 async def test_a_lost_lease_is_a_lease_lost_error_not_a_conflict(runs: RunsClient) -> None:

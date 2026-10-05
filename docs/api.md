@@ -314,9 +314,15 @@ same transaction (`GET /v1/runs/{id}/resolutions`), and:
     `QUEUED` and a worker claims it again, finding the answer in `run.last_resolution`;
   - a run recorded in process goes to `RUNNING`, for the process that resumes it.
 
-`409` when the run is not `PAUSED` (a second answer) or waits on a different
-`interrupt_id`; `422` when `run_id` names another run; `403` when the key may not answer it
-(below). Announced as `run.finished` only for `CANCEL`.
+**A retried resume is not an error.** The very same resolution sent again (every field,
+`resolved_at` included: it is set once, when the answer is made, so a client's retry after
+a lost answer sends it unchanged) answers `200` with the run as it is now, even after the
+run moved on, and changes nothing: no second resolution, no event, no attempt.
+
+`409` for any other answer to an interrupt already answered (a second click or a second
+reviewer: its `resolved_at` differs), or when the run is not `PAUSED` or waits on a
+different `interrupt_id`; `422` when `run_id` names another run; `403` when the key may not
+answer it (below). Announced as `run.finished` only for `CANCEL`.
 
 #### Who may answer a paused run
 

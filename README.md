@@ -169,7 +169,7 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
 | `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
-| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution` |
+| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution`; the same resolution repeated answers the run as it is now |
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
@@ -281,6 +281,20 @@ async with RunsClient(api_key=priya_key) as runs:
 ```
 
 The rule is `answering.py`, one function.
+
+### An answer is taken once
+
+A paused run continues once per question, automatically safe against retries and double
+clicks alike:
+
+- **The same answer sent again** (the SDK resends a resume whose answer it lost: no
+  response, `502`, `503`, `504`) answers `200` with the run as it is now and changes
+  nothing: no second resolution, no second event, no second attempt. "The same" means the
+  very same `InterruptResolution`, `resolved_at` included, which is set once, when the
+  person answered.
+- **Any other answer** to a question already answered (a second click, a second reviewer,
+  the same decision made again later) is `409 CONFLICT` (`ConflictError`): the run never
+  continues twice.
 
 ## Artifacts
 

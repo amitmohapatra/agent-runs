@@ -162,7 +162,9 @@ class RunsClient:
         """Answer the interrupt the run waits on: ``CANCEL`` ends it, any other decision
         continues it as its next attempt. A key restricted to listed people answers only as
         one of them (``resolution.reviewer``), and only a run assigned to that person or to
-        nobody: anything else raises :class:`AuthorizationError` saying why."""
+        nobody: anything else raises :class:`AuthorizationError` saying why. Safe to retry:
+        the same ``resolution`` again answers the run as it is now; another resolution for
+        an interrupt already answered (a second click) raises :class:`ConflictError`."""
         data = await self._transport.json(
             "POST",
             f"/v1/runs/{resolution.run_id}/resume",

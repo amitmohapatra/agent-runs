@@ -1877,7 +1877,7 @@
       "name": "agent-runs",
       "url": "https://github.com/amitmohapatra/agent-runs"
     },
-    "description": "\nDurable agent runs, the worker queue, the human inbox, and the schedules that start runs.\nThis service never executes an agent: a harness does, in its own process or as a worker\nclaiming queued runs, and records here what happened.\n\n### Authentication\nEvery `/v1` route needs `X-API-Key` (any case), a key issued by the Memory Service, which\nagent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key names the\ntenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own\ntenant. The `ops` routes need no key.\n\nReading is tenant-wide for every key. Answering a paused run (`resume`) is not: an admin or\nplatform key, or one that may act for anyone (`*` in `may_act_as`, the default), answers any\nrun; a key restricted to listed people answers only as one of them, and only a run assigned to\nthat person or to nobody (never one assigned to a group).\n\n### Errors\nEvery error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on\n`code`. `LEASE_LOST` (409) tells a worker it no longer holds the run's lease: stop working the\nrun. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503) and\n`RATE_LIMIT` (429) are retryable after `Retry-After` seconds.\n\n### Retries\nStarting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause` or\n`finish` by the caller that made it answers the stored run; claims and heartbeats are safe to\nrepeat. A client may retry transport errors, 429, 502, 503 and 504.\n\n### Pages\nEvery listing takes `cursor` and `limit` and answers `Link: <url>; rel=\"next\"` when there is\nmore; the bodies are bare arrays.\n\n### Limits\nJSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint\n1 MiB, an artifact 50 MiB. Each tenant's requests draw on a per-process token bucket\n(`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).\n",
+    "description": "\nDurable agent runs, the worker queue, the human inbox, and the schedules that start runs.\nThis service never executes an agent: a harness does, in its own process or as a worker\nclaiming queued runs, and records here what happened.\n\n### Authentication\nEvery `/v1` route needs `X-API-Key` (any case), a key issued by the Memory Service, which\nagent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key names the\ntenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own\ntenant. The `ops` routes need no key.\n\nReading is tenant-wide for every key. Answering a paused run (`resume`) is not: an admin or\nplatform key, or one that may act for anyone (`*` in `may_act_as`, the default), answers any\nrun; a key restricted to listed people answers only as one of them, and only a run assigned to\nthat person or to nobody (never one assigned to a group).\n\n### Errors\nEvery error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on\n`code`. `LEASE_LOST` (409) tells a worker it no longer holds the run's lease: stop working the\nrun. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503) and\n`RATE_LIMIT` (429) are retryable after `Retry-After` seconds.\n\n### Retries\nStarting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause` or\n`finish` by the caller that made it answers the stored run, and a repeated `resume` with the\nvery same resolution answers the run as it is now; claims and heartbeats are safe to repeat.\nA client may retry transport errors, 429, 502, 503 and 504.\n\n### Pages\nEvery listing takes `cursor` and `limit` and answers `Link: <url>; rel=\"next\"` when there is\nmore; the bodies are bare arrays.\n\n### Limits\nJSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint\n1 MiB, an artifact 50 MiB. Each tenant's requests draw on a per-process token bucket\n(`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).\n",
     "license": {
       "name": "Proprietary"
     },
@@ -5914,7 +5914,7 @@
     },
     "/v1/runs/{run_id}/resume": {
       "post": {
-        "description": "Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it\nas the next attempt: ``QUEUED`` for a worker when the run came from the queue, else\n``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's\n``resolutions``, in the same transaction.\n\nWho may answer: an admin or platform key, and a key that may act for anyone (``*`` in\n``may_act_as``, the default), any run; a key restricted to listed people, only as one of\nthem (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run\nassigned to that person or to nobody, checked against the assignee now (after any\nescalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.",
+        "description": "Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it\nas the next attempt: ``QUEUED`` for a worker when the run came from the queue, else\n``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's\n``resolutions``, in the same transaction.\n\nWho may answer: an admin or platform key, and a key that may act for anyone (``*`` in\n``may_act_as``, the default), any run; a key restricted to listed people, only as one of\nthem (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run\nassigned to that person or to nobody, checked against the assignee now (after any\nescalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.\n\nRepeated with the very same resolution (its ``resolved_at`` included), as a client\nretries it after losing the answer, it answers the run as it is now and changes nothing.\nAny other answer to an interrupt already answered is 409.",
         "operationId": "runs.resume",
         "parameters": [
           {
@@ -5987,7 +5987,7 @@
                 }
               }
             },
-            "description": "The run: `CANCELLED`, or continuing as the next attempt (`QUEUED` or `RUNNING`).",
+            "description": "The run: `CANCELLED`, or continuing as the next attempt (`QUEUED` or `RUNNING`); for a repeat of the same resolution, the run as it is now.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -6147,7 +6147,7 @@
                 }
               }
             },
-            "description": "CONFLICT: the run is not paused (a second answer), or waits on another interrupt.",
+            "description": "CONFLICT: the interrupt was already answered by another resolution (a second answer), or the run is not paused, or waits on another interrupt.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"

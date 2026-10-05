@@ -306,5 +306,7 @@ A call that fails on the way (no response, `429`, `502`, `503`, `504`) is sent a
 `max_retries` times, after the `Retry-After` the service asked for (at most 30 s) or a
 full-jitter backoff from 0.25 s doubling to 5 s, unless the problem says
 `retryable: false`. Every write agent-runs takes is safe to repeat: a start is idempotent on
-its id, a repeated pause or finish answers the stored run, the same artifact bytes are the
-same artifact, a schedule create is an upsert.
+its id, a repeated pause or finish answers the stored run, a repeated resume with the same
+`InterruptResolution` object answers the run as it is now (a new resolution for an
+interrupt already answered, a second click, is a `ConflictError`), the same artifact bytes
+are the same artifact, a schedule create is an upsert.

@@ -170,11 +170,12 @@ async def test_an_answer_to_another_question_is_a_conflict(client) -> None:
 
 
 async def test_a_second_answer_is_a_conflict(client) -> None:
-    """Two clicks, one pause: the second finds nothing waiting."""
+    """Two clicks, one pause: each click is its own resolution, and the second finds nothing
+    waiting."""
     run = await paused(client)
-    body = resolution(run)
-    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 200
-    assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)).status_code == 409
+    url = f"/v1/runs/{run['run_id']}/resume"
+    assert (await client.post(url, json=resolution(run))).status_code == 200
+    assert (await client.post(url, json=resolution(run, reviewer="bob"))).status_code == 409
 
 
 async def test_a_resolution_for_another_run_is_refused(client) -> None:

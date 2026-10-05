@@ -178,7 +178,7 @@ async def pause(
     "/{run_id}/resume",
     summary="Answer the interrupt a run waits on",
     response_description="The run: `CANCELLED`, or continuing as the next attempt "
-    "(`QUEUED` or `RUNNING`).",
+    "(`QUEUED` or `RUNNING`); for a repeat of the same resolution, the run as it is now.",
     responses={
         403: {
             "description": "AUTHORIZATION: the key may not answer this run. A key restricted "
@@ -188,7 +188,8 @@ async def pause(
             "the key, or X-Trellis-Tenant names a tenant the key may not act for."
         },
         **conflict(
-            "CONFLICT: the run is not paused (a second answer), or waits on another interrupt."
+            "CONFLICT: the interrupt was already answered by another resolution (a second "
+            "answer), or the run is not paused, or waits on another interrupt."
         ),
     },
 )
@@ -207,10 +208,17 @@ async def resume(
     ``may_act_as``, the default), any run; a key restricted to listed people, only as one of
     them (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run
     assigned to that person or to nobody, checked against the assignee now (after any
-    escalation). Anything else is 403 ``AUTHORIZATION``, before anything is written."""
+    escalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.
+
+    Repeated with the very same resolution (its ``resolved_at`` included), as a client
+    retries it after losing the answer, it answers the run as it is now and changes nothing.
+    Any other answer to an interrupt already answered is 409."""
     at = now()
-    run = await RunStore(db).resume(who.tenant_id, run_id, body, answerer=who.credential, now=at)
-    await WebhookStore(db).announce(run, now=at)
+    run, resumed = await RunStore(db).resume(
+        who.tenant_id, run_id, body, answerer=who.credential, now=at
+    )
+    if resumed:
+        await WebhookStore(db).announce(run, now=at)
     await db.commit()
     return run
 

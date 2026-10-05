@@ -148,6 +148,11 @@ def _settled(row: RunRow, status: RunStatus, worker_id: str | None) -> bool:
     return row.status == status.value and row.settled_by == worker_id
 
 
+def _resolution_id(resolution: InterruptResolution) -> str:
+    """The one id an interrupt's answer is kept under: an interrupt is answered once."""
+    return stable_id(resolution.run_id, resolution.interrupt_id, prefix="res_")
+
+
 def _requeue(row: RunRow, now: datetime) -> None:
     """Back on the queue for a worker, as the next attempt."""
     _move(row, RunStatus.QUEUED, now)
@@ -266,25 +271,33 @@ class RunStore:
         *,
         answerer: KeyInfo,
         now: datetime,
-    ) -> RunRecord:
+    ) -> tuple[RunRecord, bool]:
         """Answer the interrupt a paused run waits on, as ``answerer`` may
         (``answering.py``: checked against the run's assignee now, before anything is
         written). ``CANCEL`` ends the run; any other decision continues it as the next
         attempt: back on the queue when the run is durable (it was ever queued, so a worker
-        resumes it), else ``RUNNING`` in the caller's process."""
+        resumes it), else ``RUNNING`` in the caller's process.
+
+        Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
+        very same resolution, as a client retries it after losing the answer) answers the
+        run as it is now with ``resumed`` false, changing nothing. Any other answer to an
+        interrupt the run no longer waits on is a ``Conflict``: a second click must not
+        continue the run twice."""
         if resolution.run_id != run_id:
             raise Unprocessable("the resolution answers another run")
         row = await self._locked(tenant_id, run_id, worker_id=None)
-        if row.status != RunStatus.PAUSED or row.awaiting is None:
-            raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
-        asked = Interrupt.model_validate(row.awaiting)
-        if asked.interrupt_id != resolution.interrupt_id:
+        if (row.awaiting or {}).get("interrupt_id") != resolution.interrupt_id:
+            if await self._answered_by(tenant_id, resolution):
+                return _record(row), False
+            if row.status != RunStatus.PAUSED:
+                raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
             raise Conflict(f"run {run_id} is waiting on another interrupt")
+        asked = Interrupt.model_validate(row.awaiting)
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
         row.last_resolution = _json(resolution)
         self._session.add(
             ResolutionRow(
-                resolution_id=stable_id(run_id, resolution.interrupt_id, prefix="res_"),
+                resolution_id=_resolution_id(resolution),
                 run_id=run_id,
                 tenant_id=tenant_id,
                 interrupt_id=resolution.interrupt_id,
@@ -305,7 +318,19 @@ class RunStore:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
         await self._ended([row], now)
-        return await self._flushed(row)
+        return await self._flushed(row), True
+
+    async def _answered_by(self, tenant_id: str, resolution: InterruptResolution) -> bool:
+        """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
+        when the answer is made, so a retried resume sends the same JSON and a second
+        answer (another click, another person) never does."""
+        kept = await self._session.scalar(
+            select(ResolutionRow.resolution).where(
+                ResolutionRow.tenant_id == tenant_id,
+                ResolutionRow.resolution_id == _resolution_id(resolution),
+            )
+        )
+        return kept == _json(resolution)
 
     async def finish(
         self,
