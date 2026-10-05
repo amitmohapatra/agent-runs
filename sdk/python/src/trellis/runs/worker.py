@@ -21,6 +21,12 @@ cancels the handler: it must write nothing more. A heartbeat that says ``cancel_
 then finishes the run ``CANCELLED`` (:attr:`Job.cancel_requested` tells the handler why it
 was cancelled). Schedules and resumed durable runs arrive the same way: as queued runs.
 
+A handler still running when the run's working time is used up (:attr:`Job.remaining_seconds`
+as the claim gave it: its ``timeout_seconds`` or the service's maximum, less what earlier
+attempts worked) is cancelled there and then, and the worker finishes the run ``TIMEOUT``
+(``run_timeout``, not retried), instead of letting it work on until agent-runs' ticker ends
+it and the next heartbeat stops it.
+
 A handler that raises (anything but a lost lease or a cancellation) ends its run at once as
 ``ERROR``, the exception recorded as the contracts classify it (``AgentError.of``: its code,
 category and whether it is retryable), instead of leaving the run to wait for its lease to
@@ -52,7 +58,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
-from trellis.contracts.errors import AgentError
+from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import Interrupt, RunRecord, RunStatus
 from trellis.runs.client import LEASE_SECONDS
 from trellis.runs.errors import LeaseLostError
@@ -206,6 +212,17 @@ class Job:
             worker_id=self.worker_id,
             tenant=self.record.tenant_id,
         )
+
+
+#: The error of a run whose handler the worker stopped at the end of its working time:
+#: agent-runs' own (``run_timeout``), not retried (another attempt would only run as long).
+OUT_OF_TIME: Final = AgentError(
+    code="run_timeout",
+    category=ErrorCategory.TIMEOUT,
+    message="the run used up its working time: the worker stopped it",
+    retryable=False,
+    source="agent-runs",
+)
 
 
 #: What runs a claimed run: anything awaitable, its result ignored.
@@ -371,15 +388,19 @@ class Worker:
             return None
 
     async def _execute(self, claimed: Claimed) -> None:
-        """Run the handler while the lease holds; a lost lease cancels it."""
+        """Run the handler while the lease holds and the run has working time left; a lost
+        lease cancels it, and so does the end of the working time (then the run ends
+        ``TIMEOUT``)."""
         record = claimed.run
         job = Job(record, self.worker_id, self.lease_seconds, self.store)
         job._renew(claimed.lease)
         execution = asyncio.ensure_future(self.handler(job))
         self._held[record.run_id] = (job, execution)
         heartbeat = asyncio.create_task(self._heartbeat(job, execution))
+        working = asyncio.timeout(job.remaining_seconds)
         try:
-            await execution
+            async with working:
+                await execution
         except asyncio.CancelledError:
             if not execution.cancelled():
                 raise
@@ -388,8 +409,12 @@ class Worker:
         except LeaseLostError:
             log.warning("lease on %s lost while the handler wrote: stopped it", record.run_id)
         except Exception as exc:
-            log.exception("run %s failed in the worker", record.run_id)
-            await self._end(job, RunStatus.ERROR, error=AgentError.of(exc))
+            if working.expired():
+                log.warning("run %s used its working time: stopped it", record.run_id)
+                await self._end(job, RunStatus.TIMEOUT, error=OUT_OF_TIME)
+            else:
+                log.exception("run %s failed in the worker", record.run_id)
+                await self._end(job, RunStatus.ERROR, error=AgentError.of(exc))
         finally:
             self._held.pop(record.run_id, None)
             heartbeat.cancel()

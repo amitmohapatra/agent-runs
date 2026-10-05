@@ -699,3 +699,49 @@ async def test_serve_without_signal_handling_still_runs(monkeypatch: pytest.Monk
     await asyncio.sleep(0.01)
     worker.stop()
     await asyncio.wait_for(task, 5)
+
+
+async def test_a_handler_past_the_working_time_is_stopped_and_the_run_ends_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At the working time the claim said was left, not when the ticker notices."""
+    store = Store(run())
+    store.remaining = 0.05
+    stopped = asyncio.Event()
+
+    async def slow(job: Job) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stopped.set()
+            raise
+
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, slow, ["triage"], worker_id="w-1").run_once()
+    assert stopped.is_set()
+    assert "run run_1 used its working time: stopped it" in caplog.text
+    ended = [call for verb, call in store.writes if verb == "finish"]
+    assert [(e["status"], e["worker_id"]) for e in ended] == [(RunStatus.TIMEOUT, "w-1")]
+    assert ended[0]["error"] == worker_module.OUT_OF_TIME
+    assert (ended[0]["error"].code, ended[0]["error"].retryable) == ("run_timeout", False)
+
+
+async def test_a_handler_that_ends_in_time_is_not_stopped() -> None:
+    store = Store(run())
+    store.remaining = 30.0
+    assert await Worker(store, nothing, ["triage"]).run_once()
+    assert [verb for verb, _ in store.writes] == []
+
+
+async def test_a_handler_raising_its_own_timeout_in_time_ends_its_run_error() -> None:
+    """A timeout of the handler's own (a model call) is not the run's working time."""
+    store = Store(run())
+    store.remaining = 30.0
+
+    async def impatient(job: Job) -> None:
+        raise TimeoutError("the model did not answer")
+
+    assert await Worker(store, impatient, ["triage"]).run_once()
+    ended = [call for verb, call in store.writes if verb == "finish"]
+    assert [e["status"] for e in ended] == [RunStatus.ERROR]
+    assert ended[0]["error"].code == "TimeoutError"
