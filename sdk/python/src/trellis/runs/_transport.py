@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Final
@@ -49,6 +49,9 @@ RETRY_AFTER_MAX_SECONDS: Final = 30.0
 NO_CONTENT: Final = 204
 #: Items a listing page asks for when the caller names no limit (the service allows 1-500).
 PAGE_LIMIT: Final = 50
+#: How long an event stream may stay silent before it counts as broken: the service sends a
+#: comment every 15 s on a quiet stream.
+STREAM_IDLE_SECONDS: Final = 60.0
 #: The wait between attempts; a name of its own so tests can stand it in.
 _sleep = asyncio.sleep
 
@@ -144,6 +147,31 @@ class Transport:
         """A listing's body and the cursor of its next page (``Link: rel="next"``)."""
         response = await self.send("GET", path, **kwargs)
         return response.json(), next_cursor(response.headers.get("link"))
+
+    async def events(
+        self, path: str, *, tenant: str | None = None, params: Mapping[str, Any] | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
+        """A server-sent event stream's events as ``(event, data)``, ids and comments left out;
+        an error answer is raised as its typed error. Not retried: the caller reconnects."""
+        headers = {"Accept": "text/event-stream"}
+        if tenant := tenant or self.tenant:
+            headers[TENANT_HEADER] = tenant
+        timeout = httpx.Timeout(TIMEOUT_SECONDS, read=STREAM_IDLE_SECONDS)
+        async with self._client.stream(
+            "GET", path, headers=headers, params=params, timeout=timeout
+        ) as response:
+            if response.is_error:
+                await response.aread()
+                raise refusal(response)
+            name, data = "message", ""
+            async for line in response.aiter_lines():
+                if line.startswith("event: "):
+                    name = line.removeprefix("event: ")
+                elif line.startswith("data: "):
+                    data = line.removeprefix("data: ")
+                elif not line and data:
+                    yield name, data
+                    name, data = "message", ""
 
     async def aclose(self) -> None:
         if self._owns_client:

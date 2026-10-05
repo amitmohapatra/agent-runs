@@ -23,6 +23,7 @@ from trellis.contracts.runs import (
     Interrupt,
     InterruptDecision,
     InterruptResolution,
+    RunEvent,
     RunRecord,
     RunStart,
     RunStatus,
@@ -46,11 +47,14 @@ from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, U
 from agent_runs.domain.runs import (
     Claimed,
     ClaimRequest,
+    EventsAppend,
+    EventsAppended,
     HeartbeatRequest,
     Lease,
     ReleaseRequest,
     ResolutionEntry,
     RunCancel,
+    RunEventEntry,
     RunFinish,
     RunPause,
     RunSummary,
@@ -60,7 +64,7 @@ from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import ResolutionRow, RunRow
+from agent_runs.store.tables import ResolutionRow, RunEventRow, RunRow
 
 _RECORD_FIELDS = (
     "run_id",
@@ -176,6 +180,15 @@ def _fence(row: RunRow, worker_id: str | None) -> None:
     a worker whose lease lapsed must not write over the run another worker has since
     claimed."""
     if worker_id is not None and row.lease_owner != worker_id:
+        raise LeaseLost(f"worker {worker_id} does not hold the lease on run {row.run_id}")
+
+
+def _held_by(row: RunRow, worker_id: str | None) -> None:
+    """A running run is written by the worker holding its lease (``worker_id``), or, when no
+    worker holds it (it runs in its caller's process), by a caller that names none."""
+    if worker_id is None and row.lease_owner is not None:
+        raise Conflict(f"run {row.run_id} is leased: only its lease holder writes to it")
+    if worker_id != row.lease_owner:
         raise LeaseLost(f"worker {worker_id} does not hold the lease on run {row.run_id}")
 
 
@@ -846,10 +859,7 @@ class RunStore:
         if row is None:
             raise NotFound(f"no run {run_id}")
         if row.status == RunStatus.RUNNING:
-            if worker_id is None and row.lease_owner is not None:
-                raise Conflict(f"run {run_id} is leased: only its lease holder adds artifacts")
-            if worker_id != row.lease_owner:
-                raise LeaseLost(f"worker {worker_id} does not hold the lease on run {run_id}")
+            _held_by(row, worker_id)
         elif row.status == RunStatus.PAUSED:
             if role != PAUSED_ARTIFACT_ROLE:
                 raise Forbidden(f"only a {PAUSED_ARTIFACT_ROLE} key adds to a paused run")
@@ -857,6 +867,73 @@ class RunStore:
             raise LeaseLost(f"run {run_id} is {row.status}; worker {worker_id} holds no lease")
         else:
             raise Conflict(f"run {run_id} is {row.status}; artifacts are added while it runs")
+
+    # ------------------------------------------------------------------ events
+    async def append_events(
+        self, tenant_id: str, run_id: str, append: EventsAppend, *, worker_id: str | None
+    ) -> EventsAppended:
+        """Add events to the run's log, each at the next position. Only while the run is
+        ``RUNNING``, by the worker holding its lease or, when none does, by its caller (as a
+        heartbeat is fenced); never otherwise (409). Every event names this run and tenant
+        (``Unprocessable`` otherwise); one already logged (its attempt and sequence) is
+        skipped, so a retried append adds nothing. The run's row lock orders the positions:
+        two appends to one run never interleave."""
+        if any((e.tenant_id, e.run_id) != (tenant_id, run_id) for e in append.events):
+            raise Unprocessable("an event names another run")
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        if row.status != RunStatus.RUNNING:
+            if worker_id is not None:
+                raise LeaseLost(f"run {run_id} is {row.status}; worker {worker_id} holds no lease")
+            raise Conflict(f"run {run_id} is {row.status}; events are appended while it runs")
+        _held_by(row, worker_id)
+        asked = [(event.attempt, event.sequence) for event in append.events]
+        logged = select(RunEventRow.attempt, RunEventRow.sequence).where(
+            RunEventRow.run_id == run_id,
+            tuple_(RunEventRow.attempt, RunEventRow.sequence).in_(asked),
+        )
+        seen = {(attempt, sequence) for attempt, sequence in await self._session.execute(logged)}
+        last = await self._session.scalar(
+            select(func.coalesce(func.max(RunEventRow.position), 0)).where(
+                RunEventRow.run_id == run_id
+            )
+        )
+        position = int(last or 0)
+        added = 0
+        for event in append.events:
+            if (event.attempt, event.sequence) in seen:
+                continue
+            seen.add((event.attempt, event.sequence))
+            position += 1
+            added += 1
+            self._session.add(
+                RunEventRow(
+                    run_id=run_id,
+                    position=position,
+                    tenant_id=tenant_id,
+                    attempt=event.attempt,
+                    sequence=event.sequence,
+                    event=event.model_dump(mode="json"),
+                )
+            )
+        await self._session.flush()
+        return EventsAppended(appended=added, position=position)
+
+    async def events(
+        self, tenant_id: str, run_id: str, *, after: int, limit: int
+    ) -> tuple[list[RunEventEntry], RunStatus]:
+        """The run's events past position ``after``, oldest first, at most ``limit``, and the
+        run's status read before them: when it has ended, no event comes after these."""
+        status = RunStatus((await self._found(tenant_id, run_id)).status)
+        rows = await self._session.scalars(
+            select(RunEventRow)
+            .where(RunEventRow.run_id == run_id, RunEventRow.position > after)
+            .order_by(RunEventRow.position)
+            .limit(limit)
+        )
+        entries = [
+            RunEventEntry(position=r.position, event=RunEvent.model_validate(r.event)) for r in rows
+        ]
+        return entries, status
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
         """Runs that just ended start their artifacts' retention."""

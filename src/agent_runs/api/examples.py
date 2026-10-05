@@ -42,11 +42,47 @@ START: Final[dict[str, Any]] = {
             "queue": True,
         },
     },
+    "ordered": {
+        "summary": "Queue an urgent run, one at a time per customer",
+        "value": {
+            "tenant_id": "acme",
+            "agent_id": "billing",
+            "input": {"invoice_id": "inv_1002"},
+            "priority": 10,
+            "concurrency_key": "customer:c-7",
+            "queue": True,
+        },
+    },
+}
+
+EVENTS: Final[dict[str, Any]] = {
+    "text": {
+        "summary": "A step and the text it streamed",
+        "value": {
+            "events": [
+                {
+                    "type": "STEP_STARTED",
+                    "tenant_id": "acme",
+                    "run_id": "run_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                    "sequence": 3,
+                    "step": "draft",
+                },
+                {
+                    "type": "TEXT_MESSAGE_CONTENT",
+                    "tenant_id": "acme",
+                    "run_id": "run_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                    "sequence": 4,
+                    "message_id": "msg_1",
+                    "data": {"role": "assistant", "delta": "Two invoices are overdue"},
+                },
+            ]
+        },
+    }
 }
 
 CLAIM: Final[dict[str, Any]] = {
     "claim": {
-        "summary": "Lease the oldest queued run of two agents",
+        "summary": "Lease the next queued run of two agents",
         "value": {"worker_id": "w-1", "agent_ids": ["triage", "billing"], "lease_seconds": 60},
     }
 }

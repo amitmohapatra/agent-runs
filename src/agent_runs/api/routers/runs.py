@@ -4,10 +4,15 @@ does, and records here what happened."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Path, Query, Request, Response
+from fastapi import APIRouter, Body, Header, Path, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
@@ -22,15 +27,24 @@ from agent_runs.api.pagination import (
     decode_cursor,
     link_next,
 )
+from agent_runs.config.constants import (
+    EVENT_KEEPALIVE_SECONDS,
+    EVENT_POLL_SECONDS,
+    EVENT_STREAM_SECONDS,
+    MAX_PAGE,
+)
 from agent_runs.domain.runs import (
     Claimed,
     ClaimRequest,
+    EventsAppend,
+    EventsAppended,
     HeartbeatRequest,
     Lease,
     ReleaseRequest,
     ResolutionEntry,
     RunCancel,
     RunCreate,
+    RunEventEntry,
     RunFinish,
     RunPause,
     RunSummary,
@@ -372,6 +386,132 @@ async def get(run_id: RunId, db: Session, who: Who) -> RunRecord:
     """One run of this tenant, the whole record, its ``worked_seconds`` counting the stretch
     it is running now. Another tenant's run is 404."""
     return await RunStore(db).get(who.tenant_id, run_id, now=now())
+
+
+AfterQuery = Annotated[
+    int,
+    Query(
+        ge=0,
+        description="Only the events past this position: the last one seen (0, the default: "
+        "from the first).",
+    ),
+]
+
+
+@router.post(
+    "/{run_id}/events",
+    summary="Append events to a run's log",
+    response_description="How many were added, and the position of the log's last event.",
+    responses=conflict(_LEASE_LOST),
+)
+async def append_events(
+    run_id: RunId,
+    body: Annotated[EventsAppend, Body(openapi_examples=examples.EVENTS)],
+    db: Session,
+    who: Who,
+    worker_id: WorkerId = None,
+) -> EventsAppended:
+    """Add the run's events (``RunEvent``: AG-UI's vocabulary, each naming this run and
+    tenant, else 422) to its log, in order, each at the next position. Only while the run
+    runs, fenced as a heartbeat is: by the worker holding its lease (``worker_id``), or by
+    the caller it runs in when no worker holds it; 409 otherwise. An event already logged
+    (the same ``attempt`` and ``sequence``) is not added again, so a retried append is safe.
+    Append before pausing or finishing: the log takes nothing after. The log goes when the
+    run is purged."""
+    appended = await RunStore(db).append_events(who.tenant_id, run_id, body, worker_id=worker_id)
+    await db.commit()
+    return appended
+
+
+@router.get(
+    "/{run_id}/events",
+    summary="Read a run's events",
+    response_description="The run's events past `after`, oldest first, at most `limit`.",
+)
+async def events(
+    run_id: RunId,
+    db: Session,
+    who: Who,
+    after: AfterQuery = 0,
+    limit: LimitQuery = DEFAULT_LIMIT,
+) -> list[RunEventEntry]:
+    """The run's log from position ``after`` on, from any replica. The log is read by
+    position rather than by cursor: pass the last ``position`` seen as ``after`` for the
+    next page; the stream (``/events/stream``) counts the same positions."""
+    entries, _ = await RunStore(db).events(who.tenant_id, run_id, after=after, limit=limit)
+    return entries
+
+
+@router.get(
+    "/{run_id}/events/stream",
+    summary="Follow a run's events (server-sent events)",
+    response_class=StreamingResponse,
+    response_description="A `text/event-stream`: each event as `id: <position>`, `event: "
+    '<type>` and `data: <the entry as JSON>`; `event: end` with `data: {"status": …}` once '
+    "the run has ended and its last event was sent.",
+    responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}},
+)
+async def stream_events(
+    run_id: RunId,
+    request: Request,
+    who: Who,
+    after: AfterQuery = 0,
+    last_event_id: Annotated[
+        int | None,
+        Header(
+            alias="Last-Event-ID",
+            ge=0,
+            description="The last position the client saw, as a reconnecting EventSource "
+            "sends it; wins over a smaller `after`.",
+        ),
+    ] = None,
+) -> StreamingResponse:
+    """The run's events past ``after`` (or ``Last-Event-ID``), then each new one as it is
+    appended, whichever replica it was appended to. The stream ends with ``event: end``
+    once the run has ended and every event was sent; a paused run's stream stays open. A
+    comment line every 15 s keeps idle connections open, and after five minutes the
+    service ends the stream without ``end``: reconnect with the last position seen."""
+    async with request.app.state.sessions() as db:  # a 404 before the stream opens
+        await RunStore(db).get(who.tenant_id, run_id, now=now())
+    start = max(after, last_event_id or 0)
+    return StreamingResponse(
+        _follow(request, who.tenant_id, run_id, start),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _sse(event: str, data: str, *, position: int | None = None) -> str:
+    """One server-sent event (data is one line of JSON)."""
+    head = "" if position is None else f"id: {position}\n"
+    return f"{head}event: {event}\ndata: {data}\n\n"
+
+
+async def _follow(request: Request, tenant_id: str, run_id: str, after: int) -> AsyncIterator[str]:
+    """The stream's body: each read in a short transaction of its own, so a stream holds no
+    connection while it waits."""
+    ends_at = time.monotonic() + EVENT_STREAM_SECONDS
+    quiet = 0.0
+    while True:
+        async with request.app.state.sessions() as db:
+            entries, status = await RunStore(db).events(
+                tenant_id, run_id, after=after, limit=MAX_PAGE
+            )
+        for entry in entries:
+            after = entry.position
+            yield _sse(entry.event.type.value, entry.model_dump_json(), position=after)
+        if len(entries) == MAX_PAGE:
+            continue
+        if status.final:
+            yield _sse("end", json.dumps({"status": status.value}))
+            return
+        if time.monotonic() >= ends_at or await request.is_disconnected():
+            return
+        await asyncio.sleep(EVENT_POLL_SECONDS)
+        quiet = 0.0 if entries else quiet + EVENT_POLL_SECONDS
+        if quiet >= EVENT_KEEPALIVE_SECONDS:
+            quiet = 0.0
+            yield ": keepalive\n\n"
 
 
 _RESOLUTIONS_CURSOR = {"recorded_at": datetime, "resolution_id": str}

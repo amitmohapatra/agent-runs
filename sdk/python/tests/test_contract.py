@@ -31,6 +31,7 @@ from trellis.contracts.runs import (
     InterruptDecision,
     InterruptReason,
     InterruptResolution,
+    RunEvent,
     RunRecord,
     RunStart,
     RunStatus,
@@ -41,10 +42,12 @@ from trellis.runs import (
     Claimed,
     DeliveryRecord,
     DeliveryState,
+    EventsAppended,
     FireResult,
     Lease,
     LeaseLostError,
     ResolutionEntry,
+    RunEventEntry,
     RunsClient,
     RunSummary,
     ScheduleUpdate,
@@ -60,6 +63,8 @@ MODELS: dict[str, type[BaseModel]] = {
     "Lease": Lease,
     "Claimed": Claimed,
     "ResolutionEntry": ResolutionEntry,
+    "RunEventEntry": RunEventEntry,
+    "EventsAppended": EventsAppended,
     "ScheduleUpdate": ScheduleUpdate,
     "FireResult": FireResult,
     "Webhook": Webhook,
@@ -115,6 +120,7 @@ ENTRY = {
     "attempt": 1,
     "recorded_at": "2026-10-01T08:00:00Z",
 }
+EVENT = {"type": "STEP_STARTED", "tenant_id": "acme", "run_id": "run_1", "sequence": 0}
 #: what agent-runs answers each operation with: status, JSON body (or bytes, or text)
 ANSWERS: dict[str, tuple[int, Any]] = {
     "runs.start": (201, record()),
@@ -128,6 +134,13 @@ ANSWERS: dict[str, tuple[int, Any]] = {
     "runs.get": (200, record()),
     "runs.list": (200, []),
     "runs.resolutions": (200, [ENTRY]),
+    "runs.append_events": (200, {"appended": 1, "position": 1}),
+    "runs.events": (200, [{"position": 1, "event": EVENT}]),
+    "runs.stream_events": (
+        200,
+        f"id: 1\nevent: STEP_STARTED\ndata: {json.dumps({'position': 1, 'event': EVENT})}\n\n"
+        'event: end\ndata: {"status": "SUCCESS"}\n\n',
+    ),
     "artifacts.upload": (201, artifact()),
     "artifacts.download": (200, b'{"rows": []}'),
     "schedules.create": (201, schedule()),
@@ -193,7 +206,8 @@ class Service:
                 status, content=body, headers={"Content-Type": "application/json"}
             )
         if isinstance(body, str):
-            return httpx.Response(status, text=body, headers={"Content-Type": "text/plain"})
+            media = "text/event-stream" if op == "runs.stream_events" else "text/plain"
+            return httpx.Response(status, text=body, headers={"Content-Type": media})
         if body is None:
             return httpx.Response(status)
         headers = NEXT if op == "runs.list" else {}
@@ -235,6 +249,9 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
             limit=500,
         )
         await runs.resolutions("run_1", cursor="c1", limit=1)
+        await runs.append_events("run_1", [RunEvent.model_validate(EVENT)], worker_id="w-1")
+        await runs.events("run_1", after=0, limit=5)
+        assert [e.position async for e in runs.stream_events("run_1")] == [1]
         await runs.artifacts.download(ref.artifact_id)
         spec = ScheduleSpec(
             tenant_id="acme",

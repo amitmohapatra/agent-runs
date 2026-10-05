@@ -286,6 +286,29 @@ class ResolutionRow(Base):
     __table_args__ = (Index("ix_run_resolutions_run", "tenant_id", "run_id", "recorded_at"),)
 
 
+class RunEventRow(Base):
+    """One event of a run's log, at its ``position`` (1, 2, ...): assigned under the run's
+    row lock, so positions are never committed out of order. ``event`` is the
+    ``RunEvent``."""
+
+    __tablename__ = "run_events"
+
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    #: what the event says it is: a repeated append of it is stored once
+    attempt: Mapped[int] = mapped_column(Integer)
+    sequence: Mapped[int] = mapped_column(Integer)
+    event: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    recorded_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "attempt", "sequence", name="uq_run_events_sequence"),
+    )
+
+
 class RateLimitRow(Base):
     """A tenant's request budget (``api/ratelimit.py``), shared by every replica: the instant
     it would be full again."""

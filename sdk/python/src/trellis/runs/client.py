@@ -26,18 +26,35 @@ from typing import Any, Final, Self
 
 import httpx
 from trellis.contracts.errors import AgentError
-from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStart, RunStatus
+from trellis.contracts.runs import (
+    Interrupt,
+    InterruptResolution,
+    RunEvent,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
+from trellis.runs import _transport
 from trellis.runs._transport import (
     NO_CONTENT,
     PAGE_LIMIT,
     RETRIES,
     TIMEOUT_SECONDS,
     Transport,
+    backoff,
     worker_params,
 )
 from trellis.runs.artifacts import ArtifactsAPI
-from trellis.runs.errors import ConflictError, LeaseLostError
-from trellis.runs.models import Claimed, Lease, Page, ResolutionEntry, RunSummary
+from trellis.runs.errors import ConflictError, DependencyUnavailableError, LeaseLostError
+from trellis.runs.models import (
+    Claimed,
+    EventsAppended,
+    Lease,
+    Page,
+    ResolutionEntry,
+    RunEventEntry,
+    RunSummary,
+)
 from trellis.runs.schedules import SchedulesAPI
 from trellis.runs.webhooks import WebhooksAPI
 
@@ -326,6 +343,77 @@ class RunsClient:
         return Page[ResolutionEntry](
             items=[ResolutionEntry.model_validate(row) for row in rows], next_cursor=after
         )
+
+    # ------------------------------------------------------------------ events
+    async def append_events(
+        self,
+        run_id: str,
+        events: Sequence[RunEvent],
+        *,
+        worker_id: str | None = None,
+        tenant: str | None = None,
+    ) -> EventsAppended:
+        """Add the run's events to its log, in order, while it runs. ``worker_id`` fences the
+        write to the lease holder (:class:`LeaseLostError` otherwise); a run in the caller's
+        own process names none. Safe to retry: an event already logged (its ``attempt`` and
+        ``sequence``) is not added again. Append before pausing or finishing the run."""
+        body = {"events": [event.model_dump(mode="json") for event in events]}
+        data = await self._transport.json(
+            "POST",
+            f"/v1/runs/{run_id}/events",
+            tenant=tenant,
+            json=body,
+            params=worker_params(worker_id),
+        )
+        return EventsAppended.model_validate(data)
+
+    async def events(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        limit: int = PAGE_LIMIT,
+        tenant: str | None = None,
+    ) -> list[RunEventEntry]:
+        """The run's events past position ``after``, oldest first, at most ``limit``; pass the
+        last ``position`` back as ``after`` for the next ones."""
+        data = await self._transport.json(
+            "GET",
+            f"/v1/runs/{run_id}/events",
+            tenant=tenant,
+            params={"after": after, "limit": limit},
+        )
+        return [RunEventEntry.model_validate(entry) for entry in data]
+
+    async def stream_events(
+        self, run_id: str, *, after: int = 0, tenant: str | None = None
+    ) -> AsyncIterator[RunEventEntry]:
+        """Every event of the run past ``after``, then each one as it is appended (from
+        whichever replica), until the run has ended and its last event came. A dropped
+        connection, or a stream the service ended to bound its length, is opened again from
+        the last position yielded; ``max_retries`` connection failures in a row raise
+        :class:`DependencyUnavailableError`."""
+        failures = 0
+        while True:
+            try:
+                async for name, data in self._transport.events(
+                    f"/v1/runs/{run_id}/events/stream", tenant=tenant, params={"after": after}
+                ):
+                    if name == "end":
+                        return
+                    entry = RunEventEntry.model_validate_json(data)
+                    after, failures = entry.position, 0
+                    yield entry
+            except httpx.TransportError as exc:
+                if failures >= self._transport.max_retries:
+                    raise DependencyUnavailableError(
+                        f"agent-runs events of {run_id} unreachable: {type(exc).__name__}: {exc}",
+                        code="DEPENDENCY_UNAVAILABLE",
+                        status=0,
+                        retryable=True,
+                    ) from exc
+                await _transport._sleep(backoff(failures, None))
+                failures += 1
 
     # ------------------------------------------------------------------ ops
     async def live(self) -> dict[str, str]:

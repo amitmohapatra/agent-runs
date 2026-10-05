@@ -49,6 +49,19 @@ MAX_PAGE: Final = 500
 #: artifact the checkpoint refers to.
 MAX_CHECKPOINT_BYTES: Final = 1024 * 1024
 
+# --------------------------------------------------------------------------- run events
+
+#: The most events one append may carry.
+MAX_EVENTS_PER_APPEND: Final = 500
+#: How often a stream looks for new events of its run, and how long it stays quiet before it
+#: sends a comment, so proxies and load balancers keep the connection open.
+EVENT_POLL_SECONDS: Final = 0.5
+EVENT_KEEPALIVE_SECONDS: Final = 15.0
+#: How long one stream lasts before the service ends it (without ``end``); the client
+#: reconnects with the last position it saw (``Last-Event-ID``). Bounds what one connection
+#: holds across deploys and idle timeouts.
+EVENT_STREAM_SECONDS: Final = 300.0
+
 # --------------------------------------------------------------------------- artifacts
 
 #: The largest artifact one upload may carry (an ``ask`` table, a diff, a report).
