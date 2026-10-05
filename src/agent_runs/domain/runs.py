@@ -140,13 +140,20 @@ class HeartbeatRequest(BaseModel):
 
 
 class Lease(BaseModel):
-    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats."""
+    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what
+    the worker must know to stop in time: the working time the run has left."""
 
     model_config = ConfigDict(frozen=True)
 
     run_id: str = Field(description="The leased run.")
     worker_id: str = Field(description="The worker holding it.")
     expires_at: AwareDatetime = Field(description="When the lease lapses without a heartbeat.")
+    remaining_seconds: float | None = Field(
+        default=None,
+        description="Working time the run has left as of this answer, in seconds: the lesser "
+        "of its timeout_seconds and the service's maximum, less what it has worked. Past it "
+        "the ticker ends the run TIMEOUT (run_timeout). Null: no limit.",
+    )
 
 
 class RunSummary(BaseModel):

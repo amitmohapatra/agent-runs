@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Path, Query, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
@@ -45,6 +46,12 @@ _NO_CONTENT = 204
 
 def _payload_limit(request: Request) -> int:
     return request.app.state.settings.service.max_payload_bytes
+
+
+def _leasing(request: Request, db: AsyncSession) -> RunStore:
+    """The store for a route that hands out a lease, which tells the worker the working time
+    the run has left under the service's maximum too."""
+    return RunStore(db, max_run_seconds=request.app.state.settings.runs.max_run_seconds)
 
 
 #: A worker fencing its write: refused (409) unless it still holds the run's lease.
@@ -114,11 +121,15 @@ async def start(
     responses={_NO_CONTENT: {"description": "Nothing is queued for these agents; poll later."}},
 )
 async def claim(
-    body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)], db: Session, who: Who
+    body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)],
+    request: Request,
+    db: Session,
+    who: Who,
 ) -> Claimed | Response:
     """Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
-    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``."""
-    claimed = await RunStore(db).claim(who.tenant_id, body, now=now())
+    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;
+    ``lease.remaining_seconds`` is the working time it has left."""
+    claimed = await _leasing(request, db).claim(who.tenant_id, body, now=now())
     await db.commit()
     claims_total.labels("empty" if claimed is None else "claimed").inc()
     return claimed if claimed is not None else Response(status_code=_NO_CONTENT)
@@ -136,15 +147,17 @@ async def claim(
 async def heartbeat(
     run_id: RunId,
     body: Annotated[HeartbeatRequest, Body(openapi_examples=examples.HEARTBEAT)],
+    request: Request,
     db: Session,
     who: Who,
 ) -> Lease:
     """Extend the lease to ``now + lease_seconds``; every third of the lease is a good
     rhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on
     the run, replacing the one there: the next attempt's claim gets it, so a worker crash
-    repeats no checkpointed side effect. 409 ``LEASE_LOST`` means the lease is no longer the
-    worker's; stop working the run."""
-    lease = await RunStore(db).heartbeat(who.tenant_id, run_id, body, now=now())
+    repeats no checkpointed side effect. The lease says the working time the run has left
+    (``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;
+    stop working the run."""
+    lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
     return lease
 
@@ -262,8 +275,9 @@ async def finish(
     response_description="The full record: input, output, error, checkpoint, awaiting.",
 )
 async def get(run_id: RunId, db: Session, who: Who) -> RunRecord:
-    """One run of this tenant, the whole record. Another tenant's run is 404."""
-    return await RunStore(db).get(who.tenant_id, run_id)
+    """One run of this tenant, the whole record, its ``worked_seconds`` counting the stretch
+    it is running now. Another tenant's run is 404."""
+    return await RunStore(db).get(who.tenant_id, run_id, now=now())
 
 
 _RESOLUTIONS_CURSOR = {"recorded_at": datetime, "resolution_id": str}

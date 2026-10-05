@@ -73,6 +73,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 "src/agent_runs/store/artifacts.py" = ["PLR0913"]
 # A problem has nine members; its builders take them by keyword.
 "src/agent_runs/api/errors.py" = ["PLR0913"]
+# The ticker takes its collaborators, and the deployment's limits by keyword.
+"src/agent_runs/ticker.py" = ["PLR0913"]
 # The SDK's listings take their filters as keyword arguments, as the routes do.
 "sdk/python/src/trellis/runs/*.py" = ["PLR0913"]
 # The SDK's tests as the service's (PLR2004), and test doubles that take what its calls take.

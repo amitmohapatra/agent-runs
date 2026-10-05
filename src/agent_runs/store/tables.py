@@ -10,6 +10,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -62,6 +63,15 @@ class RunRow(Base):
     lease_lapses: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the most working time the run may take (RunStart.timeout_seconds)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float)
+    #: the working time of the RUNNING stretches that ended; the one going on is counted from
+    #: ``running_since``
+    worked_seconds: Mapped[float] = mapped_column(Float, server_default=text("0"))
+    #: when the run last became RUNNING; set exactly while it is
+    running_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the version of the agent's code that started the run (RunStart.agent_version)
+    agent_version: Mapped[str | None] = mapped_column(String(128))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
@@ -108,6 +118,12 @@ class RunRow(Base):
             postgresql_where=text(
                 "status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL"
             ),
+        ),
+        # the working-time sweep: RUNNING runs, by how long they have been running
+        Index(
+            "ix_runs_working",
+            "running_since",
+            postgresql_where=text("status = 'RUNNING'"),
         ),
     )
 

@@ -32,6 +32,12 @@ def run(run_id: str = "run_1", tenant: str = "acme") -> RunRecord:
     return RunRecord(run_id=run_id, tenant_id=tenant, agent_id="triage", status=RunStatus.RUNNING)
 
 
+def claimed(record: RunRecord, worker_id: str = "w-1", **lease: Any) -> Claimed:
+    """What a claim of ``record`` answers: the run and the worker's lease on it."""
+    held = Lease(run_id=record.run_id, worker_id=worker_id, expires_at=NOW, **lease)
+    return Claimed(run=record, lease=held)
+
+
 class Store:
     """A queue in memory that records every call, as agent-runs would see them."""
 
@@ -43,6 +49,8 @@ class Store:
         self.claim_error: Exception | None = None
         self.beat_error: Exception | None = None
         self.finish_error: Exception | None = None
+        #: the working time left that every lease reports
+        self.remaining: float | None = None
         #: set on every claim and heartbeat, for a test waiting until enough of them came
         self.changed = asyncio.Event()
 
@@ -60,9 +68,7 @@ class Store:
             raise self.claim_error
         if not self.queue:
             return None
-        record = self.queue.pop(0)
-        lease = Lease(run_id=record.run_id, worker_id=worker_id, expires_at=NOW)
-        return Claimed(run=record, lease=lease)
+        return claimed(self.queue.pop(0), worker_id, remaining_seconds=self.remaining)
 
     async def heartbeat(
         self,
@@ -85,7 +91,9 @@ class Store:
         self.changed.set()
         if self.beat_error is not None:
             raise self.beat_error
-        return Lease(run_id=run_id, worker_id=worker_id, expires_at=NOW)
+        return Lease(
+            run_id=run_id, worker_id=worker_id, expires_at=NOW, remaining_seconds=self.remaining
+        )
 
     async def pause(
         self,
@@ -251,6 +259,44 @@ async def test_the_lease_is_renewed_while_the_handler_runs() -> None:
     }
 
 
+async def test_the_job_says_the_working_time_left_as_the_leases_come(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(worker_module, "_clock", lambda: clock[0])
+    store = Store(run())
+    store.remaining = 60.0
+    seen: list[float | None] = []
+
+    async def handler(job: Job) -> None:
+        seen.append(job.remaining_seconds)
+        clock[0] += 15
+        seen.append(job.remaining_seconds)
+        store.remaining = 30.0
+        await store.until(lambda: bool(store.beats))
+        seen.append(job.remaining_seconds)
+        clock[0] += 45
+        seen.append(job.remaining_seconds)
+        store.remaining = 20.0
+        await job.checkpoint({"step": 1})
+        seen.append(job.remaining_seconds)
+
+    assert await Worker(store, handler, ["triage"]).run_once()
+    assert seen == [60.0, 45.0, 30.0, 0.0, 20.0]
+
+
+async def test_a_run_without_a_limit_has_no_remaining_time() -> None:
+    seen: list[float | None] = []
+
+    async def handler(job: Job) -> None:
+        seen.append(job.remaining_seconds)
+
+    assert await Worker(Store(run()), handler, ["triage"]).run_once()
+    assert seen == [None]
+    unleased = Job(run(), "w-1", 60, Store())
+    assert unleased.remaining_seconds is None
+
+
 async def test_a_failed_heartbeat_is_logged_and_the_run_continues(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -358,7 +404,7 @@ async def test_a_worker_cancelled_as_its_run_finishes_still_stops() -> None:
         return "finished"
 
     worker = Worker(Store(), finishing, ["triage"])
-    execute = asyncio.create_task(worker._execute(run()))
+    execute = asyncio.create_task(worker._execute(claimed(run())))
     outer.append(execute)
     with pytest.raises(asyncio.CancelledError):
         await execute

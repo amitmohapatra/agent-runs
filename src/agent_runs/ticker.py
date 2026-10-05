@@ -3,14 +3,16 @@
 1. fire every due schedule (one ``SKIP LOCKED`` claim at a time, each in its own transaction,
    queueing its run idempotently on ``(schedule_id, fire_time)``);
 2. time out runs not yet ended (queued, running or paused) past their own deadline;
-3. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
+3. time out running runs whose working time passed their limit (their ``timeout_seconds``, or
+   the service's ``RUNS__RUNS__MAX_RUN_SECONDS``, the lesser);
+4. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
    lapse);
-4. escalate or time out interrupts past their deadline;
-5. send the webhook deliveries that are due from the outbox (one attempt each);
-6. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
+5. escalate or time out interrupts past their deadline;
+6. send the webhook deliveries that are due from the outbox (one attempt each);
+7. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
    row: a blob delete that fails leaves the row for the next tick).
 
-Steps 2 to 4 write the webhook events they cause into the outbox in their own transaction.
+Steps 2 to 5 write the webhook events they cause into the outbox in their own transaction.
 
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
@@ -74,6 +76,7 @@ class RunSweep(Protocol):
 class TickReport:
     fired: int = 0
     timed_out: int = 0
+    overworked: int = 0
     requeued: int = 0
     escalated: int = 0
     sent: int = 0
@@ -89,12 +92,14 @@ class Ticker:
         *,
         heartbeat_path: Path,
         interval: float = TICK_SECONDS,
+        max_run_seconds: float | None = None,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
         self._blobs = blobs
         self._heartbeat = heartbeat_path
         self._interval = interval
+        self._max_run_seconds = max_run_seconds
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
     async def tick(self, *, now: datetime | None = None) -> TickReport:
@@ -108,6 +113,7 @@ class Ticker:
             report = TickReport(
                 fired=await self._fire_due(now),
                 timed_out=await self._sweep_runs(RunStore.time_out_past_deadline, now),
+                overworked=await self._sweep_runs(RunStore.time_out_overworked, now),
                 requeued=await self._sweep_runs(RunStore.requeue_lapsed, now),
                 escalated=await self._sweep_runs(RunStore.escalate_overdue, now),
                 sent=await self._send_webhooks(now),
@@ -147,7 +153,8 @@ class Ticker:
         run a sweep leaves ``PAUSED`` was escalated; any other announces what its new status
         does (an ending ``run.finished``, a requeue nothing)."""
         async with self._sessions() as db:
-            moved = await sweep(RunStore(db), now=now, limit=SWEEP_BATCH)
+            store = RunStore(db, max_run_seconds=self._max_run_seconds)
+            moved = await sweep(store, now=now, limit=SWEEP_BATCH)
             for run in moved:
                 event = WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
                 await WebhookStore(db).announce(run, event, now=now)
@@ -236,6 +243,7 @@ async def run() -> None:
             webhooks,
             blobs,
             heartbeat_path=beat,
+            max_run_seconds=settings.runs.max_run_seconds,
         )
         await ticker.run_forever(stop)
     finally:

@@ -133,7 +133,12 @@ async def test_a_retried_resume_answers_the_run_and_changes_nothing(client) -> N
     first = await client.post(url, json=body)
     again = await client.post(url, json=body)
     assert first.status_code == again.status_code == 200, again.text
-    assert again.json() == first.json()
+    # the run as it is now: the same, but for the working time of the stretch it is running
+    running = {"worked_seconds"}
+    assert {k: v for k, v in again.json().items() if k not in running} == {
+        k: v for k, v in first.json().items() if k not in running
+    }
+    assert again.json()["worked_seconds"] >= first.json()["worked_seconds"]
     assert (again.json()["status"], again.json()["attempt"]) == ("RUNNING", 2)
     assert len(await _history(client, run["run_id"])) == 1
 

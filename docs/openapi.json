@@ -669,13 +669,25 @@
         "type": "object"
       },
       "Lease": {
-        "description": "A worker's hold on a running run, until ``expires_at`` unless it heartbeats.",
+        "description": "A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what\nthe worker must know to stop in time: the working time the run has left.",
         "properties": {
           "expires_at": {
             "description": "When the lease lapses without a heartbeat.",
             "format": "date-time",
             "title": "Expires At",
             "type": "string"
+          },
+          "remaining_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Working time the run has left as of this answer, in seconds: the lesser of its timeout_seconds and the service's maximum, less what it has worked. Past it the ticker ends the run TIMEOUT (run_timeout). Null: no limit.",
+            "title": "Remaining Seconds"
           },
           "run_id": {
             "description": "The leased run.",
@@ -824,6 +836,22 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that started the run (a release or deploy id), kept for audit and to tell which code a resumed run continues on; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
+          },
           "deadline": {
             "anyOf": [
               {
@@ -916,6 +944,22 @@
             ],
             "description": "Conversation thread the run belongs to; None outside one.",
             "title": "Thread Id"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time the run may take, in seconds: time RUNNING, across attempts, not time queued or waiting for a person. Past it the run ends TIMEOUT. None: no limit of its own (a service maximum may still apply).",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
           },
           "user_id": {
             "anyOf": [
@@ -1017,6 +1061,22 @@
             ],
             "title": "Agent Id",
             "type": "string"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that started the run (a release or deploy id), kept for audit and to tell which code a resumed run continues on; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
           },
           "attempt": {
             "default": 1,
@@ -1173,6 +1233,22 @@
             "description": "Conversation thread the run belongs to; None outside one.",
             "title": "Thread Id"
           },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time the run may take, in seconds: time RUNNING, across attempts, not time queued or waiting for a person. Past it the run ends TIMEOUT. None: no limit of its own (a service maximum may still apply).",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
+          },
           "updated_at": {
             "description": "When the record last changed (ISO 8601, timezone-aware; UTC unless given).",
             "format": "date-time",
@@ -1190,6 +1266,13 @@
             ],
             "description": "End user the run serves; None when there is none.",
             "title": "User Id"
+          },
+          "worked_seconds": {
+            "default": 0,
+            "description": "Working time so far, in seconds: time RUNNING across every attempt, what timeout_seconds limits.",
+            "minimum": 0.0,
+            "title": "Worked Seconds",
+            "type": "number"
           },
           "workspace_id": {
             "anyOf": [
@@ -3171,7 +3254,7 @@
     },
     "/v1/runs/claim": {
       "post": {
-        "description": "Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``.",
+        "description": "Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;\n``lease.remaining_seconds`` is the working time it has left.",
         "operationId": "runs.claim",
         "parameters": [
           {
@@ -3508,7 +3591,7 @@
     },
     "/v1/runs/{run_id}": {
       "get": {
-        "description": "One run of this tenant, the whole record. Another tenant's run is 404.",
+        "description": "One run of this tenant, the whole record, its ``worked_seconds`` counting the stretch\nit is running now. Another tenant's run is 404.",
         "operationId": "runs.get",
         "parameters": [
           {
@@ -4718,7 +4801,7 @@
     },
     "/v1/runs/{run_id}/heartbeat": {
       "post": {
-        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. 409 ``LEASE_LOST`` means the lease is no longer the\nworker's; stop working the run.",
+        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. The lease says the working time the run has left\n(``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;\nstop working the run.",
         "operationId": "runs.heartbeat",
         "parameters": [
           {

@@ -119,6 +119,12 @@ class TickerSettings(BaseModel):
     metrics_port: int | None = Field(default=None, ge=1, le=65535)
 
 
+class RunsSettings(BaseModel):
+    #: The most working time any run may take, in seconds (time RUNNING, across attempts): a
+    #: run's own ``timeout_seconds`` may only be shorter. Unset: no platform maximum.
+    max_run_seconds: float | None = Field(default=None, gt=0)
+
+
 class RateLimitSettings(BaseModel):
     """Each tenant's request budget on the ``/v1`` routes: a token bucket refilled at
     ``per_minute`` and holding at most ``burst`` requests. Kept in each worker process's
@@ -144,6 +150,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     blob: BlobSettings = Field(default_factory=BlobSettings)
     ticker: TickerSettings = Field(default_factory=TickerSettings)
+    runs: RunsSettings = Field(default_factory=RunsSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 

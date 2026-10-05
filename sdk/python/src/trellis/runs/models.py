@@ -37,13 +37,17 @@ class RunSummary(BaseModel):
 
 
 class Lease(BaseModel):
-    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats."""
+    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats.
+    ``remaining_seconds`` is the working time the run had left when the lease was given (its
+    ``timeout_seconds`` or the service's maximum, the lesser, less what it worked; ``None``:
+    no limit): past it agent-runs ends the run ``TIMEOUT``."""
 
     model_config = ConfigDict(frozen=True)
 
     run_id: str
     worker_id: str
     expires_at: datetime
+    remaining_seconds: float | None = None
 
 
 class Claimed(BaseModel):

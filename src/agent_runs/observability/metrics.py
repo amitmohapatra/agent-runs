@@ -63,7 +63,8 @@ ticks_total = Counter(
 )
 swept_total = Counter(
     "runs_ticker_swept_total",
-    "Rows each ticker step handled: fired, timed_out, requeued, escalated, sent, purged",
+    "Rows each ticker step handled: fired, timed_out, overworked, requeued, escalated, sent, "
+    "purged",
     ["step"],
     registry=REGISTRY,
 )

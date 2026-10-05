@@ -3,8 +3,8 @@
 a worker finishing a run a person just cancelled, two clicks resuming one pause, two workers
 claiming one queued run.
 
-Nothing here reads the clock: ``now`` is a parameter, so a lapsed lease or an overdue
-interrupt is a test rather than a wait.
+Nothing here reads the clock: ``now`` is a parameter, so a lapsed lease, an overdue
+interrupt or a run that worked too long is a test rather than a wait.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -70,7 +70,9 @@ _RECORD_FIELDS = (
     "checkpoint",
     "attempt",
     "deadline",
+    "timeout_seconds",
     "idempotency_key",
+    "agent_version",
     "created_at",
     "updated_at",
 )
@@ -85,7 +87,8 @@ _UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.va
 #: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
 #: same key with a different request is a client bug to surface, not a run to hand back.
 #: ``run_id`` is not compared (the contracts mint one when none is sent, so a retry that
-#: sent none differs there by construction).
+#: sent none differs there by construction), nor is ``agent_version`` (a retry from a newer
+#: deploy asks for the same run).
 _START_FIELDS = frozenset(
     {
         "agent_id",
@@ -96,14 +99,25 @@ _START_FIELDS = frozenset(
         "on_behalf_of",
         "input",
         "deadline",
+        "timeout_seconds",
         "metadata",
     }
 )
 
 
-def _record(row: RunRow) -> RunRecord:
+def _worked(row: RunRow, now: datetime) -> float:
+    """The run's working time at ``now``: its RUNNING stretches that ended, and the one going
+    on."""
+    if row.running_since is None:
+        return row.worked_seconds
+    return row.worked_seconds + max(0.0, (now - row.running_since).total_seconds())
+
+
+def _record(row: RunRow, now: datetime) -> RunRecord:
     fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
-    return RunRecord.model_validate({**fields, "metadata": row.run_metadata or {}})
+    return RunRecord.model_validate(
+        {**fields, "metadata": row.run_metadata or {}, "worked_seconds": _worked(row, now)}
+    )
 
 
 def _json(model: Any) -> dict[str, Any] | None:
@@ -119,11 +133,14 @@ def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: boo
 
 
 def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
-    """The one transition check. Leaving RUNNING or PAUSED clears what belonged to it; an
-    ending clears the checkpoint, which only a run that may still continue needs. Whoever
-    settled the old state did not settle the new one."""
+    """The one transition check. Leaving RUNNING adds the stretch to the working time and
+    clears the lease; leaving PAUSED clears what it waited on; an ending clears the
+    checkpoint, which only a run that may still continue needs. Whoever settled the old state
+    did not settle the new one."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
+    row.worked_seconds = _worked(row, now)
+    row.running_since = now if to is RunStatus.RUNNING else None
     row.status = to.value
     row.updated_at = now
     row.settled_by = None
@@ -162,10 +179,19 @@ def _requeue(row: RunRow, now: datetime) -> None:
 
 
 class RunStore:
-    """Every run operation, in one place. The caller commits."""
+    """Every run operation, in one place. The caller commits. ``max_run_seconds`` is the
+    service's maximum working time (``RUNS__RUNS__MAX_RUN_SECONDS``): a run's own
+    ``timeout_seconds`` may only be shorter."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, max_run_seconds: float | None = None) -> None:
         self._session = session
+        self._max_run_seconds = max_run_seconds
+
+    def _limit(self, row: RunRow) -> float | None:
+        """The most working time the run may take: its own limit or the service's, the
+        lesser; ``None`` when neither is set."""
+        limits = [s for s in (row.timeout_seconds, self._max_run_seconds) if s is not None]
+        return min(limits, default=None)
 
     # ------------------------------------------------------------------ starting
     async def start(
@@ -199,7 +225,10 @@ class RunStore:
                 on_behalf_of=record.on_behalf_of,
                 input=record.input,
                 deadline=record.deadline,
+                timeout_seconds=record.timeout_seconds,
+                running_since=None if queue else now,
                 idempotency_key=record.idempotency_key,
+                agent_version=record.agent_version,
                 run_metadata=record.metadata or None,
                 attempt=1,
                 queued_at=now if queue else None,
@@ -210,14 +239,14 @@ class RunStore:
             .returning(RunRow)
         )
         if row is not None:
-            return _record(row), True
+            return _record(row, now), True
         if start.idempotency_key:
             keyed = await self._one(
                 RunRow.tenant_id == start.tenant_id,
                 RunRow.idempotency_key == start.idempotency_key,
             )
             if keyed is not None:
-                found = _record(keyed)
+                found = _record(keyed, now)
                 queued = keyed.queued_at is not None
                 differing = _differing(found, start, queue=queue, queued=queued)
                 if strict and differing:
@@ -232,7 +261,7 @@ class RunStore:
         )
         if existing is None:
             raise Conflict("this run_id cannot be used: send another, or none and one is minted")
-        return _record(existing), False
+        return _record(existing, now), False
 
     # ------------------------------------------------------------------ transitions
     async def pause(
@@ -258,7 +287,7 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         waiting_on = (row.awaiting or {}).get("interrupt_id")
         if _settled(row, RunStatus.PAUSED, worker_id) and waiting_on == interrupt.interrupt_id:
-            return _record(row), False
+            return _record(row, now), False
         _fence(row, worker_id)
         _move(row, RunStatus.PAUSED, now)
         row.checkpoint = checkpoint
@@ -266,7 +295,7 @@ class RunStore:
         row.assignee = interrupt.assignee
         row.awaiting_deadline = interrupt.deadline
         row.settled_by = worker_id
-        return await self._flushed(row), True
+        return await self._flushed(row, now), True
 
     async def resume(
         self,
@@ -296,7 +325,7 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if (row.awaiting or {}).get("interrupt_id") != resolution.interrupt_id:
             if await self._answered_by(tenant_id, resolution):
-                return _record(row), False
+                return _record(row, now), False
             if row.status != RunStatus.PAUSED:
                 raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
             raise Conflict(f"run {run_id} is waiting on another interrupt")
@@ -328,7 +357,7 @@ class RunStore:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
         await self._ended([row], now)
-        return await self._flushed(row), True
+        return await self._flushed(row, now), True
 
     async def _answered_by(self, tenant_id: str, resolution: InterruptResolution) -> bool:
         """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
@@ -356,14 +385,14 @@ class RunStore:
         nothing, so a worker that never saw the answer may retry."""
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, ending.status, worker_id):
-            return _record(row), False
+            return _record(row, now), False
         _fence(row, worker_id)
         _move(row, ending.status, now)
         row.output = ending.output
         row.error = _json(ending.error)
         row.settled_by = worker_id
         await self._ended([row], now)
-        return await self._flushed(row), True
+        return await self._flushed(row, now), True
 
     # ------------------------------------------------------------------ the queue
     async def claim(
@@ -388,7 +417,7 @@ class RunStore:
             return None
         _move(row, RunStatus.RUNNING, now)
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
-        return Claimed(run=await self._flushed(row), lease=lease)
+        return Claimed(run=await self._flushed(row, now), lease=lease)
 
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime
@@ -407,11 +436,18 @@ class RunStore:
         await self._session.flush()
         return lease
 
-    @staticmethod
-    def _lease(row: RunRow, worker_id: str, seconds: int, now: datetime) -> Lease:
+    def _lease(self, row: RunRow, worker_id: str, seconds: int, now: datetime) -> Lease:
+        """Lease the run to ``worker_id`` for ``seconds``, telling it the working time left."""
         expires_at = now + timedelta(seconds=seconds)
         row.lease_owner, row.lease_expires_at = worker_id, expires_at
-        return Lease(run_id=row.run_id, worker_id=worker_id, expires_at=expires_at)
+        limit = self._limit(row)
+        remaining = None if limit is None else max(0.0, limit - _worked(row, now))
+        return Lease(
+            run_id=row.run_id,
+            worker_id=worker_id,
+            expires_at=expires_at,
+            remaining_seconds=remaining,
+        )
 
     # ------------------------------------------------------------------ the ticker's sweeps
     async def time_out_past_deadline(self, *, now: datetime, limit: int) -> list[RunRecord]:
@@ -440,7 +476,41 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row) for row in rows]
+        return [_record(row, now) for row in rows]
+
+    async def time_out_overworked(self, *, now: datetime, limit: int) -> list[RunRecord]:
+        """Running runs whose working time passed their limit (``_limit``: their own
+        ``timeout_seconds`` or the service's maximum, the lesser) end as ``TIMEOUT``. Only
+        time RUNNING counts, across attempts: not time queued or waiting for a person. A
+        worker still running one has lost it: its next heartbeat or write is ``LeaseLost``.
+        Returns every run ended."""
+        allowed: Any = RunRow.timeout_seconds
+        if self._max_run_seconds is not None:
+            # LEAST ignores a NULL: a run with no limit of its own gets the service's
+            allowed = func.least(RunRow.timeout_seconds, self._max_run_seconds)
+        working = RunRow.worked_seconds + func.extract("epoch", now - RunRow.running_since)
+        rows = await self._sweep(
+            RunRow.status == RunStatus.RUNNING.value,
+            working > allowed,
+            order=RunRow.running_since,
+            limit=limit,
+        )
+        for row in rows:
+            _move(row, RunStatus.TIMEOUT, now)
+            row.error = _json(
+                AgentError(
+                    code="run_timeout",
+                    category=ErrorCategory.TIMEOUT,
+                    message=f"the run worked {row.worked_seconds:.0f} s, past its limit of "
+                    f"{self._limit(row):g} s",
+                    # the category alone would say retryable; a retry would only run as long
+                    retryable=False,
+                    source="agent-runs",
+                )
+            )
+        await self._ended(rows, now)
+        await self._session.flush()
+        return [_record(row, now) for row in rows]
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt;
@@ -470,7 +540,7 @@ class RunStore:
                 _requeue(row, now)
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row) for row in rows]
+        return [_record(row, now) for row in rows]
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
@@ -507,7 +577,7 @@ class RunStore:
                 )
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row) for row in rows]
+        return [_record(row, now) for row in rows]
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (
@@ -569,7 +639,7 @@ class RunStore:
     ) -> Page[ResolutionEntry]:
         """Every interrupt the run was asked and how it was answered, oldest first, a page
         at a time (keyset ``recorded_at, resolution_id``)."""
-        await self.get(tenant_id, run_id)  # 404 for another tenant's run, as everywhere
+        await self._found(tenant_id, run_id)  # 404 for another tenant's run, as everywhere
         order = (ResolutionRow.recorded_at, ResolutionRow.resolution_id)
         query = select(ResolutionRow).where(
             ResolutionRow.tenant_id == tenant_id, ResolutionRow.run_id == run_id
@@ -589,11 +659,9 @@ class RunStore:
             position=lambda r: {"recorded_at": r.recorded_at, "resolution_id": r.resolution_id},
         )
 
-    async def get(self, tenant_id: str, run_id: str) -> RunRecord:
-        row = await self._one(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
-        if row is None:
-            raise NotFound(f"no run {run_id}")
-        return _record(row)
+    async def get(self, tenant_id: str, run_id: str, *, now: datetime) -> RunRecord:
+        """The run as it is at ``now`` (its working time counts the stretch going on)."""
+        return _record(await self._found(tenant_id, run_id), now)
 
     async def list(
         self,
@@ -638,6 +706,12 @@ class RunStore:
     async def _one(self, *conditions: Any) -> RunRow | None:
         return await self._session.scalar(select(RunRow).where(*conditions))
 
+    async def _found(self, tenant_id: str, run_id: str) -> RunRow:
+        row = await self._one(RunRow.tenant_id == tenant_id, RunRow.run_id == run_id)
+        if row is None:
+            raise NotFound(f"no run {run_id}")
+        return row
+
     async def _locked(self, tenant_id: str, run_id: str, *, worker_id: str | None) -> RunRow:
         """The row, locked for this transaction. With ``worker_id``, only while that worker
         still holds the run's lease: a worker whose lease lapsed must not write over the run
@@ -652,6 +726,6 @@ class RunStore:
         _fence(row, worker_id)
         return row
 
-    async def _flushed(self, row: RunRow) -> RunRecord:
+    async def _flushed(self, row: RunRow, now: datetime) -> RunRecord:
         await self._session.flush()
-        return _record(row)
+        return _record(row, now)
