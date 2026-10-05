@@ -49,6 +49,7 @@ class Store:
         self.claim_error: Exception | None = None
         self.beat_error: Exception | None = None
         self.finish_error: Exception | None = None
+        self.release_error: Exception | None = None
         #: the working time left that every lease reports, and whether a cancel was asked
         self.remaining: float | None = None
         self.cancelling = False
@@ -99,6 +100,29 @@ class Store:
             remaining_seconds=self.remaining,
             cancel_requested=self.cancelling,
         )
+
+    async def release(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        tenant: str | None = None,
+    ) -> RunRecord:
+        self.writes.append(
+            (
+                "release",
+                {
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "checkpoint": checkpoint,
+                    "tenant": tenant,
+                },
+            )
+        )
+        if self.release_error is not None:
+            raise self.release_error
+        return run(run_id).model_copy(update={"status": RunStatus.QUEUED, "attempt": 2})
 
     async def pause(
         self,
@@ -546,7 +570,8 @@ async def test_a_run_past_the_grace_period_is_released(
             reasons.append(exc.args)
             raise
 
-    worker = Worker(Store(run()), handler, ["triage"])
+    store = Store(run(tenant="globex"))
+    worker = Worker(store, handler, ["triage"], worker_id="w-1")
     task = asyncio.create_task(worker.run())
     await started.wait()
     with caplog.at_level(logging.INFO, logger="trellis.runs.worker"):
@@ -554,7 +579,30 @@ async def test_a_run_past_the_grace_period_is_released(
         await asyncio.wait_for(task, 5)
     assert reasons == [(RELEASED,)]  # released, so the handler writes nothing
     assert "1 run(s) in flight" in caplog.text
-    assert "run run_1 released" in caplog.text
+    assert "run run_1 released: another worker runs it" in caplog.text
+    # handed back to the queue at once, not left for its lease to lapse
+    assert store.writes == [
+        (
+            "release",
+            {"run_id": "run_1", "worker_id": "w-1", "checkpoint": None, "tenant": "globex"},
+        )
+    ]
+
+
+async def test_a_run_that_cannot_be_released_is_left_to_its_lease(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.0)
+    started = asyncio.Event()
+    store = Store(run())
+    store.release_error = ConnectionError("agent-runs is down")
+    worker = Worker(store, forever(started), ["triage"])
+    task = asyncio.create_task(worker.run())
+    await started.wait()
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        worker.stop()
+        await asyncio.wait_for(task, 5)
+    assert "run run_1 could not be released (agent-runs is down)" in caplog.text
 
 
 async def test_a_second_stop_releases_the_runs_at_once(monkeypatch: pytest.MonkeyPatch) -> None:

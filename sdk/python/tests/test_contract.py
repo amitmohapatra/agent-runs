@@ -105,6 +105,7 @@ ANSWERS: dict[str, tuple[int, Any]] = {
     "runs.start": (201, record()),
     "runs.claim": (200, {"run": record(), "lease": lease()}),
     "runs.heartbeat": (200, lease()),
+    "runs.release": (200, record(status="QUEUED")),
     "runs.pause": (200, record(status="PAUSED")),
     "runs.resume": (200, record()),
     "runs.cancel": (200, record(status="CANCELLED")),
@@ -187,6 +188,8 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
         assert claimed is not None
         await runs.heartbeat("run_1", "w-1", checkpoint={"tools": {"call_1": {"output": "ok"}}})
         await runs.heartbeat("run_1", "w-1")
+        await runs.release("run_1", "w-1", checkpoint={"tools": {}})
+        await runs.release("run_1", "w-1")
         ref = await runs.artifacts.upload("run_1", b'{"rows": []}', worker_id="w-1")
         asked = interrupt(payload_ref=ref)
         await runs.pause(asked, checkpoint={"asks": {}}, worker_id="w-1")
@@ -252,4 +255,6 @@ async def test_the_error_answers_are_problems_the_document_describes(contract: O
         assert await runs.artifacts.download("art_1") is None
         with pytest.raises(LeaseLostError):
             await runs.heartbeat("run_1", "w-1")
+        await runs.release("run_1", "w-1", checkpoint={"tools": {}})
+        await runs.release("run_1", "w-1")
     assert service.violations == []

@@ -798,6 +798,37 @@
         "title": "Problem",
         "type": "object"
       },
+      "ReleaseRequest": {
+        "additionalProperties": false,
+        "description": "A worker letting go of a run it holds (it is stopping): the run goes back on the queue\nat once, for another worker, optionally with the progress made so far.",
+        "properties": {
+          "checkpoint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Progress to save first, as a heartbeat saves it (at most 1 MiB of compact JSON); absent, the run's checkpoint is kept.",
+            "title": "Checkpoint"
+          },
+          "worker_id": {
+            "description": "The worker holding the lease.",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Worker Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id"
+        ],
+        "title": "ReleaseRequest",
+        "type": "object"
+      },
       "ResolutionEntry": {
         "description": "One answered interrupt: what was asked, how it was answered, on which attempt.",
         "properties": {
@@ -6063,6 +6094,412 @@
           }
         ],
         "summary": "Pause a run for a person",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/v1/runs/{run_id}/release": {
+      "post": {
+        "description": "The worker holding the run lets go of it, as a worker that is stopping does with the\nruns it could not finish: the run goes back on the queue at once as its next attempt,\nfor another worker, without counting a lapsed lease (nothing crashed). With\n``checkpoint``, the progress made so far is saved first, as a heartbeat saves it. A run\nwhose cancel was asked for ends ``CANCELLED`` instead. Repeated by the same worker, it\nanswers the run as it is.",
+        "operationId": "runs.release",
+        "parameters": [
+          {
+            "description": "The run's id (`run_…`, or the caller's own).",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "The run's id (`run_…`, or the caller's own).",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "progress": {
+                  "summary": "Let go of the run, saving its progress",
+                  "value": {
+                    "checkpoint": {
+                      "tools": {
+                        "call_1": {
+                          "output": "PO-17 created"
+                        }
+                      }
+                    },
+                    "worker_id": "w-1"
+                  }
+                },
+                "stopping": {
+                  "summary": "Let go of the run: the worker is stopping",
+                  "value": {
+                    "worker_id": "w-1"
+                  }
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunRecord"
+                }
+              }
+            },
+            "description": "The run, `QUEUED` as its next attempt (or `CANCELLED`, when its cancel was asked for); for a repeat, the run as it is.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "CONFLICT",
+                  "detail": "run run_01J8 cannot move from SUCCESS to CANCELLED",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 409,
+                  "title": "Conflict",
+                  "type": "urn:trellis:problem:conflict"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: there is nothing to let go of. Nothing is saved.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "PAYLOAD_TOO_LARGE",
+                  "detail": "the body is larger than 4194304 bytes",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 413,
+                  "title": "Payload too large",
+                  "type": "urn:trellis:problem:payload-too-large"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/release",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Let go of a run: back on the queue",
         "tags": [
           "runs"
         ]

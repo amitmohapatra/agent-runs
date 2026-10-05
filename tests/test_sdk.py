@@ -243,6 +243,30 @@ async def test_a_run_cancelled_while_a_worker_runs_it_ends_cancelled(
     assert done is not None and done.status is RunStatus.CANCELLED
 
 
+async def test_a_stopping_worker_hands_the_runs_it_holds_back_to_the_queue(
+    runs: RunsClient, monkeypatch
+) -> None:
+    from trellis.runs import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.0)
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+    started = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    worker = Worker(runs, handler, ["triage"], tenant="acme", worker_id="w-1")
+    serving = asyncio.create_task(worker.run())
+    await started.wait()
+    worker.stop()
+    await asyncio.wait_for(serving, 5)
+    back = await runs.get(queued.run_id, tenant="acme")
+    assert back is not None and (back.status, back.attempt) == (RunStatus.QUEUED, 2)
+    again = await runs.claim("w-2", ["triage"], tenant="acme")
+    assert again is not None and again.run.run_id == queued.run_id
+
+
 async def test_schedules_through_the_sdk(runs: RunsClient) -> None:
     spec = ScheduleSpec(
         tenant_id="acme",

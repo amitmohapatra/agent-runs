@@ -137,6 +137,27 @@ class RunsClient:
             ) from exc
         return Lease.model_validate(data)
 
+    async def release(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        tenant: str | None = None,
+    ) -> RunRecord:
+        """Let go of a run this worker holds (it is stopping): the run goes back on the queue
+        at once as its next attempt, for another worker, without counting a lapsed lease;
+        ``checkpoint`` saves the progress made so far first. A run whose cancel was asked
+        for ends ``CANCELLED`` instead. :class:`LeaseLostError` when this worker no longer
+        holds it."""
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if checkpoint is not None:
+            body["checkpoint"] = checkpoint
+        data = await self._transport.json(
+            "POST", f"/v1/runs/{run_id}/release", tenant=tenant, json=body
+        )
+        return RunRecord.model_validate(data)
+
     async def pause(
         self,
         interrupt: Interrupt,

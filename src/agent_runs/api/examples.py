@@ -66,6 +66,20 @@ HEARTBEAT: Final[dict[str, Any]] = {
     },
 }
 
+RELEASE: Final[dict[str, Any]] = {
+    "stopping": {
+        "summary": "Let go of the run: the worker is stopping",
+        "value": {"worker_id": "w-1"},
+    },
+    "progress": {
+        "summary": "Let go of the run, saving its progress",
+        "value": {
+            "worker_id": "w-1",
+            "checkpoint": {"tools": {"call_1": {"output": "PO-17 created"}}},
+        },
+    },
+}
+
 PAUSE: Final[dict[str, Any]] = {
     "approval": {
         "summary": "Wait for procurement's approval, keeping the executor's checkpoint",

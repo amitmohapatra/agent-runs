@@ -27,6 +27,7 @@ from agent_runs.domain.runs import (
     ClaimRequest,
     HeartbeatRequest,
     Lease,
+    ReleaseRequest,
     ResolutionEntry,
     RunCancel,
     RunCreate,
@@ -161,6 +162,36 @@ async def heartbeat(
     lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
     return lease
+
+
+@router.post(
+    "/{run_id}/release",
+    summary="Let go of a run: back on the queue",
+    response_description="The run, `QUEUED` as its next attempt (or `CANCELLED`, when its "
+    "cancel was asked for); for a repeat, the run as it is.",
+    responses=conflict(
+        "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: there "
+        "is nothing to let go of. Nothing is saved."
+    ),
+)
+async def release(
+    run_id: RunId,
+    body: Annotated[ReleaseRequest, Body(openapi_examples=examples.RELEASE)],
+    db: Session,
+    who: Who,
+) -> RunRecord:
+    """The worker holding the run lets go of it, as a worker that is stopping does with the
+    runs it could not finish: the run goes back on the queue at once as its next attempt,
+    for another worker, without counting a lapsed lease (nothing crashed). With
+    ``checkpoint``, the progress made so far is saved first, as a heartbeat saves it. A run
+    whose cancel was asked for ends ``CANCELLED`` instead. Repeated by the same worker, it
+    answers the run as it is."""
+    at = now()
+    run, released = await RunStore(db).release(who.tenant_id, run_id, body, now=at)
+    if released:
+        await WebhookStore(db).announce(run, now=at)
+    await db.commit()
+    return run
 
 
 @router.post(

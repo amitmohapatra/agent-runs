@@ -46,6 +46,7 @@ from agent_runs.domain.runs import (
     ClaimRequest,
     HeartbeatRequest,
     Lease,
+    ReleaseRequest,
     ResolutionEntry,
     RunCancel,
     RunFinish,
@@ -535,6 +536,28 @@ class RunStore:
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
         return lease
+
+    async def release(
+        self, tenant_id: str, run_id: str, request: ReleaseRequest, *, now: datetime
+    ) -> tuple[RunRecord, bool]:
+        """The worker holding the run lets go of it (it is stopping): back on the queue at
+        once as the next attempt, for another worker, keeping ``request.checkpoint`` as its
+        progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
+        asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
+        answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
+        checkpoint = bounded_checkpoint(request.checkpoint)
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        if _settled(row, RunStatus.QUEUED, request.worker_id):
+            return _record(row, now), False
+        _fence(row, request.worker_id)
+        if _cancelled_instead(row, now):
+            await self._ended([row], now)
+        else:
+            _requeue(row, now)
+            if checkpoint is not None:
+                row.checkpoint = checkpoint
+        row.settled_by = request.worker_id
+        return await self._flushed(row, now), True
 
     def _lease(self, row: RunRow, worker_id: str, seconds: int, now: datetime) -> Lease:
         """Lease the run to ``worker_id`` for ``seconds``, telling it the working time left,

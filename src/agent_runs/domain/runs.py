@@ -149,6 +149,20 @@ class HeartbeatRequest(BaseModel):
     )
 
 
+class ReleaseRequest(BaseModel):
+    """A worker letting go of a run it holds (it is stopping): the run goes back on the queue
+    at once, for another worker, optionally with the progress made so far."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: WorkerId = Field(description="The worker holding the lease.")
+    checkpoint: dict[str, Any] | None = Field(
+        default=None,
+        description="Progress to save first, as a heartbeat saves it (at most 1 MiB of "
+        "compact JSON); absent, the run's checkpoint is kept.",
+    )
+
+
 class Lease(BaseModel):
     """A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what
     the worker must know to stop in time: the working time the run has left."""

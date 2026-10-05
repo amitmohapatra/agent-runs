@@ -32,8 +32,10 @@ An idle worker asks again after a growing pause (exponential, jittered, at most
 :data:`IDLE_MAX_SECONDS`), and asks at once again after it got work. :meth:`Worker.stop`
 (what :meth:`Worker.serve` calls on SIGTERM or SIGINT) stops claiming and lets the runs it
 holds finish for up to :data:`GRACE_SECONDS`; a run still going then is released: its handler
-is cancelled with the message :data:`RELEASED`, it writes nothing, its lease lapses and
-another worker runs it again. A second stop releases them at once.
+is cancelled with the message :data:`RELEASED`, it writes nothing, and the worker hands the
+run back to the queue (``release``), so another worker runs it at once as its next attempt,
+with no lapsed lease counted (when even that cannot be sent, the lease lapses as for a dead
+worker). A second stop releases them at once.
 """
 
 from __future__ import annotations
@@ -67,8 +69,8 @@ IDLE_MAX_SECONDS: Final = 10.0
 #: How long a stopping worker lets the runs it holds finish before it releases them.
 GRACE_SECONDS: Final = 25.0
 #: The message a worker cancels a handler with when it stops before the run ends: the run
-#: is released, not cancelled. A handler that records a cancellation as the run's ending
-#: checks for it (``RELEASED in exc.args``) and writes nothing.
+#: is released (back on the queue), not cancelled. A handler that records a cancellation as
+#: the run's ending checks for it (``RELEASED in exc.args``) and writes nothing.
 RELEASED: Final = "trellis:released"
 #: The wait between heartbeats, and the clock a job's remaining working time runs on; names
 #: of their own so tests can stand them in.
@@ -77,8 +79,8 @@ _clock = time.monotonic
 
 
 class WorkerStore(Protocol):
-    """What the worker and its jobs call: the claim and the lease, and the fenced pause and
-    finish. :class:`~trellis.runs.RunsClient` is one."""
+    """What the worker and its jobs call: the claim, the lease and its release, and the
+    fenced pause and finish. :class:`~trellis.runs.RunsClient` is one."""
 
     async def claim(
         self,
@@ -98,6 +100,15 @@ class WorkerStore(Protocol):
         checkpoint: dict[str, Any] | None = ...,
         tenant: str | None = ...,
     ) -> Lease: ...
+
+    async def release(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any] | None = ...,
+        tenant: str | None = ...,
+    ) -> RunRecord: ...
 
     async def pause(
         self,
@@ -236,8 +247,8 @@ class Worker:
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{id(self):x}"
         self._stopping = asyncio.Event()
         self._hurry = asyncio.Event()
-        #: the handlers this worker runs, by run id (what a stop releases)
-        self._held: dict[str, asyncio.Future[object]] = {}
+        #: the runs this worker holds and their handlers, by run id (what a stop releases)
+        self._held: dict[str, tuple[Job, asyncio.Future[object]]] = {}
 
     def stop(self) -> None:
         """Stop claiming and let the runs held finish (at most :data:`GRACE_SECONDS`); a
@@ -341,10 +352,12 @@ class Worker:
                     while running and not hurry.done():
                         await asyncio.wait({*running, hurry}, return_when=asyncio.FIRST_COMPLETED)
             hurry.cancel()
-        for run_id, execution in list(self._held.items()):
-            log.warning("run %s released: its lease lapses and another worker runs it", run_id)
+        released = list(self._held.values())
+        for job, execution in released:
+            log.warning("run %s released: another worker runs it", job.record.run_id)
             execution.cancel(RELEASED)
         await asyncio.gather(*running, return_exceptions=True)
+        await asyncio.gather(*(self._release(job) for job, _ in released))
 
     async def _claim(self) -> Claimed | None:
         try:
@@ -361,7 +374,7 @@ class Worker:
         job = Job(record, self.worker_id, self.lease_seconds, self.store)
         job._renew(claimed.lease)
         execution = asyncio.ensure_future(self.handler(job))
-        self._held[record.run_id] = execution
+        self._held[record.run_id] = (job, execution)
         heartbeat = asyncio.create_task(self._heartbeat(job, execution))
         try:
             await execution
@@ -380,6 +393,18 @@ class Worker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+
+    async def _release(self, job: Job) -> None:
+        """Hand a run its stopped handler left back to the queue; when that cannot be sent,
+        its lease lapses and agent-runs takes the run back."""
+        try:
+            await self.store.release(job.record.run_id, self.worker_id, tenant=job.record.tenant_id)
+        except Exception as refused:
+            log.warning(
+                "run %s could not be released (%s): its lease lapses instead",
+                job.record.run_id,
+                refused,
+            )
 
     async def _end(self, job: Job, status: RunStatus, *, error: AgentError | None = None) -> None:
         """End the run for its handler: ``ERROR`` with what it raised, or ``CANCELLED`` as
