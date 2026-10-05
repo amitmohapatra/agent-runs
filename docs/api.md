@@ -215,8 +215,12 @@ may act as.
 
 Claims use `SELECT … FOR UPDATE SKIP LOCKED`: concurrent claimers never receive the same run
 and never wait on each other. `attempt` is not changed by a claim; it counts executions and
-was already incremented when the run was put back on the queue. `204` means nothing is
-queued for those agents; poll again later.
+was already incremented when the run was put back on the queue. A lease nobody extends in
+time lapses: within a tick the ticker puts the run back on the queue as the next attempt,
+and on its 5th lapse (`MAX_LEASE_LAPSES`) ends it `ERROR` with code `lease_expired` instead.
+Lapses are counted on their own, not by `attempt`, so answering a run many times never
+brings it closer to failing. `204` means nothing is queued for those agents; poll again
+later.
 
 ### `POST /v1/runs/{id}/heartbeat` → `200 Lease`
 
@@ -260,7 +264,7 @@ a worker pausing a run lets go of it.
 interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.checkpoint` on
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, a `CANCEL` answer, a
-`TIMEOUT`, a run failed after `MAX_ATTEMPTS`) clears it. Larger than 1 MiB as compact JSON
+`TIMEOUT`, a run failed on its `MAX_LEASE_LAPSES`-th lapsed lease) clears it. Larger than 1 MiB as compact JSON
 (`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
 
@@ -412,7 +416,7 @@ already deleted.
 
 ### Retention
 
-When a run ends (`finish`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` after `MAX_ATTEMPTS`),
+When a run ends (`finish`, a `CANCEL` answer, a `TIMEOUT`, `ERROR` after `MAX_LEASE_LAPSES`),
 its artifacts get `expires_at = ended + 7 days` (`ARTIFACT_RETENTION`); until then they are
 still readable. The ticker deletes each expired artifact's blob, then its record; a blob
 that cannot be deleted keeps its record for the next tick.
@@ -524,7 +528,7 @@ deliveries still owed to the subscription. Another tenant's id is `404`.
 |---|---|
 | `run.paused` | a run pauses (`/pause`) |
 | `run.escalated` | the ticker moves an overdue interrupt to `escalate_to` |
-| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a lease lapsed `MAX_ATTEMPTS` times |
+| `run.finished` | a run ends: `/finish`, a `CANCEL` answer, an interrupt `TIMEOUT`, a lease lapsed `MAX_LEASE_LAPSES` times |
 
 The event is written to an outbox in the same transaction as the run change, one row per
 subscription of the tenant that wants it, and the ticker sends it (so within one tick,

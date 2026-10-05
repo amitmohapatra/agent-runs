@@ -69,14 +69,15 @@ BLOB_CHUNK_BYTES: Final = 1024 * 1024
 MIN_LEASE_SECONDS: Final = 5
 MAX_LEASE_SECONDS: Final = 3600
 DEFAULT_LEASE_SECONDS: Final = 60
-#: Attempts after which a run whose lease keeps lapsing is failed instead of re-queued: a run
-#: that kills every worker that claims it would otherwise take the fleet down in turn.
-MAX_ATTEMPTS: Final = 5
+#: Lapsed leases after which a run is failed instead of re-queued: a run that kills every
+#: worker that claims it would otherwise take the fleet down in turn. Only lapses count, not
+#: attempts: a person's answer starts an attempt too, and review rounds are not crashes.
+MAX_LEASE_LAPSES: Final = 5
 
 # --------------------------------------------------------------------------- the ticker
 
-#: How often the ticker comes round. The worst-case lateness of a schedule, a lapsed lease
-#: and an overdue interrupt.
+#: How often the ticker comes round. The worst-case lateness of a schedule, a run past its
+#: deadline, a lapsed lease and an overdue interrupt.
 TICK_SECONDS: Final = 5.0
 #: Rows each sweep handles per tick; the rest wait for the next one, so one tick is bounded.
 SWEEP_BATCH: Final = 100

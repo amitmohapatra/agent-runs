@@ -54,7 +54,12 @@ class RunRow(Base):
     #: denormalised from ``awaiting`` for the inbox and the escalation sweep
     assignee: Mapped[str | None] = mapped_column(String(256))
     awaiting_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: executions: the first, then one more for each resume that continues the run and each
+    #: requeue after a lapsed lease
     attempt: Mapped[int] = mapped_column(Integer, default=1)
+    #: the times the run's lease lapsed (its worker stopped heartbeating), which alone decide
+    #: when the ticker gives up on it (``MAX_LEASE_LAPSES``)
+    lease_lapses: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
@@ -95,6 +100,14 @@ class RunRow(Base):
             "ix_runs_escalation",
             "awaiting_deadline",
             postgresql_where=text("status = 'PAUSED' AND awaiting_deadline IS NOT NULL"),
+        ),
+        # the deadline sweep: runs not yet ended past their own deadline
+        Index(
+            "ix_runs_deadline",
+            "deadline",
+            postgresql_where=text(
+                "status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL"
+            ),
         ),
     )
 

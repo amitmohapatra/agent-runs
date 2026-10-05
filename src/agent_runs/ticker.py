@@ -2,7 +2,8 @@
 
 1. fire every due schedule (one ``SKIP LOCKED`` claim at a time, each in its own transaction,
    queueing its run idempotently on ``(schedule_id, fire_time)``);
-2. put runs whose lease lapsed back on the queue (or fail them after ``MAX_ATTEMPTS``);
+2. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
+   lapse);
 3. escalate or time out interrupts past their deadline;
 4. send the webhook deliveries that are due from the outbox (one attempt each);
 5. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then

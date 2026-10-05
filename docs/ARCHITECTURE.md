@@ -109,8 +109,8 @@ stateDiagram-v2
   QUEUED --> TIMEOUT: finish TIMEOUT
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed and attempt < MAX_ATTEMPTS (attempt + 1)
-  RUNNING --> ERROR: ticker, lease lapsed and attempt ≥ MAX_ATTEMPTS (lease_expired)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
@@ -140,11 +140,13 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
 - `attempt` counts executions: `+1` on a resume that continues the run and on a lapsed
-  lease's requeue, never on a claim.
+  lease's requeue, never on a claim. `lease_lapses` counts only the lapses (`+1` on each,
+  in `requeue_lapsed`), and only it decides when the ticker gives up on a run: review
+  rounds are attempts, not crashes.
 - Events go to the outbox in the same transaction: `run.paused` on a pause, `run.escalated`
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
-- `MAX_ATTEMPTS` is 5 (`config/constants.py`).
+- `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
 - `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat; a
   requeue keeps it, so the next attempt's claim resumes from it; only an ending clears it.
 - A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
@@ -298,7 +300,8 @@ erDiagram
     jsonb checkpoint "executor resume state, cleared on ending"
     varchar assignee "from awaiting, for the inbox"
     timestamptz awaiting_deadline "from awaiting, for escalation"
-    int attempt
+    int attempt "executions: resumes and requeues add one"
+    int lease_lapses "only lapsed leases; MAX_LEASE_LAPSES fails the run"
     timestamptz deadline "RunStart.deadline"
     varchar idempotency_key UK
     jsonb run_metadata

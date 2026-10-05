@@ -9,7 +9,7 @@ from datetime import timedelta
 from sqlalchemy import text
 from trellis.contracts.ids import now
 
-from agent_runs.config.constants import MAX_ATTEMPTS, MAX_CHECKPOINT_BYTES
+from agent_runs.config.constants import MAX_CHECKPOINT_BYTES, MAX_LEASE_LAPSES
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore
 from tests.conftest import pause, resolution, started
@@ -154,17 +154,45 @@ async def test_a_lapsed_lease_puts_the_run_back_on_the_queue_as_the_next_attempt
     assert (again["run"]["run_id"], again["run"]["attempt"]) == (rid, 2)
 
 
+async def _lapse(app) -> list:
+    """The ticker's lease sweep, past every lease a test hands out."""
+    async with app.state.sessions() as db:
+        moved = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=10)
+        await db.commit()
+    return moved
+
+
 async def test_a_run_whose_lease_keeps_lapsing_ends_in_error(app, client) -> None:
     await queued(client)
     moved = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, MAX_LEASE_LAPSES + 1):
         claimed = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()
         assert claimed["run"]["attempt"] == attempt
-        async with app.state.sessions() as db:
-            moved = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=10)
-            await db.commit()
+        moved = await _lapse(app)
     assert moved[0].status.value == "ERROR"
     assert moved[0].error is not None and moved[0].error.code == "lease_expired"
+    assert f"lapsed {MAX_LEASE_LAPSES} times" in moved[0].error.message
+
+
+async def test_review_rounds_do_not_use_up_the_lapses_a_crash_may_take(app, client) -> None:
+    """Each answer is an attempt, but only a lapsed lease counts toward failing the run: a
+    run reviewed more times than MAX_LEASE_LAPSES is still re-queued when its worker dies,
+    and the lapses before and after the reviews add up."""
+    await queued(client)
+    rid = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()["run"]["run_id"]
+    for round_ in range(MAX_LEASE_LAPSES + 1):
+        waiting = (
+            await client.post(f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=pause(rid))
+        ).json()
+        await client.post(f"/v1/runs/{rid}/resume", json=resolution(waiting))
+        claimed = (await client.post("/v1/runs/claim", json=claim(lease=5))).json()
+        assert claimed["run"]["attempt"] == round_ + 2
+    for _ in range(MAX_LEASE_LAPSES - 1):
+        [requeued] = await _lapse(app)
+        assert requeued.status.value == "QUEUED"
+        await client.post("/v1/runs/claim", json=claim(lease=5))
+    [failed] = await _lapse(app)
+    assert (failed.status.value, failed.attempt) == ("ERROR", MAX_LEASE_LAPSES + 6)
 
 
 async def test_a_durable_run_resumes_onto_the_queue(client) -> None:

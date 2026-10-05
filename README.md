@@ -88,8 +88,8 @@ stateDiagram-v2
   QUEUED --> TIMEOUT: finish TIMEOUT
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed and attempt < MAX_ATTEMPTS (attempt + 1)
-  RUNNING --> ERROR: ticker, lease lapsed and attempt ≥ MAX_ATTEMPTS (lease_expired)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
@@ -189,8 +189,10 @@ exact claim, heartbeat and resume semantics a worker implements.
    run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
    fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
    (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
-2. **Leases.** A `RUNNING` run whose lease lapsed goes back to `QUEUED` as the next attempt,
-   or ends in `ERROR` after `MAX_ATTEMPTS`.
+2. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
+   back to `QUEUED` as the next attempt, or ends in `ERROR` (`lease_expired`) on its
+   `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses count toward that, never a person's answers:
+   a run reviewed ten times still survives four crashes.
 3. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
    (once) or ends in `TIMEOUT`, with a webhook event either way.
 4. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),

@@ -31,7 +31,7 @@ from agent_runs.answering import require_may_answer
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     DEFAULT_PAGE,
-    MAX_ATTEMPTS,
+    MAX_LEASE_LAPSES,
     PAUSED_ARTIFACT_ROLE,
 )
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
@@ -377,8 +377,9 @@ class RunStore:
     # ------------------------------------------------------------------ the ticker's sweeps
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt;
-        one that has used up ``MAX_ATTEMPTS`` ends as ``ERROR`` instead. Returns every run
-        moved."""
+        one whose lease has now lapsed ``MAX_LEASE_LAPSES`` times ends as ``ERROR`` instead.
+        Only lapses count: a person's answer starts an attempt too, and is no crash. Returns
+        every run moved."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.lease_expires_at < now,
@@ -386,13 +387,15 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
-            if row.attempt >= MAX_ATTEMPTS:
+            row.lease_lapses += 1
+            if row.lease_lapses >= MAX_LEASE_LAPSES:
                 _move(row, RunStatus.ERROR, now)
                 row.error = _json(
                     AgentError(
                         code="lease_expired",
                         category=ErrorCategory.TIMEOUT,
-                        message=f"the lease lapsed on each of {row.attempt} attempts",
+                        message=f"the lease lapsed {row.lease_lapses} times: every worker "
+                        "that claimed the run stopped heartbeating",
                         source="agent-runs",
                     )
                 )
