@@ -145,8 +145,9 @@ into agent-harness, whose run store it is (Way 1):
   raise typed errors (`LeaseLostError`, `ConflictError`, …); failures on the way are
   retried, honouring `Retry-After`.
 - `Worker`: the claim loop: a heartbeat every third of the lease, a lost lease cancels the
-  handler, bounded concurrency, idle backoff, a graceful stop that releases what is still
-  running after 25 s.
+  handler, a handler that raises ends its run `ERROR` at once (the exception as the run's
+  `AgentError`), bounded concurrency, idle backoff, a graceful stop that releases what is
+  still running after 25 s.
 - `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
   `verify_signature` and `parse_delivery` for a receiver.
 

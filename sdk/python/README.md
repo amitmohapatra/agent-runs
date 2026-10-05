@@ -277,6 +277,10 @@ async with RunsClient() as runs:
   and another worker runs them again). A second signal releases them at once. `run()` is the
   same loop without signal handling (stop it with `stop()`), and `run_once()` claims and
   executes one run.
+- A handler that raises ends its run at once as `ERROR`, with the exception as the run's
+  `AgentError` (`AgentError.of`: its class as `code`, its text, and `retryable` as the
+  contracts classify it); you need not catch anything to record a failure. Only if that
+  finish fails too does the run wait for its lease to lapse, as for a worker that died.
 - `job.pause(interrupt, checkpoint=...)` and `job.finish(...)` are fenced: after the lease
   was lost they raise `LeaseLostError`. A handler that records a cancellation as the run's
   ending checks for `RELEASED in exc.args` and writes nothing then.

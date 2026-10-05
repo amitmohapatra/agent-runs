@@ -170,6 +170,18 @@ async def test_a_lost_lease_stops_the_workers_handler(runs: RunsClient, monkeypa
     assert done is not None and done.status is RunStatus.CANCELLED
 
 
+async def test_a_handler_that_raises_ends_its_run_as_error_at_once(runs: RunsClient) -> None:
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+
+    async def handler(job: Job) -> None:
+        raise ConnectionRefusedError("the CRM refused")
+
+    assert await Worker(runs, handler, ["triage"], tenant="acme").run_once()
+    done = await runs.get(queued.run_id, tenant="acme")
+    assert done is not None and done.status is RunStatus.ERROR and done.error is not None
+    assert (done.error.code, done.error.message) == ("ConnectionRefusedError", "the CRM refused")
+
+
 async def test_a_run_past_its_deadline_stops_the_workers_handler(
     app: Any, runs: RunsClient, monkeypatch
 ) -> None:

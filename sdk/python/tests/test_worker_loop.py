@@ -42,6 +42,7 @@ class Store:
         self.writes: list[tuple[str, dict[str, Any]]] = []
         self.claim_error: Exception | None = None
         self.beat_error: Exception | None = None
+        self.finish_error: Exception | None = None
         #: set on every claim and heartbeat, for a test waiting until enough of them came
         self.changed = asyncio.Event()
 
@@ -123,6 +124,8 @@ class Store:
                 },
             )
         )
+        if self.finish_error is not None:
+            raise self.finish_error
         return run(run_id).model_copy(update={"status": status, "output": output})
 
     async def until(self, done: Callable[[], bool]) -> None:
@@ -295,16 +298,44 @@ async def test_a_handler_whose_write_lost_the_lease_is_logged(
     assert "lease on run_1 lost while the handler wrote" in caplog.text
 
 
-async def test_a_handler_that_breaks_is_logged_and_the_worker_goes_on(
+async def test_a_handler_that_breaks_ends_its_run_as_error_and_the_worker_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At once, not when the lease lapses: the error is the contracts' reading of the
+    exception, retryable or not as its category says."""
+    failures = iter([RuntimeError("boom"), TimeoutError("the model did not answer")])
+
+    async def broken(job: Job) -> None:
+        raise next(failures)
+
+    store = Store(run("run_1"), run("run_2"))
+    worker = Worker(store, broken, ["triage"], worker_id="w-1")
+    with caplog.at_level(logging.ERROR, logger="trellis.runs.worker"):
+        assert await worker.run_once() and await worker.run_once()
+    assert caplog.text.count("failed in the worker") == 2
+    ended = [call for verb, call in store.writes if verb == "finish"]
+    assert [(e["run_id"], e["status"], e["worker_id"]) for e in ended] == [
+        ("run_1", RunStatus.ERROR, "w-1"),
+        ("run_2", RunStatus.ERROR, "w-1"),
+    ]
+    first, second = (e["error"] for e in ended)
+    assert (first.code, first.message, first.retryable) == ("RuntimeError", "boom", False)
+    assert (second.code, second.category, second.retryable) == ("TimeoutError", "TIMEOUT", True)
+
+
+async def test_a_run_that_cannot_be_ended_as_error_is_left_to_its_lease(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def broken(job: Job) -> None:
         raise RuntimeError("boom")
 
-    worker = Worker(Store(run("run_1"), run("run_2")), broken, ["triage"])
-    with caplog.at_level(logging.ERROR, logger="trellis.runs.worker"):
+    store = Store(run(), run("run_2"))
+    store.finish_error = ConnectionError("agent-runs is down")
+    worker = Worker(store, broken, ["triage"])
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
         assert await worker.run_once() and await worker.run_once()
-    assert caplog.text.count("failed in the worker") == 2
+    assert "run run_1 could not be ended as ERROR (agent-runs is down)" in caplog.text
+    assert "its lease lapses instead" in caplog.text
 
 
 async def test_a_failed_claim_is_logged_and_means_no_work(
