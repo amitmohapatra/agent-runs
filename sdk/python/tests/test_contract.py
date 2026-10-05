@@ -245,6 +245,7 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
             agent_id="triage",
             thread_id="thr_1",
             parent_run_id="run_0",
+            top_level=True,
             cursor="c1",
             limit=500,
         )

@@ -293,6 +293,17 @@ async def test_children_are_listed_by_parent(client) -> None:
     assert [r["run_id"] for r in kids] == [child["run_id"]]
 
 
+async def test_an_inbox_of_top_level_runs_leaves_paused_children_out(client) -> None:
+    parent = await paused(client)
+    child = await paused(client, parent_run_id=parent["run_id"])
+    inbox = {"status": "PAUSED", "top_level": "true", "limit": 1}
+    first = await client.get("/v1/runs", params=inbox)
+    assert [r["run_id"] for r in first.json()] == [parent["run_id"]]
+    assert "link" not in first.headers, "the child is not a page further on either"
+    every = (await client.get("/v1/runs", params={"status": "PAUSED"})).json()
+    assert {r["run_id"] for r in every} == {parent["run_id"], child["run_id"]}
+
+
 async def test_one_tenant_cannot_read_or_move_another_tenants_run(client, other_tenant) -> None:
     run = await paused(client)
     rid = run["run_id"]

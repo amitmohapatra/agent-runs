@@ -565,11 +565,19 @@ async def listing(
     parent_run_id: Annotated[
         str | None, Query(description="Only the child runs of this run.")
     ] = None,
+    top_level: Annotated[
+        bool,
+        Query(
+            description="true: only top-level runs (no parent_run_id), so an inbox lists a "
+            "paused child's parent, not the child too."
+        ),
+    ] = False,
     cursor: CursorQuery = None,
     limit: LimitQuery = DEFAULT_LIMIT,
 ) -> list[RunSummary]:
     """This tenant's runs, newest first, as summaries; the full record is
-    ``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox."""
+    ``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox, and
+    ``&top_level=true`` leaves out the runs other runs started (sub-agents)."""
     page = await RunStore(db).list(
         who.tenant_id,
         status=status,
@@ -577,6 +585,7 @@ async def listing(
         agent_id=agent_id,
         thread_id=thread_id,
         parent_run_id=parent_run_id,
+        top_level=top_level,
         limit=limit,
         after=decode_cursor(cursor, fields=_RUNS_CURSOR),
     )

@@ -268,18 +268,21 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        top_level: bool = False,
         cursor: str | None = None,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
     ) -> Page[RunSummary]:
         """One page of the tenant's runs, newest first. ``status=PAUSED`` with ``assignee``
-        is the inbox of a person or role."""
+        is the inbox of a person or role; ``top_level=True`` leaves out the runs other runs
+        started (a paused sub-agent shows as its parent only)."""
         filters = {
             "status": status.value if status is not None else None,
             "assignee": assignee,
             "agent_id": agent_id,
             "thread_id": thread_id,
             "parent_run_id": parent_run_id,
+            "top_level": "true" if top_level else None,
             "cursor": cursor,
         }
         params = {name: value for name, value in filters.items() if value is not None}
@@ -298,6 +301,7 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        top_level: bool = False,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
         max_pages: int | None = None,
@@ -313,6 +317,7 @@ class RunsClient:
                 agent_id=agent_id,
                 thread_id=thread_id,
                 parent_run_id=parent_run_id,
+                top_level=top_level,
                 cursor=cursor,
                 limit=limit,
                 tenant=tenant,

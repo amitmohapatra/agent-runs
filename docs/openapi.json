@@ -3173,7 +3173,7 @@
     },
     "/v1/runs": {
       "get": {
-        "description": "This tenant's runs, newest first, as summaries; the full record is\n``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox.",
+        "description": "This tenant's runs, newest first, as summaries; the full record is\n``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox, and\n``&top_level=true`` leaves out the runs other runs started (sub-agents).",
         "operationId": "runs.list",
         "parameters": [
           {
@@ -3264,6 +3264,18 @@
               ],
               "description": "Only the child runs of this run.",
               "title": "Parent Run Id"
+            }
+          },
+          {
+            "description": "true: only top-level runs (no parent_run_id), so an inbox lists a paused child's parent, not the child too.",
+            "in": "query",
+            "name": "top_level",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "true: only top-level runs (no parent_run_id), so an inbox lists a paused child's parent, not the child too.",
+              "title": "Top Level",
+              "type": "boolean"
             }
           },
           {

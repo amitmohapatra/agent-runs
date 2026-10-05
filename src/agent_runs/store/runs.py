@@ -1006,13 +1006,14 @@ class RunStore:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        top_level: bool = False,
         limit: int = DEFAULT_PAGE,
         after: Mapping[str, Any] | None = None,
     ) -> Page[RunSummary]:
         """This tenant's runs, newest first, as summaries (only the summary's columns are
         read), a page at a time (keyset ``created_at, run_id``, both descending).
         ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served by
-        ``ix_runs_inbox``."""
+        ``ix_runs_inbox``; ``top_level`` keeps only the runs no other run started."""
         order = (RunRow.created_at, RunRow.run_id)
         query = select(*_SUMMARY_COLUMNS, RunRow.created_at).where(RunRow.tenant_id == tenant_id)
         if after is not None:
@@ -1027,6 +1028,8 @@ class RunStore:
         for column, value in filters.items():
             if value is not None:
                 query = query.where(column == value)
+        if top_level:
+            query = query.where(RunRow.parent_run_id.is_(None))
         newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
         rows = (await self._session.execute(newest)).all()
         return page_of(

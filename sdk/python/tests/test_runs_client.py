@@ -228,6 +228,7 @@ async def test_list_sends_the_filters_and_reads_the_next_cursor(runs: RunsClient
         agent_id="triage",
         thread_id="thr_1",
         parent_run_id="run_0",
+        top_level=True,
         cursor="c1",
         limit=2,
     )
@@ -240,6 +241,7 @@ async def test_list_sends_the_filters_and_reads_the_next_cursor(runs: RunsClient
         "agent_id": "triage",
         "thread_id": "thr_1",
         "parent_run_id": "run_0",
+        "top_level": "true",
         "cursor": "c1",
         "limit": "2",
     }
@@ -260,10 +262,11 @@ async def test_iterate_follows_the_pages_to_the_end(runs: RunsClient) -> None:
         httpx.Response(200, json=[summary("run_1")], headers={"Link": NEXT}),
         httpx.Response(200, json=[summary("run_2")]),
     ]
-    seen = [s.run_id async for s in runs.iterate(status=RunStatus.PAUSED, limit=1)]
+    seen = [s.run_id async for s in runs.iterate(status=RunStatus.PAUSED, top_level=True, limit=1)]
     assert seen == ["run_1", "run_2"]
     assert route.calls[1].request.url.params["cursor"] == "c2"
     assert route.calls[1].request.url.params["status"] == "PAUSED"
+    assert route.calls[1].request.url.params["top_level"] == "true"
 
 
 @respx.mock
