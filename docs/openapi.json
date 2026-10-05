@@ -280,6 +280,109 @@
         "title": "Claimed",
         "type": "object"
       },
+      "DeliveryRecord": {
+        "description": "A delivery in the outbox, as listed: which event it carries to which subscription,\nand how its attempts went.",
+        "properties": {
+          "attempts": {
+            "description": "Attempts made since it was written or redelivered.",
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "created_at": {
+            "description": "When the event was written.",
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dead_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When it was given up on (null while pending).",
+            "title": "Dead At"
+          },
+          "delivery_id": {
+            "description": "The delivery's id (`dlv_…`).",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "event_id": {
+            "description": "The event's id, as X-Trellis-Delivery carries it.",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the last attempt failed; null before any did.",
+            "title": "Last Error"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When a pending delivery is tried next (null when dead).",
+            "title": "Next Attempt At"
+          },
+          "run_id": {
+            "description": "The run the event is about.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliveryState",
+            "description": "pending (still owed) or dead (given up on)."
+          },
+          "type": {
+            "$ref": "#/components/schemas/WebhookEvent",
+            "description": "The event."
+          },
+          "webhook_id": {
+            "description": "The subscription it goes to.",
+            "title": "Webhook Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "webhook_id",
+          "event_id",
+          "type",
+          "run_id",
+          "state",
+          "attempts",
+          "created_at"
+        ],
+        "title": "DeliveryRecord",
+        "type": "object"
+      },
+      "DeliveryState": {
+        "description": "Where a delivery is: still owed (waiting for its next attempt), or given up on and\nkept for redelivery.",
+        "enum": [
+          "pending",
+          "dead"
+        ],
+        "title": "DeliveryState",
+        "type": "string"
+      },
       "ErrorCategory": {
         "enum": [
           "VALIDATION",
@@ -1896,6 +1999,19 @@
             "title": "Events",
             "type": "array"
           },
+          "previous_secret_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "After a rotation, when deliveries stop being signed with the secret it replaced as well as with the new one; null before any rotation.",
+            "title": "Previous Secret Expires At"
+          },
           "url": {
             "description": "Where deliveries go.",
             "title": "Url",
@@ -1945,7 +2061,7 @@
         "type": "object"
       },
       "WebhookCreated": {
-        "description": "The answer to a create, the only one that carries ``secret``.",
+        "description": "The answer to a create or a rotation, the only ones that carry ``secret``.",
         "properties": {
           "created_at": {
             "description": "When it was created.",
@@ -1965,6 +2081,19 @@
             },
             "title": "Events",
             "type": "array"
+          },
+          "previous_secret_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "After a rotation, when deliveries stop being signed with the secret it replaced as well as with the new one; null before any rotation.",
+            "title": "Previous Secret Expires At"
           },
           "secret": {
             "description": "Signs every delivery (X-Trellis-Signature); shown in this answer only.",
@@ -9714,7 +9843,7 @@
         ]
       },
       "post": {
-        "description": "Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,\nwhich signs every delivery to it; it is shown here and never again.",
+        "description": "Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,\nwhich signs every delivery to it; it is shown here and never again (rotate it with\n``rotate-secret``). Outside dev the URL must be ``https`` and its host must resolve to\npublic addresses only (422 otherwise), unless the deployment allows private targets;\neach delivery checks the host again.",
         "operationId": "webhooks.create",
         "parameters": [
           {
@@ -10064,6 +10193,693 @@
           }
         ],
         "summary": "Subscribe to run events",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/v1/webhooks/deliveries": {
+      "get": {
+        "description": "This tenant's deliveries, newest first. A delivery that used its attempts, or that\nits receiver (or this deployment's address check) refused for good, is dead: kept with\nits ``last_error`` for ``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS`` (7) to be redelivered,\nthen dropped.",
+        "operationId": "webhooks.deliveries",
+        "parameters": [
+          {
+            "description": "`dead`: given up on, kept to be redelivered; `pending`: still owed.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/DeliveryState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`dead`: given up on, kept to be redelivered; `pending`: still owed.",
+              "title": "State"
+            }
+          },
+          {
+            "description": "Only the deliveries to this subscription.",
+            "in": "query",
+            "name": "webhook_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only the deliveries to this subscription.",
+              "title": "Webhook Id"
+            }
+          },
+          {
+            "description": "Opaque position of the next page, copied from the previous response's `Link: <...>; rel=\"next\"`. Omit for the first page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque position of the next page, copied from the previous response's `Link: <...>; rel=\"next\"`. Omit for the first page.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Items per page, 1 to 500.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Items per page, 1 to 500.",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DeliveryRecord"
+                  },
+                  "title": "Response Webhooks.Deliveries",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "A page of this tenant's deliveries, newest first.",
+            "headers": {
+              "Link": {
+                "$ref": "#/components/headers/Link"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "List deliveries, or the dead ones",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/v1/webhooks/deliveries/{delivery_id}/redeliver": {
+      "post": {
+        "description": "Owe a dead delivery again: due now, with all its attempts ahead of it, signed with\nthe subscription's secret as it is now. The event and its ``event_id`` are unchanged,\nso a receiver that did get it drops the repeat.",
+        "operationId": "webhooks.redeliver",
+        "parameters": [
+          {
+            "description": "The delivery's id (`dlv_…`).",
+            "in": "path",
+            "name": "delivery_id",
+            "required": true,
+            "schema": {
+              "description": "The delivery's id (`dlv_…`).",
+              "title": "Delivery Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryRecord"
+                }
+              }
+            },
+            "description": "The delivery, owed again and due now.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "CONFLICT",
+                  "detail": "run run_01J8 cannot move from SUCCESS to CANCELLED",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 409,
+                  "title": "Conflict",
+                  "type": "urn:trellis:problem:conflict"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "CONFLICT: the delivery is still owed: it is being tried already.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/webhooks/deliveries/{delivery_id}/redeliver",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Redeliver a dead delivery",
         "tags": [
           "webhooks"
         ]
@@ -10677,6 +11493,317 @@
           }
         ],
         "summary": "Read a subscription",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/v1/webhooks/{webhook_id}/rotate-secret": {
+      "post": {
+        "description": "A new secret for the subscription, in this answer only. For\n``RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS`` (24) after it, every delivery carries a\nsignature with each secret (``t=…,v1=<new>,v1=<old>``), which\n``trellis.runs.webhooks.verify_signature`` accepts with either: move the receiver to the\nnew secret within that window (``previous_secret_expires_at``).",
+        "operationId": "webhooks.rotate_secret",
+        "parameters": [
+          {
+            "description": "The subscription's id (`wh_…`).",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "description": "The subscription's id (`wh_…`).",
+              "title": "Webhook Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookCreated"
+                }
+              }
+            },
+            "description": "The subscription with its new `secret`, shown here only.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/webhooks/{webhook_id}/rotate-secret",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Rotate a subscription's secret",
         "tags": [
           "webhooks"
         ]

@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -192,6 +193,9 @@ class WebhookRow(Base):
     url: Mapped[str] = mapped_column(String(2048))
     events: Mapped[list[str]] = mapped_column(ARRAY(String(32)))
     secret: Mapped[str] = mapped_column(String(128))
+    #: the secret a rotation replaced, which also signs deliveries until it expires
+    previous_secret: Mapped[str | None] = mapped_column(String(128))
+    previous_secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = _created()
 
@@ -199,7 +203,8 @@ class WebhookRow(Base):
 
 
 class WebhookDeliveryRow(Base):
-    """The outbox: one event owed to one subscription, until it is accepted or given up."""
+    """The outbox: one event owed to one subscription, until it is accepted; one given up on
+    stays, dead, to be listed and redelivered, until its retention ends."""
 
     __tablename__ = "webhook_deliveries"
 
@@ -211,12 +216,26 @@ class WebhookDeliveryRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     attempts: Mapped[int] = mapped_column(Integer)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: why the last attempt failed (a status, an unreachable host, a refused address)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    #: when it was given up on; null while it is still owed
+    dead_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
 
     __table_args__ = (
-        # the ticker: deliveries by when they are due
-        Index("ix_webhook_deliveries_due", "next_attempt_at"),
+        # the ticker: deliveries still owed, by when they are due
+        Index(
+            "ix_webhook_deliveries_due",
+            "next_attempt_at",
+            postgresql_where=text("dead_at IS NULL"),
+        ),
         Index("ix_webhook_deliveries_webhook", "webhook_id"),
+        # the ticker: dead deliveries, by when their retention ends
+        Index(
+            "ix_webhook_deliveries_dead",
+            "dead_at",
+            postgresql_where=text("dead_at IS NOT NULL"),
+        ),
     )
 
 

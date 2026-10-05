@@ -21,6 +21,7 @@ from trellis.contracts.runs import (
 )
 from trellis.runs import (
     ConflictError,
+    DeliveryState,
     Job,
     LeaseLostError,
     NotFoundError,
@@ -302,6 +303,23 @@ async def test_webhook_subscriptions_through_the_sdk(runs: RunsClient) -> None:
     assert listed.webhook_id == made.webhook_id and listed.events == made.events
     found = await runs.webhooks.get(made.webhook_id, tenant="acme")
     assert found is not None and found.url == "https://ui.example/h"
+    rotated = await runs.webhooks.rotate_secret(made.webhook_id, tenant="acme")
+    assert rotated.secret != made.secret and rotated.previous_secret_expires_at is not None
+
+    await runs.finish(
+        (await runs.start(RunStart(tenant_id="acme", agent_id="a"))).run_id,
+        RunStatus.SUCCESS,
+        tenant="acme",
+    )
+    [owed] = (await runs.webhooks.deliveries(state=DeliveryState.PENDING, tenant="acme")).items
+    assert (owed.webhook_id, owed.type, owed.attempts) == (
+        made.webhook_id,
+        WebhookEvent.FINISHED,
+        0,
+    )
+    assert (await runs.webhooks.deliveries(state=DeliveryState.DEAD, tenant="acme")).items == []
+    with pytest.raises(ConflictError):
+        await runs.webhooks.redeliver(owed.delivery_id, tenant="acme")
     await runs.webhooks.delete(made.webhook_id, tenant="acme")
     assert await runs.webhooks.get(made.webhook_id, tenant="acme") is None
 

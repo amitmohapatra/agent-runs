@@ -111,6 +111,23 @@ def webhook(webhook_id: str = "wh_1", **over: Any) -> dict[str, Any]:
     }
 
 
+def delivery(delivery_id: str = "dlv_1", *, dead: bool = False) -> dict[str, Any]:
+    """An outbox delivery as agent-runs lists it: still owed, or given up on."""
+    return {
+        "delivery_id": delivery_id,
+        "webhook_id": "wh_1",
+        "event_id": "whd_1",
+        "type": "run.finished",
+        "run_id": "run_1",
+        "state": "dead" if dead else "pending",
+        "attempts": 7 if dead else 0,
+        "last_error": "answered 503" if dead else None,
+        "next_attempt_at": None if dead else NOW.isoformat(),
+        "dead_at": NOW.isoformat() if dead else None,
+        "created_at": NOW.isoformat(),
+    }
+
+
 def artifact(artifact_id: str = "art_1") -> dict[str, Any]:
     return {
         "artifact_id": artifact_id,

@@ -17,6 +17,8 @@ from trellis.runs.errors import (
 )
 from trellis.runs.models import (
     Claimed,
+    DeliveryRecord,
+    DeliveryState,
     FireResult,
     Lease,
     Page,
@@ -42,6 +44,8 @@ __all__ = [
     "AuthorizationError",
     "Claimed",
     "ConflictError",
+    "DeliveryRecord",
+    "DeliveryState",
     "DependencyUnavailableError",
     "FireResult",
     "Job",

@@ -224,7 +224,7 @@ async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) ->
 def sender(receiver: Receiver, *, allow_http: bool = True) -> WebhookSender:
     """The ticker's sender, delivering to ``receiver``."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle))
-    return WebhookSender(client=client, allow_http=allow_http)
+    return WebhookSender(client=client, allow_http=allow_http, allow_private=True)
 
 
 def client_of(app: Any, key: str = "dev-key", **headers: str) -> AsyncClient:

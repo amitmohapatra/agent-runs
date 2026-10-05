@@ -123,3 +123,6 @@ WEBHOOK_RETRY_BASE: Final = timedelta(seconds=15)
 WEBHOOK_RETRY_CAP: Final = timedelta(minutes=10)
 #: Receiver answers worth another attempt: a 5xx, or the receiver asking for time.
 WEBHOOK_RETRYABLE: Final = frozenset({408, 429, 500, 502, 503, 504})
+#: How long a delivery given up on is kept, dead, for a tenant to list and redeliver, unless
+#: the deployment says otherwise (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``).
+WEBHOOK_DEAD_RETENTION: Final = timedelta(days=7)

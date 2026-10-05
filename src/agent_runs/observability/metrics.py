@@ -64,8 +64,13 @@ ticks_total = Counter(
 swept_total = Counter(
     "runs_ticker_swept_total",
     "Rows each ticker step handled: fired, timed_out, overworked, requeued, escalated, sent, "
-    "purged",
+    "dropped, purged",
     ["step"],
+    registry=REGISTRY,
+)
+webhook_dead_total = Counter(
+    "runs_webhook_dead_total",
+    "Webhook deliveries given up on (out of attempts, or refused for good), kept as dead",
     registry=REGISTRY,
 )
 db_pool_connections = Gauge(

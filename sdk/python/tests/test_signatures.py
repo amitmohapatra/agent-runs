@@ -27,6 +27,16 @@ def test_the_vector() -> None:
     )
 
 
+def test_during_a_rotation_both_secrets_sign_and_either_verifies() -> None:
+    old = hmac.new(b"whsec_old", b"1700000000." + BODY, hashlib.sha256).hexdigest()
+    header = sign(SECRET, STAMP, BODY, previous="whsec_old")
+    assert header == f"t={STAMP},v1={DIGEST},v1={old}"
+    for secret in (SECRET, "whsec_old"):
+        assert verify_signature(secret, header, BODY, now=STAMP)
+    assert verify_signature("whsec_old", f"t={STAMP},v1={old},v1={DIGEST}", BODY, now=STAMP)
+    assert not verify_signature("whsec_other", header, BODY, now=STAMP)
+
+
 def test_the_headers_are_the_ones_agent_runs_sends() -> None:
     assert (hooks.SIGNATURE_HEADER, hooks.EVENT_HEADER, hooks.DELIVERY_HEADER) == (
         "X-Trellis-Signature",
