@@ -425,6 +425,22 @@ async def test_an_answer_to_a_choice_is_one_of_its_options(client) -> None:
     assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=chosen)).status_code == 200
 
 
+async def test_several_picks_are_option_values_and_the_comment_is_kept(client) -> None:
+    labelled = [{"value": "eu", "label": "Europe"}, {"value": "us", "label": "United States"}]
+    run = await _asked(client, reason="CHOICE", ui="choice", options=labelled, multiple=True)
+    assert [option["label"] for option in run["awaiting"]["options"]] == ["Europe", "United States"]
+    assert run["awaiting"]["multiple"] is True
+    await _refused(client, run, resolution(run, "ANSWER", answer="eu"), "is not a list")
+    await _refused(client, run, resolution(run, "ANSWER", answer=["Europe"]), "not among")
+    await _refused(client, run, resolution(run, "APPROVE", remember="run"), "remembered")
+    picked = resolution(run, "ANSWER", answer=["us", "eu"], comment="both regions")
+    resumed = await client.post(f"/v1/runs/{run['run_id']}/resume", json=picked)
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["last_resolution"]["comment"] == "both regions"
+    history = (await client.get(f"/v1/runs/{run['run_id']}/resolutions")).json()
+    assert history[0]["resolution"]["answer"] == ["us", "eu"]
+
+
 async def test_a_question_whose_expects_is_no_json_schema_is_refused(client) -> None:
     """Refused where it is asked, not when someone tries to answer it."""
     run = (await client.post("/v1/runs", json=started())).json()

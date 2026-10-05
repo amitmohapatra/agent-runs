@@ -10,6 +10,7 @@ from trellis.contracts.runs import (
     InterruptDecision,
     InterruptReason,
     InterruptResolution,
+    Option,
 )
 from trellis.contracts.tool import ToolCall
 from trellis.runs.answers import answer_problem, schema_problem
@@ -116,3 +117,62 @@ def test_expects_must_be_a_json_schema() -> None:
     asked = _asked(ui="form", expects={"type": "not-a-type"})
     problem = answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=1))
     assert problem is not None and problem.startswith("expects is not a valid JSON Schema")
+
+
+def test_an_answer_picks_an_options_value_never_its_label() -> None:
+    asked = _asked(
+        reason=InterruptReason.CHOICE,
+        ui="choice",
+        options=["ACME", Option(value="globex", label="Globex GmbH")],
+    )
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer="globex")) is None
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer="ACME")) is None
+    label = _answer(asked, InterruptDecision.ANSWER, answer="Globex GmbH")
+    assert answer_problem(asked, label) == (
+        "the answer 'Globex GmbH' is not one of the options ['ACME', 'globex']"
+    )
+
+
+def test_several_picks_are_a_list_of_distinct_option_values() -> None:
+    asked = _asked(ui="choice", options=["a", Option(value="b"), "c"], multiple=True)
+
+    def problem(answer: Any) -> str | None:
+        return answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=answer))
+
+    assert problem(["a", "c"]) is None
+    assert problem([]) is None
+    assert problem("a") == "the answer 'a' is not a list of the options ['a', 'b', 'c']"
+    assert problem(["a", "z", 1]) == (
+        "the answer picks ['z', 1], which are not among the options ['a', 'b', 'c']"
+    )
+    assert problem(["b", "b"]) == "the answer picks an option more than once"
+
+
+def test_several_picks_described_by_expects_fit_expects() -> None:
+    listed = {"type": "array", "items": {"type": "integer"}, "uniqueItems": True}
+    asked = _asked(ui="form", expects=listed, multiple=True)
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=[1, 2])) is None
+    wrong = _answer(asked, InterruptDecision.ANSWER, answer=[1, 1])
+    assert answer_problem(asked, wrong) == (
+        "the answer does not fit what was asked: [1, 1] has non-unique elements"
+    )
+
+
+def test_an_answer_from_the_askers_own_screen_still_fits_expects() -> None:
+    asked = _asked(component="refund-review", props={"order": 91}, expects=SQL)
+    wrong = _answer(asked, InterruptDecision.ANSWER, answer={"rows": 1})
+    assert answer_problem(asked, wrong) == (
+        "the answer does not fit what was asked: 'sql' is a required property"
+    )
+    free = _asked(component="refund-review")
+    assert answer_problem(free, _answer(free, InterruptDecision.ANSWER, answer={"x": 1})) is None
+
+
+def test_only_an_approval_of_a_tool_call_is_remembered_for_the_run() -> None:
+    call = _asked(reason=InterruptReason.APPROVAL, tool_call=ToolCall(tool="refund"))
+    remembered = _answer(call, InterruptDecision.APPROVE, remember="run", comment="ok today")
+    assert answer_problem(call, remembered) is None
+    question = _asked()
+    assert answer_problem(
+        question, _answer(question, InterruptDecision.APPROVE, remember="run")
+    ) == ("only an approval of a tool call is remembered for the run")
