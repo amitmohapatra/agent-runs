@@ -10,10 +10,11 @@ dependencies = [
   "pydantic>=2.13,<3",
   # RunRecord, RunStart, Interrupt, Schedule…: the wire's records are the contracts' models
   "trellis-contracts>=0.4,<0.6",
+  "jsonschema>=4.23,<5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6", "respx>=0.22", "jsonschema>=4.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6", "respx>=0.22"]
 
 [build-system]
 requires = ["hatchling>=1.27"]
