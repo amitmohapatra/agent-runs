@@ -160,7 +160,9 @@ class RunsClient:
         self, resolution: InterruptResolution, *, tenant: str | None = None
     ) -> RunRecord:
         """Answer the interrupt the run waits on: ``CANCEL`` ends it, any other decision
-        continues it as its next attempt."""
+        continues it as its next attempt. A key restricted to listed people answers only as
+        one of them (``resolution.reviewer``), and only a run assigned to that person or to
+        nobody: anything else raises :class:`AuthorizationError` saying why."""
         data = await self._transport.json(
             "POST",
             f"/v1/runs/{resolution.run_id}/resume",

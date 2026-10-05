@@ -213,6 +213,66 @@ principals it may put in `on_behalf_of`. The contract is in
 for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with itself
 (`403` otherwise).
 
+### Who may answer a paused run
+
+Any key of the tenant reads every run, lists every inbox and works the queue: `assignee` is
+the filter an inbox shows, not a lock. Answering a paused run (`POST /v1/runs/{id}/resume`,
+`RunsClient.resume`, a `CANCEL` included) is checked, against the run's assignee at that
+moment (after any escalation), before anything is written:
+
+1. An **admin** key (or the operator's **platform** key) answers any run.
+2. A key that **may act for anyone** (`"*"` in its `may_act_as`, which is what the Memory
+   Service issues by default) answers any run: the application holding it vouches for the
+   `reviewer` it names.
+3. A key **restricted to listed people** (`may_act_as=["user:priya"]`) answers only as one
+   of them, and only a run assigned to that person or to nobody. The `reviewer` is who it
+   answers as (a bare id `priya` means `user:priya`; no reviewer means the key itself). A run
+   assigned to a group (`role:finance`) is refused: agent-runs cannot see who is in a group,
+   so answer it with the application's key or an admin key.
+
+| The key | Run assigned to `user:priya` | to `user:raj` | to `role:finance` | to nobody |
+|---|---|---|---|---|
+| admin or platform | yes | yes | yes | yes |
+| `may_act_as=["*"]` (the default) | yes | yes | yes | yes |
+| `may_act_as=["user:priya"]`, `reviewer="priya"` | yes | no | no | yes |
+| `may_act_as=["user:priya"]`, `reviewer="raj"` | no | no | no | no |
+
+A refusal is `403 AUTHORIZATION` (`AuthorizationError` in the SDK) whose detail says why,
+for example `the run is assigned to user:raj, not user:priya; this key may act only for
+user:priya`, or `the run is assigned to role:finance, a group: a key restricted to listed
+people cannot answer it; answer with the application's key or an admin key`. The
+`reviewer` is stored as given.
+
+**Nothing changes if your keys may act for anyone**, as every key the Memory Service issues
+does unless told otherwise. To let a person's own client (an approvals UI, a mobile app)
+answer only their runs, issue that client a key restricted to them, with the tenant's admin
+key:
+
+```python
+from trellis.memory import MemoryClient
+
+async with MemoryClient(api_key=ADMIN_KEY) as admin:
+    issued = await admin.tenant.keys.issue("service", "priya-approvals", may_act_as=["user:priya"])
+    priya_key = issued.token  # shown once
+```
+
+```python
+from trellis.contracts.runs import InterruptDecision, InterruptResolution
+from trellis.runs import RunsClient
+
+async with RunsClient(api_key=priya_key) as runs:
+    await runs.resume(
+        InterruptResolution(
+            interrupt_id=run.awaiting.interrupt_id,
+            run_id=run.run_id,
+            decision=InterruptDecision.APPROVE,
+            reviewer="priya",
+        )
+    )  # her run: answered; raj's or role:finance's: AuthorizationError
+```
+
+The rule is `answering.py`, one function.
+
 ## Artifacts
 
 Large review payloads never live in a run's checkpoint. The harness uploads an `ask` table

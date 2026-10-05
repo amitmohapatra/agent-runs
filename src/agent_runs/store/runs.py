@@ -27,6 +27,7 @@ from trellis.contracts.runs import (
     RunStatus,
 )
 
+from agent_runs.answering import require_may_answer
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     DEFAULT_PAGE,
@@ -45,6 +46,7 @@ from agent_runs.domain.runs import (
     RunSummary,
     bounded_checkpoint,
 )
+from agent_runs.keys import KeyInfo
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
 from agent_runs.store.tables import ResolutionRow, RunRow
@@ -253,12 +255,19 @@ class RunStore:
         return await self._flushed(row), True
 
     async def resume(
-        self, tenant_id: str, run_id: str, resolution: InterruptResolution, *, now: datetime
+        self,
+        tenant_id: str,
+        run_id: str,
+        resolution: InterruptResolution,
+        *,
+        answerer: KeyInfo,
+        now: datetime,
     ) -> RunRecord:
-        """Answer the interrupt a paused run waits on. ``CANCEL`` ends the run; any other
-        decision continues it as the next attempt: back on the queue when the run is durable
-        (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
-        process."""
+        """Answer the interrupt a paused run waits on, as ``answerer`` may
+        (``answering.py``: checked against the run's assignee now, before anything is
+        written). ``CANCEL`` ends the run; any other decision continues it as the next
+        attempt: back on the queue when the run is durable (it was ever queued, so a worker
+        resumes it), else ``RUNNING`` in the caller's process."""
         if resolution.run_id != run_id:
             raise Unprocessable("the resolution answers another run")
         row = await self._locked(tenant_id, run_id, worker_id=None)
@@ -267,6 +276,7 @@ class RunStore:
         asked = Interrupt.model_validate(row.awaiting)
         if asked.interrupt_id != resolution.interrupt_id:
             raise Conflict(f"run {run_id} is waiting on another interrupt")
+        require_may_answer(answerer, asked.assignee, resolution.reviewer)
         row.last_resolution = _json(resolution)
         self._session.add(
             ResolutionRow(

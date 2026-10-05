@@ -38,7 +38,9 @@ DB_URL = f"postgresql+psycopg://memory:memory@localhost:5432/{DB_NAME}"
 #: What the fake key registry knows, as ``GET /v1/keys/self`` answers it. Each a different
 #: shape: a tenant service key that may act as anyone in acme, the same for globex (a
 #: different secret: one key for both tenants would let isolation tests pass by
-#: impersonation), an ordinary acme user, and a platform key with no tenant.
+#: impersonation), an ordinary acme user, a platform key with no tenant, an approvals UI's
+#: key restricted to one person (priya), and an acme admin key restricted to nobody in
+#: particular (its role, not its list, is what lets it answer any run).
 KEYS: dict[str, dict[str, Any]] = {
     "dev-key": {
         "key_id": "key_dev",
@@ -67,6 +69,20 @@ KEYS: dict[str, dict[str, Any]] = {
         "principal": "svc_worker",
         "role": "platform",
         "may_act_as": ["*"],
+    },
+    "priya-key": {
+        "key_id": "key_priya",
+        "tenant_id": "acme",
+        "principal": "key:key_priya",
+        "role": "service",
+        "may_act_as": ["user:priya"],
+    },
+    "admin-key": {
+        "key_id": "key_admin",
+        "tenant_id": "acme",
+        "principal": "key:key_admin",
+        "role": "admin",
+        "may_act_as": [],
     },
 }
 #: A key the registry knows but refuses (its tenant is suspended).

@@ -53,7 +53,8 @@ class AuthenticationError(RunsError):
 
 
 class AuthorizationError(RunsError):
-    """403: the key may not do this (another tenant, an ``on_behalf_of`` it may not act as)."""
+    """403: the key may not do this (another tenant, an ``on_behalf_of`` it may not act as,
+    a paused run it may not answer)."""
 
 
 class NotFoundError(RunsError):

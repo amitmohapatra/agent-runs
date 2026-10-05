@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 import respx
-from conftest import URL, interrupt, lease, record, summary
+from conftest import URL, interrupt, lease, problem, record, summary
 from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import (
     InterruptDecision,
@@ -15,7 +15,14 @@ from trellis.contracts.runs import (
     RunStart,
     RunStatus,
 )
-from trellis.runs import Claimed, Lease, LeaseLostError, RunsClient, RunSummary
+from trellis.runs import (
+    AuthorizationError,
+    Claimed,
+    Lease,
+    LeaseLostError,
+    RunsClient,
+    RunSummary,
+)
 from trellis.runs.client import DEFAULT_URL
 
 
@@ -162,6 +169,24 @@ async def test_resume_sends_the_resolution(runs: RunsClient) -> None:
     assert (await runs.resume(answer, tenant="acme")).run_id == "run_1"
     assert json.loads(sent(route).content)["decision"] == "APPROVE"
     assert sent(route).headers["X-Trellis-Tenant"] == "acme"
+
+
+@respx.mock
+async def test_a_key_that_may_not_answer_the_run_raises_authorization_error(
+    runs: RunsClient,
+) -> None:
+    detail = "the run is assigned to user:raj, not user:priya; this key may act only for user:priya"
+    route = respx.post(f"{URL}/v1/runs/run_1/resume").respond(
+        403, json=problem(403, "AUTHORIZATION", detail)
+    )
+    answer = InterruptResolution(
+        interrupt_id="int_1", run_id="run_1", decision=InterruptDecision.APPROVE, reviewer="priya"
+    )
+    with pytest.raises(AuthorizationError) as refused:
+        await runs.resume(answer)
+    assert (refused.value.status, refused.value.code) == (403, "AUTHORIZATION")
+    assert refused.value.message.endswith(detail) and not refused.value.retryable
+    assert route.call_count == 1
 
 
 @respx.mock

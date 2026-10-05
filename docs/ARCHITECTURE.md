@@ -81,6 +81,7 @@ flowchart LR
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
+| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
@@ -204,7 +205,8 @@ sequenceDiagram
   U->>A: GET /v1/artifacts/{artifact_id}
   A->>B: read, verified against the SHA-256
   A-->>U: 200 bytes
-  U->>A: POST /v1/runs/{id}/resume {InterruptResolution APPROVE}
+  U->>A: POST /v1/runs/{id}/resume {InterruptResolution APPROVE, reviewer}
+  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt, and may this key answer its assignee now (403 if not)
   A->>DB: INSERT run_resolutions, then last_resolution, then PAUSED → QUEUED, attempt 2
   A-->>U: 200 RunRecord (QUEUED)
 

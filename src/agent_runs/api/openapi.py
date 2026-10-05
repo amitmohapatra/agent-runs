@@ -33,6 +33,11 @@ agent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key 
 tenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own
 tenant. The `ops` routes need no key.
 
+Reading is tenant-wide for every key. Answering a paused run (`resume`) is not: an admin or
+platform key, or one that may act for anyone (`*` in `may_act_as`, the default), answers any
+run; a key restricted to listed people answers only as one of them, and only a run assigned to
+that person or to nobody (never one assigned to a group).
+
 ### Errors
 Every error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on
 `code`. `LEASE_LOST` (409) tells a worker it no longer holds the run's lease: stop working the

@@ -179,9 +179,18 @@ async def pause(
     summary="Answer the interrupt a run waits on",
     response_description="The run: `CANCELLED`, or continuing as the next attempt "
     "(`QUEUED` or `RUNNING`).",
-    responses=conflict(
-        "CONFLICT: the run is not paused (a second answer), or waits on another interrupt."
-    ),
+    responses={
+        403: {
+            "description": "AUTHORIZATION: the key may not answer this run. A key restricted "
+            "to listed people (`may_act_as`) answers only as one of them (`reviewer`), and "
+            "only a run assigned to that person or to nobody, never one assigned to a group "
+            "(`role:…`); the detail says which, and what would. Or the key registry refuses "
+            "the key, or X-Trellis-Tenant names a tenant the key may not act for."
+        },
+        **conflict(
+            "CONFLICT: the run is not paused (a second answer), or waits on another interrupt."
+        ),
+    },
 )
 async def resume(
     run_id: RunId,
@@ -192,9 +201,15 @@ async def resume(
     """Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it
     as the next attempt: ``QUEUED`` for a worker when the run came from the queue, else
     ``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's
-    ``resolutions``, in the same transaction."""
+    ``resolutions``, in the same transaction.
+
+    Who may answer: an admin or platform key, and a key that may act for anyone (``*`` in
+    ``may_act_as``, the default), any run; a key restricted to listed people, only as one of
+    them (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run
+    assigned to that person or to nobody, checked against the assignee now (after any
+    escalation). Anything else is 403 ``AUTHORIZATION``, before anything is written."""
     at = now()
-    run = await RunStore(db).resume(who.tenant_id, run_id, body, now=at)
+    run = await RunStore(db).resume(who.tenant_id, run_id, body, answerer=who.credential, now=at)
     await WebhookStore(db).announce(run, now=at)
     await db.commit()
     return run
