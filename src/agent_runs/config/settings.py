@@ -43,7 +43,7 @@ class ServiceSettings(BaseModel):
     #: environments the filesystem blob store may run in.
     environment: str = DEV
     #: Uvicorn worker processes; unset, one per CPU (1 to 8). Each worker keeps its own key
-    #: cache, rate-limit buckets and metrics.
+    #: cache and metrics; the rate-limit budgets are shared, in the database.
     workers: int | None = Field(default=None, ge=1)
     #: How long a stopping worker lets requests in flight finish before closing them.
     graceful_shutdown_seconds: int = Field(default=20, ge=0)
@@ -157,10 +157,9 @@ class WebhookSettings(BaseModel):
 
 
 class RateLimitSettings(BaseModel):
-    """Each tenant's request budget on the ``/v1`` routes: a token bucket refilled at
-    ``per_minute`` and holding at most ``burst`` requests. Kept in each worker process's
-    memory, so the budget a tenant really gets is about this times the number of workers and
-    replicas: a guard against a runaway client, not a quota. ``per_minute`` 0 turns it off."""
+    """Each tenant's request budget on the ``/v1`` routes: a bucket refilled at
+    ``per_minute`` and holding at most ``burst`` requests, kept in PostgreSQL and so shared by
+    every worker of every replica. ``per_minute`` 0 turns it off."""
 
     per_minute: int = Field(default=3000, ge=0)
     burst: int = Field(default=500, ge=1)

@@ -40,6 +40,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = await connect(settings.database)
         app.state.engine = engine
         app.state.sessions = async_sessionmaker(engine, expire_on_commit=False)
+        app.state.limiter = TenantRateLimiter(settings.rate_limit, engine)
         app.state.keys = KeyRegistry(settings.memory.url)
         app.state.blobs = open_blob_store(settings.blob)
         log.info("agent_runs.started", environment=settings.service.environment)
@@ -61,7 +62,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         generate_unique_id_function=operation_id,
     )
     app.state.settings = settings
-    app.state.limiter = TenantRateLimiter(settings.rate_limit)
     # Added innermost first: a request meets the request context (id, metrics), then the
     # body limit, then compression, which acts on what the route produced.
     app.add_middleware(CompressionMiddleware)

@@ -117,7 +117,7 @@ async def _within_budget(request: Request, tenant_id: str) -> None:
     limiter: TenantRateLimiter = request.app.state.limiter
     if not limiter.enabled:
         return
-    decision = limiter.take(tenant_id)
+    decision = await limiter.take(tenant_id)
     request.state.ratelimit = decision.headers()
     if not decision.allowed:
         rate_limited_total.inc()

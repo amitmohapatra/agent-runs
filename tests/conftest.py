@@ -209,7 +209,7 @@ async def serving(
             await conn.execute(
                 text(
                     "TRUNCATE run_resolutions, run_artifacts, agent_runs, agent_schedules, "
-                    "webhooks, webhook_deliveries"
+                    "webhooks, webhook_deliveries, rate_limit_buckets"
                 )
             )
         yield application

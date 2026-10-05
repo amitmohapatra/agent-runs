@@ -286,6 +286,17 @@ class ResolutionRow(Base):
     __table_args__ = (Index("ix_run_resolutions_run", "tenant_id", "run_id", "recorded_at"),)
 
 
+class RateLimitRow(Base):
+    """A tenant's request budget (``api/ratelimit.py``), shared by every replica: the instant
+    it would be full again."""
+
+    __tablename__ = "rate_limit_buckets"
+
+    #: the tenant (or ``key:<key_id>``, a platform key claiming across tenants)
+    bucket: Mapped[str] = mapped_column(String(256), primary_key=True)
+    tat: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ArtifactRow(Base):
     """A run artifact: what it is and whose; the bytes are in the blob store at ``blob_key``.
     ``expires_at`` is set when the run ends; the ticker deletes the artifact after it."""
