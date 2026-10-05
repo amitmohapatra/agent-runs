@@ -105,6 +105,16 @@ class RunFinish(BaseModel):
         return self
 
 
+class RunCancel(BaseModel):
+    """Why a run is cancelled: kept with the run, with the principal of the key that asked."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reason: str | None = Field(
+        default=None, max_length=1000, description="Why the run is cancelled (optional)."
+    )
+
+
 class ClaimRequest(BaseModel):
     """A worker asking for the oldest queued run of one of its agents."""
 
@@ -139,14 +149,40 @@ class HeartbeatRequest(BaseModel):
     )
 
 
+class ReleaseRequest(BaseModel):
+    """A worker letting go of a run it holds (it is stopping): the run goes back on the queue
+    at once, for another worker, optionally with the progress made so far."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: WorkerId = Field(description="The worker holding the lease.")
+    checkpoint: dict[str, Any] | None = Field(
+        default=None,
+        description="Progress to save first, as a heartbeat saves it (at most 1 MiB of "
+        "compact JSON); absent, the run's checkpoint is kept.",
+    )
+
+
 class Lease(BaseModel):
-    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats."""
+    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what
+    the worker must know to stop in time: the working time the run has left."""
 
     model_config = ConfigDict(frozen=True)
 
     run_id: str = Field(description="The leased run.")
     worker_id: str = Field(description="The worker holding it.")
     expires_at: AwareDatetime = Field(description="When the lease lapses without a heartbeat.")
+    remaining_seconds: float | None = Field(
+        default=None,
+        description="Working time the run has left as of this answer, in seconds: the lesser "
+        "of its timeout_seconds and the service's maximum, less what it has worked. Past it "
+        "the ticker ends the run TIMEOUT (run_timeout). Null: no limit.",
+    )
+    cancel_requested: bool = Field(
+        default=False,
+        description="Someone asked to cancel the run: stop working it and finish it CANCELLED. "
+        "The lease is no longer extended; when it runs out the ticker cancels the run.",
+    )
 
 
 class RunSummary(BaseModel):

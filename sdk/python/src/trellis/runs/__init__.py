@@ -17,6 +17,8 @@ from trellis.runs.errors import (
 )
 from trellis.runs.models import (
     Claimed,
+    DeliveryRecord,
+    DeliveryState,
     FireResult,
     Lease,
     Page,
@@ -33,7 +35,7 @@ from trellis.runs.schedules import SchedulesAPI
 from trellis.runs.webhooks import WebhooksAPI, parse_delivery, sign, verify_signature
 from trellis.runs.worker import RELEASED, Job, Worker, WorkerStore
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     "RELEASED",
@@ -42,6 +44,8 @@ __all__ = [
     "AuthorizationError",
     "Claimed",
     "ConflictError",
+    "DeliveryRecord",
+    "DeliveryState",
     "DependencyUnavailableError",
     "FireResult",
     "Job",

@@ -10,10 +10,12 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -60,17 +62,36 @@ class RunRow(Base):
     #: the times the run's lease lapsed (its worker stopped heartbeating), which alone decide
     #: when the ticker gives up on it (``MAX_LEASE_LAPSES``)
     lease_lapses: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    #: the times the run went back on the queue after its worker ended it ERROR with a
+    #: retryable error (``MAX_ERROR_RETRIES``)
+    error_retries: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     #: the run's own deadline (RunStart.deadline)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the most working time the run may take (RunStart.timeout_seconds)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float)
+    #: the working time of the RUNNING stretches that ended; the one going on is counted from
+    #: ``running_since``
+    worked_seconds: Mapped[float] = mapped_column(Float, server_default=text("0"))
+    #: when the run last became RUNNING; set exactly while it is
+    running_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the version of the agent's code that started the run (RunStart.agent_version)
+    agent_version: Mapped[str | None] = mapped_column(String(128))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: a QUEUED run is not claimed before this (a retry's backoff); null: at once
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(200))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the worker_id whose pause or finish made the current state (null: no worker), so a
     #: repeat of that call answers the stored run instead of a conflict
     settled_by: Mapped[str | None] = mapped_column(String(200))
+    #: when someone asked to cancel the run while a worker held it; set only while RUNNING
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: why the run was cancelled (POST /v1/runs/{run_id}/cancel), and the principal who asked
+    cancel_reason: Mapped[str | None] = mapped_column(String(1000))
+    cancelled_by: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
 
@@ -108,6 +129,12 @@ class RunRow(Base):
             postgresql_where=text(
                 "status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL"
             ),
+        ),
+        # the working-time sweep: RUNNING runs, by how long they have been running
+        Index(
+            "ix_runs_working",
+            "running_since",
+            postgresql_where=text("status = 'RUNNING'"),
         ),
     )
 
@@ -166,6 +193,9 @@ class WebhookRow(Base):
     url: Mapped[str] = mapped_column(String(2048))
     events: Mapped[list[str]] = mapped_column(ARRAY(String(32)))
     secret: Mapped[str] = mapped_column(String(128))
+    #: the secret a rotation replaced, which also signs deliveries until it expires
+    previous_secret: Mapped[str | None] = mapped_column(String(128))
+    previous_secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = _created()
 
@@ -173,7 +203,8 @@ class WebhookRow(Base):
 
 
 class WebhookDeliveryRow(Base):
-    """The outbox: one event owed to one subscription, until it is accepted or given up."""
+    """The outbox: one event owed to one subscription, until it is accepted; one given up on
+    stays, dead, to be listed and redelivered, until its retention ends."""
 
     __tablename__ = "webhook_deliveries"
 
@@ -185,12 +216,26 @@ class WebhookDeliveryRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     attempts: Mapped[int] = mapped_column(Integer)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: why the last attempt failed (a status, an unreachable host, a refused address)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    #: when it was given up on; null while it is still owed
+    dead_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
 
     __table_args__ = (
-        # the ticker: deliveries by when they are due
-        Index("ix_webhook_deliveries_due", "next_attempt_at"),
+        # the ticker: deliveries still owed, by when they are due
+        Index(
+            "ix_webhook_deliveries_due",
+            "next_attempt_at",
+            postgresql_where=text("dead_at IS NULL"),
+        ),
         Index("ix_webhook_deliveries_webhook", "webhook_id"),
+        # the ticker: dead deliveries, by when their retention ends
+        Index(
+            "ix_webhook_deliveries_dead",
+            "dead_at",
+            postgresql_where=text("dead_at IS NOT NULL"),
+        ),
     )
 
 

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Path, Query, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
@@ -26,7 +27,9 @@ from agent_runs.domain.runs import (
     ClaimRequest,
     HeartbeatRequest,
     Lease,
+    ReleaseRequest,
     ResolutionEntry,
+    RunCancel,
     RunCreate,
     RunFinish,
     RunPause,
@@ -45,6 +48,12 @@ _NO_CONTENT = 204
 
 def _payload_limit(request: Request) -> int:
     return request.app.state.settings.service.max_payload_bytes
+
+
+def _leasing(request: Request, db: AsyncSession) -> RunStore:
+    """The store for a route that hands out a lease, which tells the worker the working time
+    the run has left under the service's maximum too."""
+    return RunStore(db, max_run_seconds=request.app.state.settings.runs.max_run_seconds)
 
 
 #: A worker fencing its write: refused (409) unless it still holds the run's lease.
@@ -114,11 +123,15 @@ async def start(
     responses={_NO_CONTENT: {"description": "Nothing is queued for these agents; poll later."}},
 )
 async def claim(
-    body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)], db: Session, who: Who
+    body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)],
+    request: Request,
+    db: Session,
+    who: Who,
 ) -> Claimed | Response:
     """Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
-    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``."""
-    claimed = await RunStore(db).claim(who.tenant_id, body, now=now())
+    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;
+    ``lease.remaining_seconds`` is the working time it has left."""
+    claimed = await _leasing(request, db).claim(who.tenant_id, body, now=now())
     await db.commit()
     claims_total.labels("empty" if claimed is None else "claimed").inc()
     return claimed if claimed is not None else Response(status_code=_NO_CONTENT)
@@ -136,17 +149,49 @@ async def claim(
 async def heartbeat(
     run_id: RunId,
     body: Annotated[HeartbeatRequest, Body(openapi_examples=examples.HEARTBEAT)],
+    request: Request,
     db: Session,
     who: Who,
 ) -> Lease:
     """Extend the lease to ``now + lease_seconds``; every third of the lease is a good
     rhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on
     the run, replacing the one there: the next attempt's claim gets it, so a worker crash
-    repeats no checkpointed side effect. 409 ``LEASE_LOST`` means the lease is no longer the
-    worker's; stop working the run."""
-    lease = await RunStore(db).heartbeat(who.tenant_id, run_id, body, now=now())
+    repeats no checkpointed side effect. The lease says the working time the run has left
+    (``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;
+    stop working the run."""
+    lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
     return lease
+
+
+@router.post(
+    "/{run_id}/release",
+    summary="Let go of a run: back on the queue",
+    response_description="The run, `QUEUED` as its next attempt (or `CANCELLED`, when its "
+    "cancel was asked for); for a repeat, the run as it is.",
+    responses=conflict(
+        "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: there "
+        "is nothing to let go of. Nothing is saved."
+    ),
+)
+async def release(
+    run_id: RunId,
+    body: Annotated[ReleaseRequest, Body(openapi_examples=examples.RELEASE)],
+    db: Session,
+    who: Who,
+) -> RunRecord:
+    """The worker holding the run lets go of it, as a worker that is stopping does with the
+    runs it could not finish: the run goes back on the queue at once as its next attempt,
+    for another worker, without counting a lapsed lease (nothing crashed). With
+    ``checkpoint``, the progress made so far is saved first, as a heartbeat saves it. A run
+    whose cancel was asked for ends ``CANCELLED`` instead. Repeated by the same worker, it
+    answers the run as it is."""
+    at = now()
+    run, released = await RunStore(db).release(who.tenant_id, run_id, body, now=at)
+    if released:
+        await WebhookStore(db).announce(run, now=at)
+    await db.commit()
+    return run
 
 
 @router.post(
@@ -230,6 +275,48 @@ async def resume(
 
 
 @router.post(
+    "/{run_id}/cancel",
+    summary="Cancel a run, whatever its status",
+    response_description="The run: `CANCELLED`, or `RUNNING` with its cancel asked of the "
+    "worker holding it; for a repeat, the run as it is.",
+    responses={
+        403: {
+            "description": "AUTHORIZATION: the key may not cancel this run: the keys that may "
+            "answer it may cancel it (a key restricted to listed people, only a run assigned "
+            "to one of them or to nobody). Or the key registry refuses the key, or "
+            "X-Trellis-Tenant names a tenant the key may not act for."
+        },
+        **conflict("CONFLICT: the run already ended (other than by this very cancel)."),
+    },
+)
+async def cancel(
+    run_id: RunId,
+    body: Annotated[RunCancel, Body(openapi_examples=examples.CANCEL)],
+    db: Session,
+    who: Who,
+) -> RunRecord:
+    """Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or
+    ``PAUSED`` run, and a ``RUNNING`` one no worker holds (kept in its caller's process),
+    ends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING`` run a worker
+    holds is asked to stop: the worker's next heartbeat answers ``cancel_requested: true``
+    and no longer extends its lease; the worker finishes the run ``CANCELLED``, and if it
+    has not when the lease runs out, the ticker cancels the run.
+
+    Who may cancel: the keys that may answer the run (``resume``), checked against its
+    assignee now, before anything is written; 403 otherwise. A cancel already asked for, or
+    repeated after the run was cancelled by the same principal for the same reason, answers
+    the run as it is; an ended run is otherwise 409."""
+    at = now()
+    run, changed = await RunStore(db).cancel(
+        who.tenant_id, run_id, body, canceller=who.credential, now=at
+    )
+    if changed:
+        await WebhookStore(db).announce(run, now=at)
+    await db.commit()
+    return run
+
+
+@router.post(
     "/{run_id}/finish",
     summary="End a run",
     response_description="The ended run (or as stored, for a repeat).",
@@ -262,8 +349,9 @@ async def finish(
     response_description="The full record: input, output, error, checkpoint, awaiting.",
 )
 async def get(run_id: RunId, db: Session, who: Who) -> RunRecord:
-    """One run of this tenant, the whole record. Another tenant's run is 404."""
-    return await RunStore(db).get(who.tenant_id, run_id)
+    """One run of this tenant, the whole record, its ``worked_seconds`` counting the stretch
+    it is running now. Another tenant's run is 404."""
+    return await RunStore(db).get(who.tenant_id, run_id, now=now())
 
 
 _RESOLUTIONS_CURSOR = {"recorded_at": datetime, "resolution_id": str}

@@ -12,7 +12,18 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import URL, OpenAPI, artifact, interrupt, lease, problem, record, schedule, webhook
+from conftest import (
+    URL,
+    OpenAPI,
+    artifact,
+    delivery,
+    interrupt,
+    lease,
+    problem,
+    record,
+    schedule,
+    webhook,
+)
 from pydantic import BaseModel
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.contracts.errors import AgentError, ErrorCategory
@@ -28,6 +39,8 @@ from trellis.contracts.runs import (
 )
 from trellis.runs import (
     Claimed,
+    DeliveryRecord,
+    DeliveryState,
     FireResult,
     Lease,
     LeaseLostError,
@@ -51,6 +64,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "FireResult": FireResult,
     "Webhook": Webhook,
     "WebhookCreated": WebhookCreated,
+    "DeliveryRecord": DeliveryRecord,
     # the contracts' models, used as they are
     "RunRecord": RunRecord,
     "RunStart": RunStart,
@@ -62,6 +76,7 @@ MODELS: dict[str, type[BaseModel]] = {
 }
 ENUMS: dict[str, type[enum.Enum]] = {
     "WebhookEvent": WebhookEvent,
+    "DeliveryState": DeliveryState,
     "RunStatus": RunStatus,
     "InterruptReason": InterruptReason,
     "InterruptDecision": InterruptDecision,
@@ -105,8 +120,10 @@ ANSWERS: dict[str, tuple[int, Any]] = {
     "runs.start": (201, record()),
     "runs.claim": (200, {"run": record(), "lease": lease()}),
     "runs.heartbeat": (200, lease()),
+    "runs.release": (200, record(status="QUEUED")),
     "runs.pause": (200, record(status="PAUSED")),
     "runs.resume": (200, record()),
+    "runs.cancel": (200, record(status="CANCELLED")),
     "runs.finish": (200, record(status="SUCCESS", output={"po": "PO-17"})),
     "runs.get": (200, record()),
     "runs.list": (200, []),
@@ -123,6 +140,12 @@ ANSWERS: dict[str, tuple[int, Any]] = {
     "webhooks.list": (200, [webhook()]),
     "webhooks.get": (200, webhook()),
     "webhooks.delete": (204, None),
+    "webhooks.rotate_secret": (
+        200,
+        {**webhook(previous_secret_expires_at="2026-10-02T08:00:00Z"), "secret": "whsec_y"},
+    ),
+    "webhooks.deliveries": (200, [delivery(), delivery("dlv_2", dead=True)]),
+    "webhooks.redeliver": (200, delivery()),
     "ops.live": (200, {"status": "ok"}),
     "ops.ready": (200, {"status": "ok"}),
     "ops.metrics": (200, "runs_claims_total 1\n"),
@@ -186,6 +209,8 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
         assert claimed is not None
         await runs.heartbeat("run_1", "w-1", checkpoint={"tools": {"call_1": {"output": "ok"}}})
         await runs.heartbeat("run_1", "w-1")
+        await runs.release("run_1", "w-1", checkpoint={"tools": {}})
+        await runs.release("run_1", "w-1")
         ref = await runs.artifacts.upload("run_1", b'{"rows": []}', worker_id="w-1")
         asked = interrupt(payload_ref=ref)
         await runs.pause(asked, checkpoint={"asks": {}}, worker_id="w-1")
@@ -194,6 +219,8 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
             interrupt_id="int_1", run_id="run_1", decision=InterruptDecision.EDIT, payload={"a": 1}
         )
         await runs.resume(answer)
+        await runs.cancel("run_1", reason="the customer withdrew the request")
+        await runs.cancel("run_1")
         await runs.finish("run_1", RunStatus.SUCCESS, output={"po": "PO-17"}, worker_id="w-1")
         failed = AgentError(code="ToolFailed", category=ErrorCategory.TOOL, message="no")
         await runs.finish("run_1", RunStatus.ERROR, error=failed)
@@ -230,6 +257,12 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
         await runs.webhooks.list(cursor="c1", limit=5)
         await runs.webhooks.get("wh_1")
         await runs.webhooks.delete("wh_1")
+        await runs.webhooks.rotate_secret("wh_1")
+        await runs.webhooks.deliveries(
+            state=DeliveryState.DEAD, webhook_id="wh_1", cursor="c1", limit=5
+        )
+        await runs.webhooks.deliveries()
+        await runs.webhooks.redeliver("dlv_1")
         await runs.live()
         await runs.ready()
         await runs.metrics()
@@ -249,4 +282,6 @@ async def test_the_error_answers_are_problems_the_document_describes(contract: O
         assert await runs.artifacts.download("art_1") is None
         with pytest.raises(LeaseLostError):
             await runs.heartbeat("run_1", "w-1")
+        await runs.release("run_1", "w-1", checkpoint={"tools": {}})
+        await runs.release("run_1", "w-1")
     assert service.violations == []

@@ -137,6 +137,27 @@ class RunsClient:
             ) from exc
         return Lease.model_validate(data)
 
+    async def release(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        tenant: str | None = None,
+    ) -> RunRecord:
+        """Let go of a run this worker holds (it is stopping): the run goes back on the queue
+        at once as its next attempt, for another worker, without counting a lapsed lease;
+        ``checkpoint`` saves the progress made so far first. A run whose cancel was asked
+        for ends ``CANCELLED`` instead. :class:`LeaseLostError` when this worker no longer
+        holds it."""
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if checkpoint is not None:
+            body["checkpoint"] = checkpoint
+        data = await self._transport.json(
+            "POST", f"/v1/runs/{run_id}/release", tenant=tenant, json=body
+        )
+        return RunRecord.model_validate(data)
+
     async def pause(
         self,
         interrupt: Interrupt,
@@ -172,6 +193,21 @@ class RunsClient:
             f"/v1/runs/{resolution.run_id}/resume",
             tenant=tenant,
             json=resolution.model_dump(mode="json"),
+        )
+        return RunRecord.model_validate(data)
+
+    async def cancel(
+        self, run_id: str, *, reason: str | None = None, tenant: str | None = None
+    ) -> RunRecord:
+        """Cancel the run, whatever its status, keeping ``reason`` with it. A queued or
+        waiting run (or one in its caller's process) is ``CANCELLED`` at once; a run a worker
+        holds stays ``RUNNING`` until its worker stops (its next heartbeat says
+        ``cancel_requested``; :class:`Worker` cancels the handler and finishes the run
+        ``CANCELLED``), or agent-runs cancels it when the lease runs out. The keys that may
+        answer a run may cancel it (:class:`AuthorizationError` otherwise); an ended run
+        raises :class:`ConflictError`. Safe to retry."""
+        data = await self._transport.json(
+            "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json={"reason": reason}
         )
         return RunRecord.model_validate(data)
 

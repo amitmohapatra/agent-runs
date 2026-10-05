@@ -66,6 +66,20 @@ HEARTBEAT: Final[dict[str, Any]] = {
     },
 }
 
+RELEASE: Final[dict[str, Any]] = {
+    "stopping": {
+        "summary": "Let go of the run: the worker is stopping",
+        "value": {"worker_id": "w-1"},
+    },
+    "progress": {
+        "summary": "Let go of the run, saving its progress",
+        "value": {
+            "worker_id": "w-1",
+            "checkpoint": {"tools": {"call_1": {"output": "PO-17 created"}}},
+        },
+    },
+}
+
 PAUSE: Final[dict[str, Any]] = {
     "approval": {
         "summary": "Wait for procurement's approval, keeping the executor's checkpoint",
@@ -112,6 +126,14 @@ FINISH: Final[dict[str, Any]] = {
         },
     },
     "cancel": {"summary": "Cancel a queued or waiting run", "value": {"status": "CANCELLED"}},
+}
+
+CANCEL: Final[dict[str, Any]] = {
+    "why": {
+        "summary": "Cancel, saying why",
+        "value": {"reason": "the customer withdrew the request"},
+    },
+    "plain": {"summary": "Cancel", "value": {}},
 }
 
 SCHEDULE: Final[dict[str, Any]] = {

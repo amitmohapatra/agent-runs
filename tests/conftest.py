@@ -224,7 +224,7 @@ async def app(migrated: None, memory: FakeMemory, blobs: FilesystemBlobStore) ->
 def sender(receiver: Receiver, *, allow_http: bool = True) -> WebhookSender:
     """The ticker's sender, delivering to ``receiver``."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle))
-    return WebhookSender(client=client, allow_http=allow_http)
+    return WebhookSender(client=client, allow_http=allow_http, allow_private=True)
 
 
 def client_of(app: Any, key: str = "dev-key", **headers: str) -> AsyncClient:
@@ -329,6 +329,15 @@ async def ticker(app: Any, receiver: Receiver, tmp_path: Any) -> AsyncIterator[T
     hooks = sender(receiver)
     yield Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
     await hooks.aclose()
+
+
+async def backoff_passed(app: Any) -> None:
+    """Let every queued run's retry backoff (``available_at``) pass, straight on the row: what
+    the clock would do, without the wait."""
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE agent_runs SET available_at = NULL WHERE status = 'QUEUED'")
+        )
 
 
 async def queued_runs(app: Any) -> list[dict[str, Any]]:

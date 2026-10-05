@@ -4,9 +4,9 @@ A run *is* the contracts' ``RunRecord`` (started from a ``RunStart``, paused wit
 ``Interrupt``, resumed with an ``InterruptResolution``) and a schedule *is* a ``Schedule``
 (created from a ``ScheduleSpec``); those are used as they are. What is here is the service's
 own shapes: a listing's summary, a lease and a claim, the resolution history, a schedule's
-partial update and a fire's result, webhook subscriptions and the delivery envelope, and a
-page of a listing. ``tests/test_contract.py`` checks every one against the committed
-``docs/openapi.json``.
+partial update and a fire's result, webhook subscriptions, the outbox's deliveries and the
+delivery envelope, and a page of a listing. ``tests/test_contract.py`` checks every one
+against the committed ``docs/openapi.json``.
 """
 
 from __future__ import annotations
@@ -37,13 +37,20 @@ class RunSummary(BaseModel):
 
 
 class Lease(BaseModel):
-    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats."""
+    """A worker's hold on a running run, until ``expires_at`` unless it heartbeats.
+    ``remaining_seconds`` is the working time the run had left when the lease was given (its
+    ``timeout_seconds`` or the service's maximum, the lesser, less what it worked; ``None``:
+    no limit): past it agent-runs ends the run ``TIMEOUT``. ``cancel_requested``: someone
+    asked to cancel the run; stop and finish it ``CANCELLED`` (the lease is no longer
+    extended, and agent-runs cancels the run when it runs out)."""
 
     model_config = ConfigDict(frozen=True)
 
     run_id: str
     worker_id: str
     expires_at: datetime
+    remaining_seconds: float | None = None
+    cancel_requested: bool = False
 
 
 class Claimed(BaseModel):
@@ -106,7 +113,8 @@ class WebhookEvent(StrEnum):
 
 
 class Webhook(BaseModel):
-    """A subscription as listed and read: never its secret."""
+    """A subscription as listed and read: never its secret. ``previous_secret_expires_at``
+    is, after a rotation, when deliveries stop being signed with the replaced secret too."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -115,6 +123,7 @@ class Webhook(BaseModel):
     events: list[WebhookEvent]
     created_by: str
     created_at: datetime
+    previous_secret_expires_at: datetime | None = None
 
 
 class WebhookCreated(Webhook):
@@ -123,6 +132,33 @@ class WebhookCreated(Webhook):
     is never shown again."""
 
     secret: str
+
+
+class DeliveryState(StrEnum):
+    """Where a delivery is: still owed, or given up on (and kept to be redelivered)."""
+
+    PENDING = "pending"
+    DEAD = "dead"
+
+
+class DeliveryRecord(BaseModel):
+    """A delivery in agent-runs' outbox: which event (``event_id``, ``type``, about
+    ``run_id``) it carries to which subscription, and how its attempts went. A dead one is
+    kept for a while (seven days by default) to be redelivered."""
+
+    model_config = ConfigDict(frozen=True)
+
+    delivery_id: str
+    webhook_id: str
+    event_id: str
+    type: WebhookEvent
+    run_id: str
+    state: DeliveryState
+    attempts: int
+    last_error: str | None = None
+    next_attempt_at: datetime | None = None
+    dead_at: datetime | None = None
+    created_at: datetime
 
 
 class WebhookData(BaseModel):

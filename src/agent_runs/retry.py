@@ -1,9 +1,11 @@
-"""The one retry policy: a capped doubling backoff, and a breaker for a loop whose
-dependency is down. Webhook deliveries, failed schedule fires and the ticker all use these.
+"""The one retry policy: a capped doubling backoff (jittered where many retries may line up),
+and a breaker for a loop whose dependency is down. Webhook deliveries, failed schedule fires,
+retried runs and the ticker all use these.
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -16,6 +18,12 @@ def backoff(base: timedelta, failures: int, *, cap: timedelta) -> timedelta:
     """The wait after the ``failures``-th consecutive failure: ``base * 2**(failures-1)``,
     never more than ``cap``."""
     return min(base * 2 ** max(failures - 1, 0), cap)
+
+
+def jittered(wait: timedelta) -> timedelta:
+    """``wait`` spread over its upper half (equal jitter): runs that failed together are not
+    all retried in the same instant."""
+    return wait / 2 + wait * random.uniform(0, 0.5)  # spread, not a secret
 
 
 @dataclass

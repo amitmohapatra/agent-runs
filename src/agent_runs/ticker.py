@@ -3,14 +3,18 @@
 1. fire every due schedule (one ``SKIP LOCKED`` claim at a time, each in its own transaction,
    queueing its run idempotently on ``(schedule_id, fire_time)``);
 2. time out runs not yet ended (queued, running or paused) past their own deadline;
-3. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
+3. time out running runs whose working time passed their limit (their ``timeout_seconds``, or
+   the service's ``RUNS__RUNS__MAX_RUN_SECONDS``, the lesser);
+4. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
    lapse);
-4. escalate or time out interrupts past their deadline;
-5. send the webhook deliveries that are due from the outbox (one attempt each);
-6. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
+5. escalate or time out interrupts past their deadline;
+6. send the webhook deliveries that are due from the outbox (one attempt each), keeping one
+   given up on as dead;
+7. drop the dead deliveries older than their retention (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``);
+8. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
    row: a blob delete that fails leaves the row for the next tick).
 
-Steps 2 to 4 write the webhook events they cause into the outbox in their own transaction.
+Steps 2 to 5 write the webhook events they cause into the outbox in their own transaction.
 
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
@@ -26,7 +30,7 @@ import contextlib
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -43,6 +47,7 @@ from agent_runs.config.constants import (
     BREAKER_THRESHOLD,
     SWEEP_BATCH,
     TICK_SECONDS,
+    WEBHOOK_DEAD_RETENTION,
 )
 from agent_runs.config.settings import get_settings
 from agent_runs.domain.schedules import FireFailed
@@ -74,9 +79,11 @@ class RunSweep(Protocol):
 class TickReport:
     fired: int = 0
     timed_out: int = 0
+    overworked: int = 0
     requeued: int = 0
     escalated: int = 0
     sent: int = 0
+    dropped: int = 0
     purged: int = 0
 
 
@@ -89,12 +96,16 @@ class Ticker:
         *,
         heartbeat_path: Path,
         interval: float = TICK_SECONDS,
+        max_run_seconds: float | None = None,
+        dead_retention: timedelta = WEBHOOK_DEAD_RETENTION,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
         self._blobs = blobs
         self._heartbeat = heartbeat_path
         self._interval = interval
+        self._max_run_seconds = max_run_seconds
+        self._dead_retention = dead_retention
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
     async def tick(self, *, now: datetime | None = None) -> TickReport:
@@ -108,9 +119,11 @@ class Ticker:
             report = TickReport(
                 fired=await self._fire_due(now),
                 timed_out=await self._sweep_runs(RunStore.time_out_past_deadline, now),
+                overworked=await self._sweep_runs(RunStore.time_out_overworked, now),
                 requeued=await self._sweep_runs(RunStore.requeue_lapsed, now),
                 escalated=await self._sweep_runs(RunStore.escalate_overdue, now),
                 sent=await self._send_webhooks(now),
+                dropped=await self._drop_dead(now),
                 purged=await self._purge_artifacts(now),
             )
         except (DBAPIError, OSError) as exc:
@@ -147,7 +160,8 @@ class Ticker:
         run a sweep leaves ``PAUSED`` was escalated; any other announces what its new status
         does (an ending ``run.finished``, a requeue nothing)."""
         async with self._sessions() as db:
-            moved = await sweep(RunStore(db), now=now, limit=SWEEP_BATCH)
+            store = RunStore(db, max_run_seconds=self._max_run_seconds)
+            moved = await sweep(store, now=now, limit=SWEEP_BATCH)
             for run in moved:
                 event = WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
                 await WebhookStore(db).announce(run, event, now=now)
@@ -156,21 +170,33 @@ class Ticker:
 
     async def _send_webhooks(self, now: datetime) -> int:
         """Hold the due deliveries (a short transaction), send them concurrently with no
-        transaction open, then settle each: gone once accepted or given up, else backing
-        off. Returns how many were accepted."""
+        transaction open, then settle each: gone once accepted, dead once given up on, else
+        backing off. Returns how many were accepted."""
         async with self._sessions() as db:
             due = await WebhookStore(db).claim_due(now=now, limit=SWEEP_BATCH)
             await db.commit()
         if not due:
             return 0
-        retries = await self._webhooks.send_all(due)
+        attempts = await self._webhooks.send_all(due)
         async with self._sessions() as db:
             store = WebhookStore(db)
-            for delivery, retry in zip(due, retries, strict=True):
-                if not await store.settle(delivery, retry=retry, now=now) and retry:
-                    log.warning("webhook.gave_up", event_id=delivery.payload["event_id"])
+            for delivery, attempt in zip(due, attempts, strict=True):
+                if await store.settle(delivery, attempt, now=now):
+                    metrics.webhook_dead_total.inc()
+                    log.warning(
+                        "webhook.dead", event_id=delivery.payload["event_id"], error=attempt.error
+                    )
             await db.commit()
-        return retries.count(False)
+        return sum(attempt.accepted for attempt in attempts)
+
+    async def _drop_dead(self, now: datetime) -> int:
+        """Drop the dead deliveries whose retention is over."""
+        async with self._sessions() as db:
+            dropped = await WebhookStore(db).drop_dead(
+                before=now - self._dead_retention, limit=SWEEP_BATCH
+            )
+            await db.commit()
+        return dropped
 
     async def _purge_artifacts(self, now: datetime) -> int:
         """Delete expired artifacts: each blob, then the rows whose blob is gone."""
@@ -222,7 +248,9 @@ async def run() -> None:
     if settings.ticker.metrics_port is not None:
         metrics.serve(settings.ticker.metrics_port, engine)
         log.info("ticker.metrics", port=settings.ticker.metrics_port)
-    webhooks = WebhookSender(allow_http=settings.service.is_dev)
+    webhooks = WebhookSender(
+        allow_http=settings.service.is_dev, allow_private=settings.private_webhook_targets
+    )
     blobs = open_blob_store(settings.blob)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -236,6 +264,8 @@ async def run() -> None:
             webhooks,
             blobs,
             heartbeat_path=beat,
+            max_run_seconds=settings.runs.max_run_seconds,
+            dead_retention=settings.webhooks.dead_retention,
         )
         await ticker.run_forever(stop)
     finally:

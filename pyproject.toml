@@ -1,6 +1,6 @@
 [project]
 name = "agent-runs"
-version = "0.3.1"
+version = "0.3.2"
 description = "Durable agent runs, the worker queue, the human inbox and the schedules that start runs."
 requires-python = ">=3.12"
 dependencies = [
@@ -31,6 +31,8 @@ dev = [
   # the SDK's suite (sdk/python/tests): HTTP mocks and the OpenAPI schema checks
   "respx>=0.22",
   "jsonschema>=4.23",
+  # a certificate for the webhook TLS test (tests/test_webhook_delivery.py)
+  "cryptography>=43",
 ]
 
 [project.scripts]
@@ -73,6 +75,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 "src/agent_runs/store/artifacts.py" = ["PLR0913"]
 # A problem has nine members; its builders take them by keyword.
 "src/agent_runs/api/errors.py" = ["PLR0913"]
+# The ticker takes its collaborators, and the deployment's limits by keyword.
+"src/agent_runs/ticker.py" = ["PLR0913"]
 # The SDK's listings take their filters as keyword arguments, as the routes do.
 "sdk/python/src/trellis/runs/*.py" = ["PLR0913"]
 # The SDK's tests as the service's (PLR2004), and test doubles that take what its calls take.

@@ -16,7 +16,7 @@ from trellis.contracts.runs import RunRecord, RunStatus
 from trellis.runs.webhooks import parse_delivery, sign, verify_signature
 
 from agent_runs.config.constants import WEBHOOK_ATTEMPTS
-from agent_runs.domain.webhooks import WebhookEvent, event_of
+from agent_runs.domain.webhooks import Attempt, WebhookEvent, event_of
 from agent_runs.store.webhooks import Delivery, WebhookStore, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
@@ -77,7 +77,7 @@ def _delivery(url: str = "https://h") -> Delivery:
 
 def _answering(status: int) -> WebhookSender:
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(status)))
-    return WebhookSender(allow_http=False, client=client)
+    return WebhookSender(allow_http=False, allow_private=True, client=client)
 
 
 @pytest.mark.parametrize(
@@ -85,13 +85,19 @@ def _answering(status: int) -> WebhookSender:
 )
 async def test_a_refusal_is_final_but_backpressure_is_retried(status: int, retry: bool) -> None:
     hooks = _answering(status)
-    assert await hooks.send(_delivery()) is retry
+    attempt = await hooks.send(_delivery())
+    assert attempt.retry is retry
+    assert attempt.error == (None if status == 200 else f"answered {status}")
     await hooks.aclose()
 
 
 async def test_plain_http_is_refused_outside_dev_and_not_retried() -> None:
     hooks = _answering(200)
-    assert await hooks.send(_delivery("http://ui/h")) is False
+    attempt = await hooks.send(_delivery("http://ui/h"))
+    assert (attempt.retry, attempt.error) == (
+        False,
+        "refused: this deployment delivers only to https URLs",
+    )
     await hooks.aclose()
 
 
@@ -217,7 +223,9 @@ async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
         return httpx.Response(503)
 
     hooks = WebhookSender(
-        allow_http=False, client=httpx.AsyncClient(transport=httpx.MockTransport(failing))
+        allow_http=False,
+        allow_private=True,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(failing)),
     )
     ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
     await subscribe(client)
@@ -231,7 +239,9 @@ async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
     for minutes in range(1, 60):
         await ticker.tick(now=at(minutes))
     assert len(calls) == WEBHOOK_ATTEMPTS
-    assert await _outbox(app) == []
+    [dead] = await _outbox(app)  # given up on, kept to be redelivered
+    assert (dead["attempts"], dead["last_error"]) == (WEBHOOK_ATTEMPTS, "answered 503")
+    assert dead["dead_at"] is not None
     await hooks.aclose()
 
 
@@ -239,6 +249,7 @@ async def test_a_receiver_that_recovers_is_told_once(app, client, tmp_path) -> N
     answers = iter([500, 200])
     hooks = WebhookSender(
         allow_http=False,
+        allow_private=True,
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: httpx.Response(next(answers)))
         ),
@@ -281,9 +292,12 @@ async def test_an_unreachable_receiver_is_worth_another_attempt() -> None:
         raise httpx.ConnectError("connection refused", request=request)
 
     hooks = WebhookSender(
-        allow_http=False, client=httpx.AsyncClient(transport=httpx.MockTransport(unreachable))
+        allow_http=False,
+        allow_private=True,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(unreachable)),
     )
-    assert await hooks.send(_delivery()) is True
+    attempt = await hooks.send(_delivery())
+    assert (attempt.retry, attempt.error) == (True, "unreachable: connection refused")
     await hooks.aclose()
 
 
@@ -298,7 +312,8 @@ async def test_a_delivery_whose_subscription_went_mid_send_is_settled_quietly(ap
         await db.commit()
     assert (await client.delete(f"/v1/webhooks/{hook['webhook_id']}")).status_code == 204
     async with app.state.sessions() as db:
-        assert await WebhookStore(db).settle(held, retry=True, now=at(0)) is True
+        failed = Attempt("answered 503", retry=True)
+        assert await WebhookStore(db).settle(held, failed, now=at(0)) is False
         await db.commit()
     assert await _outbox(app) == []
 

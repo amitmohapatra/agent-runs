@@ -35,8 +35,8 @@ flowchart LR
       routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
-      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out · requeue · escalate<br/>send webhooks · purge artifacts"]
-      sender["WebhookSender<br/>(webhooks.py)"]
+      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out (deadline, working time)<br/>requeue or cancel · escalate<br/>send webhooks · drop dead · purge artifacts"]
+      sender["WebhookSender<br/>(webhooks.py, egress.py)"]
     end
     keys["KeyRegistry (keys.py)<br/>TTL cache of key answers"]
     stores["store/: RunStore · ScheduleStore<br/>WebhookStore · ArtifactStore<br/>firing.py: Firing"]
@@ -81,11 +81,13 @@ flowchart LR
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
-| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question |
+| Answering | `answering.py` `require_may_answer`, `require_may_cancel` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question. `RunStore.cancel` applies the same rule (as any principal the key may act for) |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
-| Webhook sender | `webhooks.py` `WebhookSender` | one attempt per due outbox row, signed with the SDK's `trellis.runs.webhooks.sign` |
+| Retries | `retry.py` `backoff`, `jittered`, `Breaker` | the one retry policy: a capped doubling backoff (webhook deliveries, schedule fires, a lapsed lease's and a retryable error's requeue, the last two jittered) and the breaker |
+| Webhook sender | `webhooks.py` `WebhookSender`; `domain/webhooks.py` `Attempt` | one attempt per due outbox row, signed with the SDK's `trellis.runs.webhooks.sign` (with the replaced secret too during a rotation's overlap); how it went (`Attempt`: accepted, worth another, or refused for good) decides whether `WebhookStore.settle` deletes the row, backs it off or keeps it dead |
+| Egress guard | `egress.py` `public_addresses`, `pinned`, `require_public` | the SSRF guard: a subscription's host must resolve to public addresses only, checked on create (`422`) and by the sender on every attempt (a refusal is final), unless `Settings.private_webhook_targets`; the sender then connects only to the addresses it checked (`pinned`: the IP in the URL, the host in `Host` and TLS SNI, so the certificate is checked against it), and never follows a redirect |
 | SDK | `sdk/python/src/trellis/runs`: `RunsClient`, `Worker`, `webhooks`, `errors`, `models` | the Python client of every route (method names are the operation ids), the framework-neutral worker loop, the delivery signature; `sdk/python/tests` holds it to 100% line and branch coverage and checks it against `docs/openapi.json` |
 | Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
@@ -97,30 +99,34 @@ The one transition check is `trellis-contracts` `RunStatus.can_become`, called b
 `store/runs.py` `_move` under a row lock; a refused transition is `409` and changes nothing.
 The arrows are exactly the transitions some route or ticker step makes:
 `tests/test_state_machine.py` asserts every route's transition and every refusal, and
-`tests/test_queue.py`, `tests/test_deadline.py` and `tests/test_escalation.py` the ticker's.
+`tests/test_queue.py`, `tests/test_deadline.py`, `tests/test_working_time.py`,
+`tests/test_retries.py`, `tests/test_cancel.py`, `tests/test_release.py` and
+`tests/test_escalation.py` the rest.
 
 ```mermaid
 stateDiagram-v2
   [*] --> RUNNING: POST /v1/runs (queue false)
   [*] --> QUEUED: POST /v1/runs (queue true), or a schedule fires
 
-  QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
-  QUEUED --> CANCELLED: finish CANCELLED
+  QUEUED --> RUNNING: POST /v1/runs/claim, once available_at passed (lease to worker_id)
+  QUEUED --> CANCELLED: cancel, or finish CANCELLED
   QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1, after a backoff)
+  RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
+  RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
   RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
-  RUNNING --> CANCELLED: finish
+  RUNNING --> TIMEOUT: finish, ticker past the run's deadline (run_deadline), or past its working-time limit (run_timeout)
+  RUNNING --> CANCELLED: finish, cancel of a run no worker holds, or after a cancel request: ticker when the lease runs out, pause, release
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
-  PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
+  PAUSED --> CANCELLED: resume CANCEL, cancel, or finish CANCELLED
   PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
   PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
@@ -134,23 +140,44 @@ stateDiagram-v2
 
 What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 
-- Leaving `RUNNING` clears the lease (`lease_owner`, `lease_expires_at`); leaving `PAUSED`
-  clears `awaiting`, `assignee`, `awaiting_deadline`; any ending clears `checkpoint` and
-  starts the run's artifacts' retention (`expires_at = now + ARTIFACT_RETENTION`, 7 days).
+- Entering `RUNNING` sets `running_since`; leaving it adds the stretch to `worked_seconds`
+  and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`) and
+  `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
+  `time_out_overworked` ends a run whose working time passed its limit (`timeout_seconds`
+  or `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser) `TIMEOUT` (`run_timeout`); `_lease` tells
+  the worker the time left (`remaining_seconds`).
+- Leaving `PAUSED` clears `awaiting`, `assignee`, `awaiting_deadline`; leaving `QUEUED`
+  clears `available_at`; any ending clears `checkpoint` and starts the run's artifacts'
+  retention (`expires_at = now + ARTIFACT_RETENTION`, 7 days).
+- A requeue (`_requeue`) may hold the run back: `available_at = now + wait`, which the claim
+  respects. A lapsed lease waits `LAPSE_RETRY_BASE` (5 s) doubling per lapse up to
+  `LAPSE_RETRY_CAP` (1 min); a retried error `ERROR_RETRY_BASE` (10 s) doubling up to
+  `ERROR_RETRY_CAP` (10 min); both jittered (`retry.jittered`). A release and a resume wait
+  for nothing.
+- `finish` with `ERROR` and a retryable error, of a run that was queued, running and not
+  asked to cancel, requeues it instead of ending it (`_retried`), `error_retries + 1`, at
+  most `MAX_ERROR_RETRIES` (3); the error that finally stands says how often the run was
+  retried (`_counted`).
+- `cancel` ends a queued, paused or unleased running run `CANCELLED` at once; a leased one
+  gets `cancel_requested_at`, from which every lease is measured (`_lease`), so the run is
+  cancelled within one lease: the worker finishes it, or a pause, a release or the lapse
+  sweep ends it `CANCELLED` instead of pausing or requeueing it (`_cancelled_instead`).
+  `cancel_reason` and `cancelled_by` keep why and who.
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
-- `attempt` counts executions: `+1` on a resume that continues the run and on a lapsed
-  lease's requeue, never on a claim. `lease_lapses` counts only the lapses (`+1` on each,
+- `attempt` counts executions: `+1` on a resume that continues the run and on every requeue
+  (a lapsed lease, a release, a retried error), never on a claim. `lease_lapses` counts only the lapses (`+1` on each,
   in `requeue_lapsed`), and only it decides when the ticker gives up on a run: review
   rounds are attempts, not crashes.
 - Events go to the outbox in the same transaction: `run.paused` on a pause, `run.escalated`
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
 - `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
-- `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat; a
-  requeue keeps it, so the next attempt's claim resumes from it; only an ending clears it.
-- A pause or finish records who made it (`settled_by`, the `worker_id` or null); any other
-  move clears it. A repeat of that call (the same caller, to the same status, on the same
+- `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat or
+  release; a requeue keeps it, so the next attempt's claim resumes from it; only an ending
+  clears it.
+- A pause, finish or release records who made it (`settled_by`, the `worker_id` or null),
+  as does a finish that requeued the run for a retry; any other move clears it. A repeat of that call (the same caller, to the same status, on the same
   interrupt for a pause) is answered with the stored run and moves nothing (`_settled`),
   so a worker that lost the answer may retry. Otherwise a fenced write (`worker_id`) on a
   run whose lease the worker no longer holds is `LeaseLost` (`409 LEASE_LOST`, `_fence`),
@@ -276,8 +303,8 @@ moves forward past now, so a long outage fires each schedule once, not once per 
 
 ## The tables
 
-Six tables, built by the nine Alembic revisions in `alembic/versions` (head
-`e4d9f0a1b2c3`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
+Six tables, built by the fourteen Alembic revisions in `alembic/versions` (head
+`4d0c5e6f7a8b`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
 line is the logical link a schedule fire leaves (no foreign key: a run outlives the schedule
 that fired it).
 
@@ -308,13 +335,22 @@ erDiagram
     timestamptz awaiting_deadline "from awaiting, for escalation"
     int attempt "executions: resumes and requeues add one"
     int lease_lapses "only lapsed leases; MAX_LEASE_LAPSES fails the run"
+    int error_retries "requeues after a retryable error; MAX_ERROR_RETRIES"
     timestamptz deadline "RunStart.deadline, for the deadline sweep"
+    float timeout_seconds "RunStart.timeout_seconds: the working-time limit"
+    float worked_seconds "RUNNING stretches that ended"
+    timestamptz running_since "set exactly while RUNNING"
+    varchar agent_version "RunStart.agent_version"
     varchar idempotency_key UK
     jsonb run_metadata
     timestamptz queued_at "set once the run entered the queue"
+    timestamptz available_at "a queued run is claimed only after it (a backoff)"
     varchar lease_owner
     timestamptz lease_expires_at
-    varchar settled_by "worker_id of the pause or finish that made the state"
+    varchar settled_by "worker_id of the pause, finish or release that made the state"
+    timestamptz cancel_requested_at "a held run asked to stop"
+    varchar cancel_reason
+    varchar cancelled_by "the principal who cancelled"
     timestamptz created_at
     timestamptz updated_at
   }
@@ -375,6 +411,8 @@ erDiagram
     varchar url
     varchar_array events "run.paused, run.escalated, run.finished"
     varchar secret "whsec_..., shown once"
+    varchar previous_secret "the rotated-out secret, signing too until it expires"
+    timestamptz previous_secret_expires_at
     varchar created_by
     timestamptz created_at
   }
@@ -385,6 +423,8 @@ erDiagram
     jsonb payload "the event envelope"
     int attempts
     timestamptz next_attempt_at
+    text last_error "what the last attempt met"
+    timestamptz dead_at "given up on; null while owed"
     timestamptz created_at
   }
 ```
@@ -402,19 +442,23 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
 | `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
+| `ix_runs_working` | `agent_runs (running_since) WHERE status = 'RUNNING'` | `RunStore.time_out_overworked` |
 | `ix_run_resolutions_run` | `run_resolutions (tenant_id, run_id, recorded_at)` | `GET /v1/runs/{id}/resolutions` |
 | `ix_run_artifacts_expiry` | `run_artifacts (expires_at) WHERE expires_at IS NOT NULL` | `ArtifactStore.expired` |
 | `ix_schedules_tenant_created` | `agent_schedules (tenant_id, created_at)` | `GET /v1/schedules`, newest first |
 | `ix_schedules_due` | `agent_schedules (next_fire_at) WHERE enabled` | `ScheduleStore.claim_due` |
 | `ix_webhooks_tenant` | `webhooks (tenant_id)` | listing, `WebhookStore.announce` |
-| `ix_webhook_deliveries_due` | `webhook_deliveries (next_attempt_at)` | `WebhookStore.claim_due` |
-| `ix_webhook_deliveries_webhook` | `webhook_deliveries (webhook_id)` | the cascade on unsubscribe |
+| `ix_webhook_deliveries_due` | `webhook_deliveries (next_attempt_at) WHERE dead_at IS NULL` | `WebhookStore.claim_due` |
+| `ix_webhook_deliveries_webhook` | `webhook_deliveries (webhook_id)` | the cascade on unsubscribe, `GET /v1/webhooks/deliveries?webhook_id=` |
+| `ix_webhook_deliveries_dead` | `webhook_deliveries (dead_at) WHERE dead_at IS NOT NULL` | `WebhookStore.drop_dead` |
 
 The migrations, oldest first: `1f6242bb21de` initial runs table, `7c1d2e3f4a5b` queue, lease
 and inbox, `8d2e3f4a5b6c` schedules, `9e3f4a5b6c7d` run checkpoint, `a0f4b5c6d7e8` schedule
 identity, `b1a5c6d7e8f9` webhook subscriptions, `c2b6d7e8f9a0` run artifacts,
-`d3c8e9f0a1b2` run resolutions, `e4d9f0a1b2c3` run `settled_by`. Each has a downgrade; CI runs upgrade, downgrade to base and
-upgrade again.
+`d3c8e9f0a1b2` run resolutions, `e4d9f0a1b2c3` run `settled_by`, `f5e0a1b2c3d4` lease lapses
+and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run retries,
+`3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation. Each has a
+downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 
@@ -427,7 +471,9 @@ src/agent_runs/
   keys.py              KeyRegistry, KeyInfo: who an X-API-Key is
   firing.py            Firing: one schedule tick → one queued run
   webhooks.py          WebhookSender: delivering the outbox (signed with trellis.runs.webhooks.sign)
-  retry.py             backoff(), Breaker: the one retry policy
+  egress.py            public_addresses(), pinned(), require_public(): where a webhook may go
+  answering.py         require_may_answer(), require_may_cancel(): who may answer or cancel a run
+  retry.py             backoff(), jittered(), Breaker: the one retry policy
   api/app.py           create_app(): routers, middleware, error handlers, health routes
   api/errors.py        Problem, install_error_handlers(): every error as a problem
   api/middleware.py    request context (id, metrics), body cap, compression
@@ -449,13 +495,15 @@ src/agent_runs/
   observability/       logging.py (structlog, JSON or console), metrics.py (Prometheus)
 
 sdk/python/src/trellis/runs/      (trellis-runs, a workspace member; no trellis/__init__.py)
-  client.py            RunsClient: the run verbs, list/iterate, live/ready/metrics
+  client.py            RunsClient: the run verbs (cancel and release among them), list/iterate,
+                       live/ready/metrics
   artifacts.py         ArtifactsAPI: upload (with its SHA-256), download
   schedules.py         SchedulesAPI: create, list, get, update, delete, fire
-  webhooks.py          WebhooksAPI; sign, verify_signature, parse_delivery, the header names
+  webhooks.py          WebhooksAPI (rotate_secret, deliveries, redeliver too); sign,
+                       verify_signature, parse_delivery, the header names
   worker.py            Worker, Job, WorkerStore, RELEASED: the claim loop
   models.py            RunSummary, Lease, Claimed, ResolutionEntry, ScheduleUpdate, FireResult,
-                       Webhook*, WebhookDelivery, Page
+                       Webhook*, DeliveryRecord, DeliveryState, WebhookDelivery, Page
   errors.py            RunsError and its classes, error_from_problem
   _transport.py        the key and tenant headers, retries, Retry-After, Link paging
 ```

@@ -6,6 +6,7 @@ decisions are constants in ``constants.py``.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Final, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from agent_runs.config.constants import WEBHOOK_DEAD_RETENTION
 
 DEV = "dev"
 TEST = "test"
@@ -35,8 +38,9 @@ def default_workers(cpus: int | None = None) -> int:
 class ServiceSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8090
-    #: "dev" also accepts plain-http webhook URLs (a receiver on a laptop); "dev" and "test"
-    #: are the only environments the filesystem blob store may run in.
+    #: "dev" also accepts plain-http webhook URLs and, unless ``RUNS__WEBHOOKS__`` says
+    #: otherwise, private ones (a receiver on a laptop); "dev" and "test" are the only
+    #: environments the filesystem blob store may run in.
     environment: str = DEV
     #: Uvicorn worker processes; unset, one per CPU (1 to 8). Each worker keeps its own key
     #: cache, rate-limit buckets and metrics.
@@ -119,6 +123,32 @@ class TickerSettings(BaseModel):
     metrics_port: int | None = Field(default=None, ge=1, le=65535)
 
 
+class RunsSettings(BaseModel):
+    #: The most working time any run may take, in seconds (time RUNNING, across attempts): a
+    #: run's own ``timeout_seconds`` may only be shorter. Unset: no platform maximum.
+    max_run_seconds: float | None = Field(default=None, gt=0)
+
+
+class WebhookSettings(BaseModel):
+    #: Deliver to hosts that resolve to private, loopback or link-local addresses (a receiver
+    #: inside the deployment's own network). Unset: only in ``dev``. Elsewhere such a URL is
+    #: refused when subscribed, and a delivery whose host resolves to one by then is not sent.
+    allow_private_targets: bool | None = None
+    #: After a secret's rotation, how long deliveries are also signed with the old secret, so
+    #: receivers can move to the new one; 0 signs with the new one only.
+    secret_overlap_hours: int = Field(default=24, ge=0)
+    #: How long a delivery given up on is kept, dead, to be listed and redelivered.
+    dead_retention_days: int = Field(default=WEBHOOK_DEAD_RETENTION.days, ge=1)
+
+    @property
+    def dead_retention(self) -> timedelta:
+        return timedelta(days=self.dead_retention_days)
+
+    @property
+    def secret_overlap(self) -> timedelta:
+        return timedelta(hours=self.secret_overlap_hours)
+
+
 class RateLimitSettings(BaseModel):
     """Each tenant's request budget on the ``/v1`` routes: a token bucket refilled at
     ``per_minute`` and holding at most ``burst`` requests. Kept in each worker process's
@@ -144,6 +174,8 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     blob: BlobSettings = Field(default_factory=BlobSettings)
     ticker: TickerSettings = Field(default_factory=TickerSettings)
+    runs: RunsSettings = Field(default_factory=RunsSettings)
+    webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
@@ -158,6 +190,12 @@ class Settings(BaseSettings):
                 "use gcs (RUNS__BLOB__BUCKET)"
             )
         return self
+
+    @property
+    def private_webhook_targets(self) -> bool:
+        """May webhooks be delivered to private addresses here? As said, else only in dev."""
+        allowed = self.webhooks.allow_private_targets
+        return self.service.is_dev if allowed is None else allowed
 
 
 @lru_cache(maxsize=1)

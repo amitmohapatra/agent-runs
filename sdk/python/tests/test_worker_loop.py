@@ -32,6 +32,12 @@ def run(run_id: str = "run_1", tenant: str = "acme") -> RunRecord:
     return RunRecord(run_id=run_id, tenant_id=tenant, agent_id="triage", status=RunStatus.RUNNING)
 
 
+def claimed(record: RunRecord, worker_id: str = "w-1", **lease: Any) -> Claimed:
+    """What a claim of ``record`` answers: the run and the worker's lease on it."""
+    held = Lease(run_id=record.run_id, worker_id=worker_id, expires_at=NOW, **lease)
+    return Claimed(run=record, lease=held)
+
+
 class Store:
     """A queue in memory that records every call, as agent-runs would see them."""
 
@@ -43,6 +49,10 @@ class Store:
         self.claim_error: Exception | None = None
         self.beat_error: Exception | None = None
         self.finish_error: Exception | None = None
+        self.release_error: Exception | None = None
+        #: the working time left that every lease reports, and whether a cancel was asked
+        self.remaining: float | None = None
+        self.cancelling = False
         #: set on every claim and heartbeat, for a test waiting until enough of them came
         self.changed = asyncio.Event()
 
@@ -60,9 +70,7 @@ class Store:
             raise self.claim_error
         if not self.queue:
             return None
-        record = self.queue.pop(0)
-        lease = Lease(run_id=record.run_id, worker_id=worker_id, expires_at=NOW)
-        return Claimed(run=record, lease=lease)
+        return claimed(self.queue.pop(0), worker_id, remaining_seconds=self.remaining)
 
     async def heartbeat(
         self,
@@ -85,7 +93,36 @@ class Store:
         self.changed.set()
         if self.beat_error is not None:
             raise self.beat_error
-        return Lease(run_id=run_id, worker_id=worker_id, expires_at=NOW)
+        return Lease(
+            run_id=run_id,
+            worker_id=worker_id,
+            expires_at=NOW,
+            remaining_seconds=self.remaining,
+            cancel_requested=self.cancelling,
+        )
+
+    async def release(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        tenant: str | None = None,
+    ) -> RunRecord:
+        self.writes.append(
+            (
+                "release",
+                {
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "checkpoint": checkpoint,
+                    "tenant": tenant,
+                },
+            )
+        )
+        if self.release_error is not None:
+            raise self.release_error
+        return run(run_id).model_copy(update={"status": RunStatus.QUEUED, "attempt": 2})
 
     async def pause(
         self,
@@ -251,6 +288,44 @@ async def test_the_lease_is_renewed_while_the_handler_runs() -> None:
     }
 
 
+async def test_the_job_says_the_working_time_left_as_the_leases_come(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(worker_module, "_clock", lambda: clock[0])
+    store = Store(run())
+    store.remaining = 60.0
+    seen: list[float | None] = []
+
+    async def handler(job: Job) -> None:
+        seen.append(job.remaining_seconds)
+        clock[0] += 15
+        seen.append(job.remaining_seconds)
+        store.remaining = 30.0
+        await store.until(lambda: bool(store.beats))
+        seen.append(job.remaining_seconds)
+        clock[0] += 45
+        seen.append(job.remaining_seconds)
+        store.remaining = 20.0
+        await job.checkpoint({"step": 1})
+        seen.append(job.remaining_seconds)
+
+    assert await Worker(store, handler, ["triage"]).run_once()
+    assert seen == [60.0, 45.0, 30.0, 0.0, 20.0]
+
+
+async def test_a_run_without_a_limit_has_no_remaining_time() -> None:
+    seen: list[float | None] = []
+
+    async def handler(job: Job) -> None:
+        seen.append(job.remaining_seconds)
+
+    assert await Worker(Store(run()), handler, ["triage"]).run_once()
+    assert seen == [None]
+    unleased = Job(run(), "w-1", 60, Store())
+    assert unleased.remaining_seconds is None
+
+
 async def test_a_failed_heartbeat_is_logged_and_the_run_continues(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -285,6 +360,40 @@ async def test_a_lost_lease_cancels_the_handler(caplog: pytest.LogCaptureFixture
         assert await Worker(store, handler, ["triage"]).run_once()
     assert cancelled.is_set() and len(store.beats) == 1
     assert "lease on run_1 lost: stopping it" in caplog.text
+
+
+async def test_a_cancel_asked_for_stops_the_handler_and_ends_the_run_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = Store(run())
+    store.cancelling = True
+    told: list[bool] = []
+
+    async def handler(job: Job) -> None:
+        told.append(job.cancel_requested)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            told.append(job.cancel_requested)  # cancelled, not a lost lease: may record it
+            raise
+
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, handler, ["triage"], worker_id="w-1").run_once()
+    assert told == [False, True] and len(store.beats) == 1  # no heartbeat after it
+    [(verb, ended)] = store.writes
+    assert (verb, ended["status"], ended["worker_id"]) == ("finish", RunStatus.CANCELLED, "w-1")
+    assert "run run_1 cancelled: stopping it" in caplog.text
+
+
+async def test_a_cancel_that_cannot_be_recorded_is_left_to_the_lease(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = Store(run())
+    store.cancelling = True
+    store.finish_error = ConnectionError("agent-runs is down")
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, forever(), ["triage"]).run_once()
+    assert "run run_1 could not be ended as CANCELLED (agent-runs is down)" in caplog.text
 
 
 async def test_a_handler_whose_write_lost_the_lease_is_logged(
@@ -358,7 +467,7 @@ async def test_a_worker_cancelled_as_its_run_finishes_still_stops() -> None:
         return "finished"
 
     worker = Worker(Store(), finishing, ["triage"])
-    execute = asyncio.create_task(worker._execute(run()))
+    execute = asyncio.create_task(worker._execute(claimed(run())))
     outer.append(execute)
     with pytest.raises(asyncio.CancelledError):
         await execute
@@ -461,7 +570,8 @@ async def test_a_run_past_the_grace_period_is_released(
             reasons.append(exc.args)
             raise
 
-    worker = Worker(Store(run()), handler, ["triage"])
+    store = Store(run(tenant="globex"))
+    worker = Worker(store, handler, ["triage"], worker_id="w-1")
     task = asyncio.create_task(worker.run())
     await started.wait()
     with caplog.at_level(logging.INFO, logger="trellis.runs.worker"):
@@ -469,7 +579,30 @@ async def test_a_run_past_the_grace_period_is_released(
         await asyncio.wait_for(task, 5)
     assert reasons == [(RELEASED,)]  # released, so the handler writes nothing
     assert "1 run(s) in flight" in caplog.text
-    assert "run run_1 released" in caplog.text
+    assert "run run_1 released: another worker runs it" in caplog.text
+    # handed back to the queue at once, not left for its lease to lapse
+    assert store.writes == [
+        (
+            "release",
+            {"run_id": "run_1", "worker_id": "w-1", "checkpoint": None, "tenant": "globex"},
+        )
+    ]
+
+
+async def test_a_run_that_cannot_be_released_is_left_to_its_lease(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.0)
+    started = asyncio.Event()
+    store = Store(run())
+    store.release_error = ConnectionError("agent-runs is down")
+    worker = Worker(store, forever(started), ["triage"])
+    task = asyncio.create_task(worker.run())
+    await started.wait()
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        worker.stop()
+        await asyncio.wait_for(task, 5)
+    assert "run run_1 could not be released (agent-runs is down)" in caplog.text
 
 
 async def test_a_second_stop_releases_the_runs_at_once(monkeypatch: pytest.MonkeyPatch) -> None:

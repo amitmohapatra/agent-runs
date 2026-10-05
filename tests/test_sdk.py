@@ -21,6 +21,7 @@ from trellis.contracts.runs import (
 )
 from trellis.runs import (
     ConflictError,
+    DeliveryState,
     Job,
     LeaseLostError,
     NotFoundError,
@@ -214,6 +215,59 @@ async def test_a_run_past_its_deadline_stops_the_workers_handler(
     assert done.error is not None and done.error.code == "run_deadline"
 
 
+async def test_a_run_cancelled_while_a_worker_runs_it_ends_cancelled(
+    runs: RunsClient, monkeypatch
+) -> None:
+    """``RunsClient.cancel`` asks; the worker's next heartbeat hears it, cancels the handler
+    (which can tell it was cancelled, not lost) and finishes the run ``CANCELLED``."""
+    from trellis.runs import worker as worker_module
+
+    async def soon(seconds: float) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(worker_module, "_sleep", soon)
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+    told: list[bool] = []
+
+    async def handler(job: Job) -> None:
+        asked = await runs.cancel(job.record.run_id, reason="withdrawn", tenant="acme")
+        assert asked.status is RunStatus.RUNNING
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            told.append(job.cancel_requested)
+            raise
+
+    assert await Worker(runs, handler, ["triage"], tenant="acme").run_once()
+    assert told == [True]
+    done = await runs.get(queued.run_id, tenant="acme")
+    assert done is not None and done.status is RunStatus.CANCELLED
+
+
+async def test_a_stopping_worker_hands_the_runs_it_holds_back_to_the_queue(
+    runs: RunsClient, monkeypatch
+) -> None:
+    from trellis.runs import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.0)
+    queued = await runs.start(RunStart(tenant_id="acme", agent_id="triage"), queue=True)
+    started = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    worker = Worker(runs, handler, ["triage"], tenant="acme", worker_id="w-1")
+    serving = asyncio.create_task(worker.run())
+    await started.wait()
+    worker.stop()
+    await asyncio.wait_for(serving, 5)
+    back = await runs.get(queued.run_id, tenant="acme")
+    assert back is not None and (back.status, back.attempt) == (RunStatus.QUEUED, 2)
+    again = await runs.claim("w-2", ["triage"], tenant="acme")
+    assert again is not None and again.run.run_id == queued.run_id
+
+
 async def test_schedules_through_the_sdk(runs: RunsClient) -> None:
     spec = ScheduleSpec(
         tenant_id="acme",
@@ -249,6 +303,23 @@ async def test_webhook_subscriptions_through_the_sdk(runs: RunsClient) -> None:
     assert listed.webhook_id == made.webhook_id and listed.events == made.events
     found = await runs.webhooks.get(made.webhook_id, tenant="acme")
     assert found is not None and found.url == "https://ui.example/h"
+    rotated = await runs.webhooks.rotate_secret(made.webhook_id, tenant="acme")
+    assert rotated.secret != made.secret and rotated.previous_secret_expires_at is not None
+
+    await runs.finish(
+        (await runs.start(RunStart(tenant_id="acme", agent_id="a"))).run_id,
+        RunStatus.SUCCESS,
+        tenant="acme",
+    )
+    [owed] = (await runs.webhooks.deliveries(state=DeliveryState.PENDING, tenant="acme")).items
+    assert (owed.webhook_id, owed.type, owed.attempts) == (
+        made.webhook_id,
+        WebhookEvent.FINISHED,
+        0,
+    )
+    assert (await runs.webhooks.deliveries(state=DeliveryState.DEAD, tenant="acme")).items == []
+    with pytest.raises(ConflictError):
+        await runs.webhooks.redeliver(owed.delivery_id, tenant="acme")
     await runs.webhooks.delete(made.webhook_id, tenant="acme")
     assert await runs.webhooks.get(made.webhook_id, tenant="acme") is None
 
