@@ -85,6 +85,11 @@ MAX_ERROR_RETRIES: Final = 3
 ERROR_RETRY_BASE: Final = timedelta(seconds=10)
 ERROR_RETRY_CAP: Final = timedelta(minutes=10)
 
+#: Runs of one tenant sharing a ``concurrency_key`` that may be RUNNING at once, unless the
+#: deployment says otherwise (``RUNS__RUNS__CONCURRENCY_PER_KEY``): one, so a thread's second
+#: message waits for its first run.
+CONCURRENCY_PER_KEY: Final = 1
+
 # --------------------------------------------------------------------------- the ticker
 
 #: How often the ticker comes round. The worst-case lateness of a schedule, a run past its

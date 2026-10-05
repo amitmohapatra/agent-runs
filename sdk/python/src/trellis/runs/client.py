@@ -100,8 +100,11 @@ class RunsClient:
         lease_seconds: int = LEASE_SECONDS,
         tenant: str | None = None,
     ) -> Claimed | None:
-        """Lease the oldest queued run of ``agent_ids`` to ``worker_id`` (it is now
-        ``RUNNING``), or None when nothing is queued."""
+        """Lease the next queued run of ``agent_ids`` to ``worker_id`` (it is now
+        ``RUNNING``), or None when none may run now: the highest ``priority``, then the
+        oldest, among the runs with room under their ``concurrency_key``. A platform key with
+        no ``tenant`` (here or on the client) claims from every tenant's queue, the tenant
+        whose workers hold the fewest runs first; the run names its tenant."""
         body = {"worker_id": worker_id, "agent_ids": [*agent_ids], "lease_seconds": lease_seconds}
         response = await self._transport.send("POST", "/v1/runs/claim", tenant=tenant, json=body)
         if response.status_code == NO_CONTENT:

@@ -13,7 +13,7 @@ from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
 from agent_runs.api import examples
-from agent_runs.api.deps import Session, Who
+from agent_runs.api.deps import Claiming, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
@@ -52,8 +52,15 @@ def _payload_limit(request: Request) -> int:
 
 def _leasing(request: Request, db: AsyncSession) -> RunStore:
     """The store for a route that hands out a lease, which tells the worker the working time
-    the run has left under the service's maximum too."""
-    return RunStore(db, max_run_seconds=request.app.state.settings.runs.max_run_seconds)
+    the run has left under the service's maximum too, and claims within the deployment's
+    limits."""
+    limits = request.app.state.settings.runs
+    return RunStore(
+        db,
+        max_run_seconds=limits.max_run_seconds,
+        concurrency_per_key=limits.concurrency_per_key,
+        max_running_per_tenant=limits.max_running_per_tenant,
+    )
 
 
 #: A worker fencing its write: refused (409) unless it still holds the run's lease.
@@ -118,19 +125,32 @@ async def start(
 @router.post(
     "/claim",
     response_model=Claimed,
-    summary="Claim the oldest queued run",
+    summary="Claim the next queued run",
     response_description="The run, now `RUNNING`, and the worker's lease on it.",
-    responses={_NO_CONTENT: {"description": "Nothing is queued for these agents; poll later."}},
+    responses={
+        _NO_CONTENT: {
+            "description": "Nothing is queued for these agents that may run now; poll later."
+        }
+    },
 )
 async def claim(
     body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)],
     request: Request,
     db: Session,
-    who: Who,
+    who: Claiming,
 ) -> Claimed | Response:
-    """Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
-    none. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;
-    ``lease.remaining_seconds`` is the working time it has left."""
+    """Lease the next queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
+    none that may run now. The run is ``RUNNING`` and the worker holds it until
+    ``lease.expires_at``; ``lease.remaining_seconds`` is the working time it has left.
+
+    The next run is the one with the highest ``priority``, then the oldest, among those
+    with room: fewer than ``RUNS__RUNS__CONCURRENCY_PER_KEY`` (1) runs of the tenant
+    sharing its ``concurrency_key`` are ``RUNNING``, and the tenant's workers hold fewer
+    than ``RUNS__RUNS__MAX_RUNNING_PER_TENANT`` runs (no cap unless set). A platform key
+    that sends no ``X-Trellis-Tenant`` claims from every tenant's queue, the tenant whose
+    workers hold the fewest runs of these agents first: a fair share of the fleet, with
+    nothing to set. The claimed run names its tenant (``run.tenant_id``), which the
+    worker's later calls send."""
     claimed = await _leasing(request, db).claim(who.tenant_id, body, now=now())
     await db.commit()
     claims_total.labels("empty" if claimed is None else "claimed").inc()

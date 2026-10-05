@@ -76,6 +76,10 @@ class RunRow(Base):
     running_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the version of the agent's code that started the run (RunStart.agent_version)
     agent_version: Mapped[str | None] = mapped_column(String(128))
+    #: claim order among the tenant's queued runs, higher first (RunStart.priority)
+    priority: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    #: the tenant's runs sharing it run a few at a time (RunStart.concurrency_key)
+    concurrency_key: Mapped[str | None] = mapped_column(String(200))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
@@ -135,6 +139,20 @@ class RunRow(Base):
             "ix_runs_working",
             "running_since",
             postgresql_where=text("status = 'RUNNING'"),
+        ),
+        # the claim: RUNNING runs sharing a concurrency key
+        Index(
+            "ix_runs_concurrency",
+            "tenant_id",
+            "concurrency_key",
+            postgresql_where=text("status = 'RUNNING' AND concurrency_key IS NOT NULL"),
+        ),
+        # the claim: each tenant's runs held by workers (fair share, the per-tenant cap)
+        Index(
+            "ix_runs_leased",
+            "tenant_id",
+            "agent_id",
+            postgresql_where=text("status = 'RUNNING' AND lease_owner IS NOT NULL"),
         ),
     )
 

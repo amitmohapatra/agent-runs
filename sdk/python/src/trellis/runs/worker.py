@@ -220,7 +220,9 @@ def default_concurrency() -> int:
 class Worker:
     """Claims queued runs of ``agent_ids`` from ``store`` and runs each with ``handler``,
     ``concurrency`` at a time (default: :func:`default_concurrency`). ``tenant`` is the
-    tenant a platform key claims for; ``worker_id`` defaults to host, process and object."""
+    tenant a platform key claims for; a platform key with none claims from every tenant's
+    queue, sharing the worker fairly between them. ``worker_id`` defaults to host, process
+    and object."""
 
     def __init__(
         self,

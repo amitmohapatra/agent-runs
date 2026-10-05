@@ -13,9 +13,10 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, tuple_
+from sqlalchemy import Select, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.ids import stable_id
 from trellis.contracts.runs import (
@@ -31,6 +32,7 @@ from trellis.runs.answers import answer_problem, schema_problem
 from agent_runs.answering import require_may_answer, require_may_cancel
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
+    CONCURRENCY_PER_KEY,
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
     ERROR_RETRY_CAP,
@@ -81,12 +83,17 @@ _RECORD_FIELDS = (
     "timeout_seconds",
     "idempotency_key",
     "agent_version",
+    "priority",
+    "concurrency_key",
     "created_at",
     "updated_at",
 )
 
 
 _SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
+
+#: A run a worker holds: what fair share and the per-tenant cap count.
+_LEASED = (RunRow.status == RunStatus.RUNNING.value, RunRow.lease_owner.is_not(None))
 
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
@@ -108,6 +115,8 @@ _START_FIELDS = frozenset(
         "input",
         "deadline",
         "timeout_seconds",
+        "priority",
+        "concurrency_key",
         "metadata",
     }
 )
@@ -226,11 +235,21 @@ def _counted(error: AgentError | None, retries: int) -> AgentError | None:
 class RunStore:
     """Every run operation, in one place. The caller commits. ``max_run_seconds`` is the
     service's maximum working time (``RUNS__RUNS__MAX_RUN_SECONDS``): a run's own
-    ``timeout_seconds`` may only be shorter."""
+    ``timeout_seconds`` may only be shorter. ``concurrency_per_key`` and
+    ``max_running_per_tenant`` bound what a claim may take (``RUNS__RUNS__*``)."""
 
-    def __init__(self, session: AsyncSession, *, max_run_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        max_run_seconds: float | None = None,
+        concurrency_per_key: int = CONCURRENCY_PER_KEY,
+        max_running_per_tenant: int | None = None,
+    ) -> None:
         self._session = session
         self._max_run_seconds = max_run_seconds
+        self._per_key = concurrency_per_key
+        self._per_tenant = max_running_per_tenant
 
     def _limit(self, row: RunRow) -> float | None:
         """The most working time the run may take: its own limit or the service's, the
@@ -274,6 +293,8 @@ class RunStore:
                 running_since=None if queue else now,
                 idempotency_key=record.idempotency_key,
                 agent_version=record.agent_version,
+                priority=record.priority,
+                concurrency_key=record.concurrency_key,
                 run_metadata=record.metadata or None,
                 attempt=1,
                 queued_at=now if queue else None,
@@ -496,29 +517,111 @@ class RunStore:
 
     # ------------------------------------------------------------------ the queue
     async def claim(
-        self, tenant_id: str, request: ClaimRequest, *, now: datetime
+        self, tenant_id: str | None, request: ClaimRequest, *, now: datetime
     ) -> Claimed | None:
-        """The oldest queued run of the worker's agents that is available (no retry's
-        backoff still holding it back), leased to it; ``None`` when there is none. ``SKIP
-        LOCKED`` is what lets many workers claim at once without two of them ever getting one
-        run: a row another claim holds is passed over, not waited on."""
-        row = await self._session.scalar(
-            select(RunRow)
+        """The next queued run of the worker's agents, leased to it; ``None`` when there is
+        none it may take. ``tenant_id`` is the tenant's queue; ``None`` (a platform key that
+        names no tenant) is every tenant's.
+
+        The next run is available (no retry's backoff still holding it back) and has room:
+        fewer than ``concurrency_per_key`` RUNNING runs share its ``concurrency_key``, and
+        its tenant's workers hold fewer than ``max_running_per_tenant`` runs. Among those,
+        the tenant whose workers hold the fewest runs of these agents comes first (the fair
+        share: a tenant takes more of a shared fleet only while no tenant with fewer waits),
+        then the highest ``priority``, then the oldest.
+
+        ``SKIP LOCKED`` lets many workers claim at once without two of them ever getting one
+        run: a row another claim holds is passed over, not waited on. The room is counted
+        again under a transaction lock on the key (and on the tenant, when capped), so two
+        claims at once cannot both take the last place; a key or tenant another claim is
+        counting right now is passed over the same way, for this claim."""
+        passed: list[Any] = []
+        while (
+            row := await self._session.scalar(self._next_queued(tenant_id, request, now, passed))
+        ) is not None:
+            if not await self._tenant_has_room(row):
+                passed.append(RunRow.tenant_id != row.tenant_id)
+            elif not await self._key_has_room(row):
+                passed.append(
+                    or_(
+                        RunRow.tenant_id != row.tenant_id,
+                        RunRow.concurrency_key.is_distinct_from(row.concurrency_key),
+                    )
+                )
+            else:
+                _move(row, RunStatus.RUNNING, now)
+                lease = self._lease(row, request.worker_id, request.lease_seconds, now)
+                return Claimed(run=await self._flushed(row, now), lease=lease)
+        return None
+
+    def _next_queued(
+        self, tenant_id: str | None, request: ClaimRequest, now: datetime, passed: list[Any]
+    ) -> Select[tuple[RunRow]]:
+        """The query for the next run a claim may take, in claim order, locked."""
+        held = (
+            select(RunRow.tenant_id, func.count().label("runs"))
+            .where(*_LEASED, RunRow.agent_id.in_(request.agent_ids))
+            .group_by(RunRow.tenant_id)
+            .subquery()
+        )
+        sharing = aliased(RunRow)
+        running_with_key = (
+            select(func.count())
             .where(
-                RunRow.tenant_id == tenant_id,
+                sharing.status == RunStatus.RUNNING.value,
+                sharing.tenant_id == RunRow.tenant_id,
+                sharing.concurrency_key == RunRow.concurrency_key,
+            )
+            .scalar_subquery()
+        )
+        query = (
+            select(RunRow)
+            .outerjoin(held, held.c.tenant_id == RunRow.tenant_id)
+            .where(
                 RunRow.status == RunStatus.QUEUED.value,
                 RunRow.agent_id.in_(request.agent_ids),
                 or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
+                or_(RunRow.concurrency_key.is_(None), running_with_key < self._per_key),
+                *passed,
             )
-            .order_by(RunRow.queued_at)
+            .order_by(func.coalesce(held.c.runs, 0), RunRow.priority.desc(), RunRow.queued_at)
             .limit(1)
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=RunRow, skip_locked=True)
         )
-        if row is None:
-            return None
-        _move(row, RunStatus.RUNNING, now)
-        lease = self._lease(row, request.worker_id, request.lease_seconds, now)
-        return Claimed(run=await self._flushed(row, now), lease=lease)
+        return query if tenant_id is None else query.where(RunRow.tenant_id == tenant_id)
+
+    async def _tenant_has_room(self, row: RunRow) -> bool:
+        """Do the run's tenant's workers hold fewer runs than the cap (always, uncapped)?"""
+        if self._per_tenant is None:
+            return True
+        if not await self._locked_for_claim("tenant", row.tenant_id):
+            return False
+        held = await self._session.scalar(
+            select(func.count()).where(*_LEASED, RunRow.tenant_id == row.tenant_id)
+        )
+        return (held or 0) < self._per_tenant
+
+    async def _key_has_room(self, row: RunRow) -> bool:
+        """Do fewer runs than allowed share the run's concurrency key (always, with none)?"""
+        if row.concurrency_key is None:
+            return True
+        if not await self._locked_for_claim("key", row.tenant_id, row.concurrency_key):
+            return False
+        running = await self._session.scalar(
+            select(func.count()).where(
+                RunRow.status == RunStatus.RUNNING.value,
+                RunRow.tenant_id == row.tenant_id,
+                RunRow.concurrency_key == row.concurrency_key,
+            )
+        )
+        return (running or 0) < self._per_key
+
+    async def _locked_for_claim(self, *names: str) -> bool:
+        """Take the transaction lock claims count a key's or a tenant's room under, unless
+        another claim holds it (then pass over, as ``SKIP LOCKED`` passes over a row). The
+        count after it sees every claim committed before it."""
+        lock = func.pg_try_advisory_xact_lock(func.hashtextextended("\x1f".join(names), 0))
+        return bool(await self._session.scalar(select(lock)))
 
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime

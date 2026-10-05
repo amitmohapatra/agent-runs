@@ -15,7 +15,7 @@ from typing import Final, Self
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agent_runs.config.constants import WEBHOOK_DEAD_RETENTION
+from agent_runs.config.constants import CONCURRENCY_PER_KEY, WEBHOOK_DEAD_RETENTION
 
 DEV = "dev"
 TEST = "test"
@@ -127,6 +127,13 @@ class RunsSettings(BaseModel):
     #: The most working time any run may take, in seconds (time RUNNING, across attempts): a
     #: run's own ``timeout_seconds`` may only be shorter. Unset: no platform maximum.
     max_run_seconds: float | None = Field(default=None, gt=0)
+    #: How many of a tenant's runs sharing a ``concurrency_key`` may be RUNNING at once; the
+    #: rest wait QUEUED.
+    concurrency_per_key: int = Field(default=CONCURRENCY_PER_KEY, ge=1)
+    #: The most runs one tenant's workers may hold at once (RUNNING with a lease), whoever
+    #: claims: a claim past it answers 204. Unset: no cap (a claim across tenants still
+    #: shares the fleet fairly).
+    max_running_per_tenant: int | None = Field(default=None, ge=1)
 
 
 class WebhookSettings(BaseModel):

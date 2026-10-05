@@ -2600,7 +2600,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -2614,7 +2614,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3070,7 +3070,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3084,7 +3084,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3343,7 +3343,7 @@
         "operationId": "runs.start",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3357,7 +3357,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3731,11 +3731,11 @@
     },
     "/v1/runs/claim": {
       "post": {
-        "description": "Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;\n``lease.remaining_seconds`` is the working time it has left.",
+        "description": "Lease the next queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone that may run now. The run is ``RUNNING`` and the worker holds it until\n``lease.expires_at``; ``lease.remaining_seconds`` is the working time it has left.\n\nThe next run is the one with the highest ``priority``, then the oldest, among those\nwith room: fewer than ``RUNS__RUNS__CONCURRENCY_PER_KEY`` (1) runs of the tenant\nsharing its ``concurrency_key`` are ``RUNNING``, and the tenant's workers hold fewer\nthan ``RUNS__RUNS__MAX_RUNNING_PER_TENANT`` runs (no cap unless set). A platform key\nthat sends no ``X-Trellis-Tenant`` claims from every tenant's queue, the tenant whose\nworkers hold the fewest runs of these agents first: a fair share of the fleet, with\nnothing to set. The claimed run names its tenant (``run.tenant_id``), which the\nworker's later calls send.",
         "operationId": "runs.claim",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3749,7 +3749,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3800,7 +3800,7 @@
             }
           },
           "204": {
-            "description": "Nothing is queued for these agents; poll later.",
+            "description": "Nothing is queued for these agents that may run now; poll later.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -4060,7 +4060,7 @@
             "ApiKeyAuth": []
           }
         ],
-        "summary": "Claim the oldest queued run",
+        "summary": "Claim the next queued run",
         "tags": [
           "runs"
         ]
@@ -4083,7 +4083,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -4097,7 +4097,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -4432,7 +4432,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -4446,7 +4446,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -4860,7 +4860,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -4874,7 +4874,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -5276,7 +5276,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -5290,7 +5290,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -5690,7 +5690,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -5704,7 +5704,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -6117,7 +6117,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -6131,7 +6131,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -6535,7 +6535,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -6549,7 +6549,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -6974,7 +6974,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -6988,7 +6988,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -7292,7 +7292,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -7306,7 +7306,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -7755,7 +7755,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -7769,7 +7769,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8028,7 +8028,7 @@
         "operationId": "schedules.create",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8042,7 +8042,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8421,7 +8421,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8435,7 +8435,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8723,7 +8723,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8737,7 +8737,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9032,7 +9032,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9046,7 +9046,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9438,7 +9438,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9452,7 +9452,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9864,7 +9864,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9878,7 +9878,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10137,7 +10137,7 @@
         "operationId": "webhooks.create",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10151,7 +10151,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10563,7 +10563,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10577,7 +10577,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10849,7 +10849,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10863,7 +10863,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11192,7 +11192,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -11206,7 +11206,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11494,7 +11494,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -11508,7 +11508,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11805,7 +11805,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -11819,7 +11819,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
