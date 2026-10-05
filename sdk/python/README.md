@@ -279,8 +279,9 @@ async with RunsClient() as runs:
 ```
 
 Outside dev agent-runs delivers only to `https` URLs whose host resolves to public addresses
-(a subscription to a private, loopback or link-local one raises `ValidationError`), and
-checks the address again before each delivery, unless the operator allows private targets.
+(a subscription to a private, loopback or link-local one raises `ValidationError`); each
+delivery checks the addresses again and connects only to one it checked, never following a
+redirect, unless the operator allows private targets.
 
 ## The worker
 

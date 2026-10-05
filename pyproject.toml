@@ -31,6 +31,8 @@ dev = [
   # the SDK's suite (sdk/python/tests): HTTP mocks and the OpenAPI schema checks
   "respx>=0.22",
   "jsonschema>=4.23",
+  # a certificate for the webhook TLS test (tests/test_webhook_delivery.py)
+  "cryptography>=43",
 ]
 
 [project.scripts]

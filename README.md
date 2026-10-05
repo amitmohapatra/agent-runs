@@ -383,11 +383,15 @@ event, so a receiver drops repeats.
   its attempts ahead of it.
 - **Where deliveries may go.** Outside `dev` a subscription's URL must be `https` and its host
   must resolve only to public addresses: not private, loopback, link-local (where cloud
-  metadata lives), carrier-grade NAT, reserved or multicast (`422` when subscribed). The
-  host is resolved again before every attempt, since a name may point elsewhere by then; a
-  delivery to one that now resolves to such an address is refused for good (dead), one that
-  does not resolve is retried. A deployment whose receivers are inside its own network sets
-  `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`; `dev` allows them unless it is `false`.
+  metadata lives), carrier-grade NAT, reserved or multicast (`422` when subscribed). Every
+  attempt resolves the host again, once, checks every address, and connects only to an
+  address it checked (in the resolver's order, the next when one refuses the connection),
+  naming the host in `Host`, in TLS SNI and in the certificate check: a name that changes
+  between the check and the connection (DNS rebinding) cannot send a delivery elsewhere. A
+  host that now resolves to such an address is refused for good (dead), one that does not
+  resolve is retried. Redirects are never followed: a `3xx` is a final answer. A deployment
+  whose receivers are inside its own network sets `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`;
+  `dev` allows them unless it is `false`.
 
 ## Run it
 

@@ -638,7 +638,8 @@ addresses: not private, loopback, link-local (cloud metadata), carrier-grade NAT
 multicast, an IPv4-mapped IPv6 address judged as its IPv4 one; else `422` saying which
 address. The check is skipped where private targets are allowed
 (`RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`, and in `dev` unless it is `false`), and made
-again before every delivery. At most 20 subscriptions per tenant (`409`).
+again for every delivery, which then connects only to an address it checked (below). At most
+20 subscriptions per tenant (`409`).
 
 ```json
 {"webhook_id": "wh_…", "url": "https://ui.example/hooks/trellis",
@@ -715,7 +716,12 @@ checks it over the raw bytes with `trellis.runs.webhooks.verify_signature(secret
 body)` (it refuses a timestamp more than 300 s from its clock and compares in constant time)
 and reads the body with `parse_delivery`. `event_id` is the same on every
 retry. A `2xx` accepts; `408`, `429`, `5xx` and an unreachable receiver are retried (7
-attempts, 15 s doubling to at most 10 min); any other answer is final. A delivery given up on
+attempts, 15 s doubling to at most 10 min); any other answer is final, a redirect (`3xx`)
+included: it is never followed. Where private targets are not allowed, each attempt
+resolves the host once, refuses the delivery for good when any address is not public, and
+connects only to the addresses it checked, in order (the next when one refuses the
+connection), with `Host`, TLS SNI and the certificate check naming the host: a name that
+resolves elsewhere a moment later (DNS rebinding) is never reached. A delivery given up on
 is kept, dead, to be redelivered (above). At least once: receivers drop repeats by
 `event_id` and read the run for anything the summary lacks.
 

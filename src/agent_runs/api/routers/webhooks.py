@@ -58,7 +58,7 @@ async def create(
     which signs every delivery to it; it is shown here and never again (rotate it with
     ``rotate-secret``). Outside dev the URL must be ``https`` and its host must resolve to
     public addresses only (422 otherwise), unless the deployment allows private targets;
-    each delivery checks the host again."""
+    each delivery checks the host again and connects only to an address it checked."""
     settings = request.app.state.settings
     body.check_url(allow_http=settings.service.is_dev)
     if not settings.private_webhook_targets:

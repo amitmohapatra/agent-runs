@@ -9843,7 +9843,7 @@
         ]
       },
       "post": {
-        "description": "Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,\nwhich signs every delivery to it; it is shown here and never again (rotate it with\n``rotate-secret``). Outside dev the URL must be ``https`` and its host must resolve to\npublic addresses only (422 otherwise), unless the deployment allows private targets;\neach delivery checks the host again.",
+        "description": "Subscribe ``url`` to ``events``. The answer carries the subscription's ``secret``,\nwhich signs every delivery to it; it is shown here and never again (rotate it with\n``rotate-secret``). Outside dev the URL must be ``https`` and its host must resolve to\npublic addresses only (422 otherwise), unless the deployment allows private targets;\neach delivery checks the host again and connects only to an address it checked.",
         "operationId": "webhooks.create",
         "parameters": [
           {

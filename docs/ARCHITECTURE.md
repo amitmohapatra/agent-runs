@@ -87,7 +87,7 @@ flowchart LR
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
 | Retries | `retry.py` `backoff`, `jittered`, `Breaker` | the one retry policy: a capped doubling backoff (webhook deliveries, schedule fires, a lapsed lease's and a retryable error's requeue, the last two jittered) and the breaker |
 | Webhook sender | `webhooks.py` `WebhookSender`; `domain/webhooks.py` `Attempt` | one attempt per due outbox row, signed with the SDK's `trellis.runs.webhooks.sign` (with the replaced secret too during a rotation's overlap); how it went (`Attempt`: accepted, worth another, or refused for good) decides whether `WebhookStore.settle` deletes the row, backs it off or keeps it dead |
-| Egress guard | `egress.py` `private_address`, `require_public` | the SSRF guard: a subscription's host must resolve to public addresses only, checked on create (`422`) and by the sender before every attempt (a refusal is final), unless `Settings.private_webhook_targets` |
+| Egress guard | `egress.py` `public_addresses`, `pinned`, `require_public` | the SSRF guard: a subscription's host must resolve to public addresses only, checked on create (`422`) and by the sender on every attempt (a refusal is final), unless `Settings.private_webhook_targets`; the sender then connects only to the addresses it checked (`pinned`: the IP in the URL, the host in `Host` and TLS SNI, so the certificate is checked against it), and never follows a redirect |
 | SDK | `sdk/python/src/trellis/runs`: `RunsClient`, `Worker`, `webhooks`, `errors`, `models` | the Python client of every route (method names are the operation ids), the framework-neutral worker loop, the delivery signature; `sdk/python/tests` holds it to 100% line and branch coverage and checks it against `docs/openapi.json` |
 | Blob port | `blob/port.py` `BlobStore`, `read`; `blob/filesystem.py`, `blob/gcs.py` | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
@@ -471,7 +471,7 @@ src/agent_runs/
   keys.py              KeyRegistry, KeyInfo: who an X-API-Key is
   firing.py            Firing: one schedule tick → one queued run
   webhooks.py          WebhookSender: delivering the outbox (signed with trellis.runs.webhooks.sign)
-  egress.py            private_address(), require_public(): where a webhook may be delivered
+  egress.py            public_addresses(), pinned(), require_public(): where a webhook may go
   answering.py         require_may_answer(), require_may_cancel(): who may answer or cancel a run
   retry.py             backoff(), jittered(), Breaker: the one retry policy
   api/app.py           create_app(): routers, middleware, error handlers, health routes

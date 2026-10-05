@@ -7,17 +7,23 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import ssl
 from datetime import timedelta
 from typing import Any
 
 import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from trellis.contracts.ids import now
 from trellis.contracts.runs import RunStatus
 from trellis.runs.webhooks import verify_signature
 
 from agent_runs.config.constants import WEBHOOK_DEAD_RETENTION
 from agent_runs.domain.webhooks import WebhookEvent
+from agent_runs.egress import pinned
 from agent_runs.store.webhooks import Delivery, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
@@ -246,6 +252,178 @@ async def test_each_attempt_checks_the_address_again(monkeypatch) -> None:
     assert (await guarded.send(_delivery("https://hooks.example/h"))).accepted
     assert len(receiver.received) == 1
     await guarded.aclose()
+
+
+def resolving_in_turn(monkeypatch: pytest.MonkeyPatch, *answers: list[str]) -> list[str]:
+    """Each resolution answers the next of ``answers`` (a name that changes: DNS
+    rebinding); returns the hosts asked about."""
+    asked: list[str] = []
+    turns = iter(answers)
+
+    async def getaddrinfo(host: Any, port: Any, **kwargs: Any) -> list[Any]:
+        asked.append(host)
+        family = socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, "", (a, 0)) for a in next(turns)]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", getaddrinfo)
+    return asked
+
+
+def _guarded(handle: Any, **client: Any) -> WebhookSender:
+    transport = httpx.MockTransport(handle)
+    return WebhookSender(
+        allow_http=False,
+        allow_private=False,
+        client=httpx.AsyncClient(transport=transport, **client),
+    )
+
+
+async def test_an_attempt_connects_only_to_the_address_it_checked(monkeypatch) -> None:
+    """The name resolves to a public address when checked and to a private one a moment
+    later: the attempt connects to the address it checked, naming the host in Host and in
+    TLS SNI (which the certificate is checked against), and never resolves it again."""
+    asked = resolving_in_turn(monkeypatch, ["93.184.215.14"], ["127.0.0.1"])
+    seen = Receiver()
+    guarded = _guarded(seen.handle)
+    assert (await guarded.send(_delivery("https://hooks.example:8443/h"))).accepted
+    [request] = seen.received
+    assert (request.url.host, request.url.port, request.url.path) == ("93.184.215.14", 8443, "/h")
+    assert request.headers["Host"] == "hooks.example:8443"
+    assert request.extensions["sni_hostname"] == "hooks.example"
+    assert asked == ["hooks.example"], "resolved once"
+
+    rebound = await guarded.send(_delivery("https://hooks.example:8443/h"))
+    assert rebound.error == (
+        "refused: hooks.example resolves to 127.0.0.1, which is not a public address"
+    )
+    assert len(seen.received) == 1, "nothing sent to the address that is not public"
+    await guarded.aclose()
+
+
+async def test_the_checked_addresses_are_tried_in_order(monkeypatch) -> None:
+    # a resolver may name an address twice (once per protocol): it is tried once
+    twice = ["93.184.215.14", "93.184.215.14", "93.184.215.15"]
+    resolving_in_turn(monkeypatch, twice, ["93.184.215.14", "93.184.215.15"])
+    tried: list[str] = []
+
+    def first_refuses(request: httpx.Request) -> httpx.Response:
+        tried.append(request.url.host)
+        if request.url.host == "93.184.215.14":
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(204)
+
+    guarded = _guarded(first_refuses)
+    assert (await guarded.send(_delivery("https://hooks.example/h"))).accepted
+    assert tried == ["93.184.215.14", "93.184.215.15"]
+    await guarded.aclose()
+
+    def all_refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    guarded = _guarded(all_refuse)
+    down = await guarded.send(_delivery("https://hooks.example/h"))
+    assert (down.retry, down.error) == (True, "unreachable: connection refused")
+    await guarded.aclose()
+
+
+async def test_an_ipv6_address_is_connected_to_as_such(monkeypatch) -> None:
+    async def getaddrinfo(host: Any, port: Any, **kwargs: Any) -> list[Any]:
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:2800:21f:cb07::1", 0, 0, 0))]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", getaddrinfo)
+    seen = Receiver()
+    guarded = _guarded(seen.handle)
+    assert (await guarded.send(_delivery("https://hooks.example/h"))).accepted
+    [request] = seen.received
+    assert (
+        request.url.host == "2606:2800:21f:cb07::1" and request.headers["Host"] == "hooks.example"
+    )
+    await guarded.aclose()
+
+
+def _certificate(tmp_path: Any, name: str) -> tuple[Any, Any]:
+    """A self-signed certificate for ``name`` (its own authority), and its key, as files."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now() - timedelta(days=1))
+        .not_valid_after(now() + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(name)]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_file, key_file
+
+
+async def test_a_pinned_connection_still_checks_the_certificate_against_the_host(
+    tmp_path,
+) -> None:
+    """Over real TLS to 127.0.0.1: the server is asked for hooks.example (SNI), the request
+    names it (Host), and the certificate is checked against it, so a certificate for
+    another name is refused even at the checked address."""
+    cert_file, key_file = _certificate(tmp_path, "hooks.example")
+    served = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    served.load_cert_chain(cert_file, key_file)
+    names: list[str | None] = []
+    served.sni_callback = lambda sock, name, context: names.append(name)
+    hosts: list[bytes] = []
+
+    async def answer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        hosts.extend(line for line in head.split(b"\r\n") if line.lower().startswith(b"host:"))
+        writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(answer, "127.0.0.1", 0, ssl=served)
+    port = server.sockets[0].getsockname()[1]
+    trusting = ssl.create_default_context(cafile=str(cert_file))
+    async with server, httpx.AsyncClient(verify=trusting) as client:
+        target = pinned(f"https://hooks.example:{port}/h", "127.0.0.1")
+        request = client.build_request(
+            "POST", target.url, headers=target.headers, extensions=target.extensions
+        )
+        assert (await client.send(request)).status_code == 204
+        assert names == ["hooks.example"] and hosts == [f"Host: hooks.example:{port}".encode()]
+        other = pinned(f"https://other.example:{port}/h", "127.0.0.1")
+        wrong = client.build_request(
+            "POST", other.url, headers=other.headers, extensions=other.extensions
+        )
+        with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
+            await client.send(wrong)
+
+
+@pytest.mark.parametrize("allow_private", [True, False])
+async def test_a_redirect_is_never_followed(monkeypatch, allow_private: bool) -> None:
+    """Even by a client that would follow one: a 3xx is an answer that is not a 2xx, final,
+    and the delivery dies with it."""
+    resolving_in_turn(monkeypatch, ["93.184.215.14"])
+    seen: list[httpx.Request] = []
+
+    def redirecting(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(redirecting), follow_redirects=True)
+    hooks = WebhookSender(allow_http=False, allow_private=allow_private, client=client)
+    attempt = await hooks.send(_delivery("https://hooks.example/h"))
+    assert (attempt.retry, attempt.error) == (False, "answered 302")
+    assert len(seen) == 1 and seen[0].url.path == "/h"
+    await hooks.aclose()
 
 
 # ------------------------------------------------------------------ secret rotation

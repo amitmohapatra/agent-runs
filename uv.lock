@@ -35,6 +35,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "cryptography" },
     { name = "jsonschema" },
     { name = "pyright" },
     { name = "pytest" },
@@ -48,6 +49,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.20,<2" },
     { name = "croniter", specifier = ">=6" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=43" },
     { name = "fastapi", specifier = ">=0.141,<1" },
     { name = "google-cloud-storage", specifier = ">=3.4" },
     { name = "httpx", specifier = ">=0.28" },
