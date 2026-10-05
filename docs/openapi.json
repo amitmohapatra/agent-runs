@@ -5126,7 +5126,7 @@
     },
     "/v1/runs/{run_id}/pause": {
       "post": {
-        "description": "The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that\ninbox. ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound).\nThe lease ends. Repeated by the same caller on the same interrupt, it answers the stored\nrun and changes nothing.",
+        "description": "The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that\ninbox, and its ``expects``, when given, must be a JSON Schema (422 otherwise, saying\nwhy). ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound).\nThe lease ends. Repeated by the same caller on the same interrupt, it answers the stored\nrun and changes nothing.",
         "operationId": "runs.pause",
         "parameters": [
           {
@@ -5914,7 +5914,7 @@
     },
     "/v1/runs/{run_id}/resume": {
       "post": {
-        "description": "Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it\nas the next attempt: ``QUEUED`` for a worker when the run came from the queue, else\n``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's\n``resolutions``, in the same transaction.\n\nWho may answer: an admin or platform key, and a key that may act for anyone (``*`` in\n``may_act_as``, the default), any run; a key restricted to listed people, only as one of\nthem (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run\nassigned to that person or to nobody, checked against the assignee now (after any\nescalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.\n\nRepeated with the very same resolution (its ``resolved_at`` included), as a client\nretries it after losing the answer, it answers the run as it is now and changes nothing.\nAny other answer to an interrupt already answered is 409.",
+        "description": "Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it\nas the next attempt: ``QUEUED`` for a worker when the run came from the queue, else\n``RUNNING``. The resolution is kept as ``last_resolution`` and appended to the run's\n``resolutions``, in the same transaction.\n\nWho may answer: an admin or platform key, and a key that may act for anyone (``*`` in\n``may_act_as``, the default), any run; a key restricted to listed people, only as one of\nthem (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run\nassigned to that person or to nobody, checked against the assignee now (after any\nescalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.\n\nThe answer must fit the question, also before anything is written: an ``ANSWER`` fits\nthe interrupt's ``expects`` (a JSON Schema), or else is one of its ``options`` when it\nhas some; an ``EDIT`` of a question (no ``tool_call``) carries a ``payload`` that fits\n``expects``. Anything else is 422 ``VALIDATION``, the detail saying what does not fit.\n\nRepeated with the very same resolution (its ``resolved_at`` included), as a client\nretries it after losing the answer, it answers the run as it is now and changes nothing.\nAny other answer to an interrupt already answered is 409.",
         "operationId": "runs.resume",
         "parameters": [
           {

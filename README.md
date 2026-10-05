@@ -296,6 +296,25 @@ clicks alike:
   the same decision made again later) is `409 CONFLICT` (`ConflictError`): the run never
   continues twice.
 
+### An answer must fit the question
+
+agent-runs checks every answer against what was asked before anything is written, so a
+run never continues on an answer its agent cannot use. The check is
+`trellis.runs.answers`, the same one the harness makes for a run it keeps in its own
+process:
+
+- An `ANSWER` must fit the interrupt's `expects` (a JSON Schema); without `expects`, an
+  interrupt with `options` takes only one of them.
+- An `EDIT` of a question (an interrupt with no `tool_call`) carries a `payload` that fits
+  `expects`. Edited tool-call arguments are checked by the harness, which knows the tool's
+  schema.
+- `APPROVE`, `REJECT` and `CANCEL` carry nothing to check.
+
+A misfit is `422 VALIDATION` (`ValidationError` in the SDK), its detail saying what does not
+fit (`the answer['qty'] does not fit what was asked: 'two' is not of type 'integer'`), and
+the run keeps waiting for a good answer. A question whose `expects` is not a JSON Schema at
+all is refused when it is asked: the `pause` is `422`, and the run keeps running.
+
 ## Artifacts
 
 Large review payloads never live in a run's checkpoint. The harness uploads an `ask` table

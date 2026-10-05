@@ -263,6 +263,10 @@ otherwise), and optionally the executor's `checkpoint`:
  "checkpoint": {"asks": {…}, "tools": {…}, "framework": {…}}}
 ```
 
+`interrupt.expects`, when given, must be a JSON Schema: one that is not is `422`, the detail
+saying why (`expects is not a valid JSON Schema: …`), and the run is not paused. Answers are
+checked against it on `resume`.
+
 `RUNNING → PAUSED`. The interrupt is kept as `awaiting`; `assignee` and `deadline` are
 indexed for the inbox and the escalation sweep. Announced as `run.paused`. The lease ends:
 a worker pausing a run lets go of it.
@@ -304,7 +308,12 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
  "answer": null, "reviewer": "user:alice", "payload": null}
 ```
 
-`decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`). The
+`decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`).
+**The answer must fit the question** (`trellis.runs.answers`, checked before anything is
+written): an `ANSWER` fits the interrupt's `expects`, or, with no `expects`, is one of its
+`options` when it has some; an `EDIT` of a question (no `tool_call`) carries a `payload` that
+fits `expects`; `APPROVE`, `REJECT` and `CANCEL` carry nothing to check. A misfit is `422
+VALIDATION` whose detail says what does not fit, and the run keeps waiting. The
 resolution is kept as `last_resolution`, appended to the run's resolution history in the
 same transaction (`GET /v1/runs/{id}/resolutions`), and:
 
@@ -321,8 +330,8 @@ run moved on, and changes nothing: no second resolution, no event, no attempt.
 
 `409` for any other answer to an interrupt already answered (a second click or a second
 reviewer: its `resolved_at` differs), or when the run is not `PAUSED` or waits on a
-different `interrupt_id`; `422` when `run_id` names another run; `403` when the key may not
-answer it (below). Announced as `run.finished` only for `CANCEL`.
+different `interrupt_id`; `422` when `run_id` names another run or the answer does not fit
+the question; `403` when the key may not answer it (below), checked first. Announced as `run.finished` only for `CANCEL`.
 
 #### Who may answer a paused run
 

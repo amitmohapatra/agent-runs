@@ -163,7 +163,8 @@ async def pause(
     worker_id: WorkerId = None,
 ) -> RunRecord:
     """The run waits on ``body.interrupt`` (``awaiting``); its ``assignee`` puts it in that
-    inbox. ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound).
+    inbox, and its ``expects``, when given, must be a JSON Schema (422 otherwise, saying
+    why). ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound).
     The lease ends. Repeated by the same caller on the same interrupt, it answers the stored
     run and changes nothing."""
     at = now()
@@ -209,6 +210,11 @@ async def resume(
     them (``reviewer``, a bare id being ``user:<id>``; none is the key itself) and only a run
     assigned to that person or to nobody, checked against the assignee now (after any
     escalation). Anything else is 403 ``AUTHORIZATION``, before anything is written.
+
+    The answer must fit the question, also before anything is written: an ``ANSWER`` fits
+    the interrupt's ``expects`` (a JSON Schema), or else is one of its ``options`` when it
+    has some; an ``EDIT`` of a question (no ``tool_call``) carries a ``payload`` that fits
+    ``expects``. Anything else is 422 ``VALIDATION``, the detail saying what does not fit.
 
     Repeated with the very same resolution (its ``resolved_at`` included), as a client
     retries it after losing the answer, it answers the run as it is now and changes nothing.

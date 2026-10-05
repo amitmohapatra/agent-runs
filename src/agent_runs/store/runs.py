@@ -26,6 +26,7 @@ from trellis.contracts.runs import (
     RunStart,
     RunStatus,
 )
+from trellis.runs.answers import answer_problem, schema_problem
 
 from agent_runs.answering import require_may_answer
 from agent_runs.config.constants import (
@@ -243,12 +244,16 @@ class RunStore:
         worker_id: str | None,
         now: datetime,
     ) -> tuple[RunRecord, bool]:
-        """The run waits on ``pause.interrupt``. Returns ``(run, paused)``: a repeat of the
-        pause that made the current state (the same caller, the same interrupt) answers the
-        stored run with ``paused`` false, changing nothing."""
+        """The run waits on ``pause.interrupt``, whose ``expects`` must be a JSON Schema
+        (``Unprocessable`` otherwise: a question nobody could answer fails where it is
+        asked). Returns ``(run, paused)``: a repeat of the pause that made the current state
+        (the same caller, the same interrupt) answers the stored run with ``paused`` false,
+        changing nothing."""
         interrupt = pause.interrupt
         if (interrupt.tenant_id, interrupt.run_id) != (tenant_id, run_id):
             raise Unprocessable("the interrupt belongs to another run")
+        if problem := schema_problem(interrupt.expects):
+            raise Unprocessable(problem)
         checkpoint = pause.bounded_checkpoint()
         row = await self._locked(tenant_id, run_id, worker_id=None)
         waiting_on = (row.awaiting or {}).get("interrupt_id")
@@ -273,10 +278,13 @@ class RunStore:
         now: datetime,
     ) -> tuple[RunRecord, bool]:
         """Answer the interrupt a paused run waits on, as ``answerer`` may
-        (``answering.py``: checked against the run's assignee now, before anything is
-        written). ``CANCEL`` ends the run; any other decision continues it as the next
-        attempt: back on the queue when the run is durable (it was ever queued, so a worker
-        resumes it), else ``RUNNING`` in the caller's process.
+        (``answering.py``: checked against the run's assignee now) and with an answer that
+        fits the question (``trellis.runs.answers``: an ``ANSWER`` fits ``expects`` or is one
+        of ``options``, an ``EDIT`` of a question fits ``expects``; ``Unprocessable``
+        otherwise), both before anything is written. ``CANCEL`` ends the run; any other
+        decision continues it as the next attempt: back on the queue when the run is durable
+        (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
+        process.
 
         Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
         very same resolution, as a client retries it after losing the answer) answers the
@@ -294,6 +302,8 @@ class RunStore:
             raise Conflict(f"run {run_id} is waiting on another interrupt")
         asked = Interrupt.model_validate(row.awaiting)
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
+        if problem := answer_problem(asked, resolution):
+            raise Unprocessable(problem)
         row.last_resolution = _json(resolution)
         self._session.add(
             ResolutionRow(

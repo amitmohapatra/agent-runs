@@ -81,7 +81,7 @@ flowchart LR
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
-| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing |
+| Answering | `answering.py` `require_may_answer` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
 | Ticker | `ticker.py` `Ticker` | the background loop; a `retry.Breaker` stops it hammering a dead database; `heartbeat.py` is its liveness file and probe |
@@ -155,6 +155,12 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   so a worker that lost the answer may retry. Otherwise a fenced write (`worker_id`) on a
   run whose lease the worker no longer holds is `LeaseLost` (`409 LEASE_LOST`, `_fence`),
   checked before the transition.
+- A resume to a run no longer waiting on its interrupt is a repeat when the resolution kept
+  for that interrupt (`run_resolutions`, read under the row lock) is the very same
+  (`_answered_by`; `resolved_at` is set once per answer): the run is answered as it is and
+  nothing moves. Any other is `409`. An answer that does not fit the question
+  (`trellis.runs.answers.answer_problem`) is `422`, and a pause whose `expects` is not a
+  JSON Schema (`schema_problem`) too, both before anything is written.
 
 ## Start, interrupt, resume
 
@@ -208,7 +214,7 @@ sequenceDiagram
   A->>B: read, verified against the SHA-256
   A-->>U: 200 bytes
   U->>A: POST /v1/runs/{id}/resume {InterruptResolution APPROVE, reviewer}
-  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt, and may this key answer its assignee now (403 if not)
+  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt (else the same resolution kept: 200 as is; another: 409), may this key answer its assignee now (403 if not), does the answer fit (422 if not)
   A->>DB: INSERT run_resolutions, then last_resolution, then PAUSED → QUEUED, attempt 2
   A-->>U: 200 RunRecord (QUEUED)
 

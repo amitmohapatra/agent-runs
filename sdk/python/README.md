@@ -297,7 +297,7 @@ its status). Every error has `message`, `code`, `status` (0 without a response),
 | `NotFoundError` | `NOT_FOUND` / 404 | no such record (reads by id answer `None` instead) |
 | `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt |
 | `LeaseLostError` | `LEASE_LOST` / 409 | the worker no longer holds the run: stop, write nothing more. **Not** a `ConflictError` |
-| `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid |
+| `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid, an answer that does not fit its question included (the message says what) |
 | `PayloadTooLargeError` | `PAYLOAD_TOO_LARGE` / 413 | a `ValidationError`: a body, payload, checkpoint or artifact too large |
 | `RateLimitedError` | `RATE_LIMIT` / 429 | the tenant's budget is spent for now (`retry_after`) |
 | `DependencyUnavailableError` | `DEPENDENCY_UNAVAILABLE` / 502, 503, 504, or no response | the service or its database could not answer |

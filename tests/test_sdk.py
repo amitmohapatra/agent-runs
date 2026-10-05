@@ -26,6 +26,7 @@ from trellis.runs import (
     NotFoundError,
     RunsClient,
     ScheduleUpdate,
+    ValidationError,
     WebhookEvent,
     Worker,
 )
@@ -110,6 +111,26 @@ async def test_a_durable_run_through_the_sdk(runs: RunsClient) -> None:
     second = answer.model_copy(update={"decision": InterruptDecision.REJECT})
     with pytest.raises(ConflictError):  # a second answer: the run is no longer paused
         await runs.resume(second, tenant="acme")
+
+
+async def test_an_answer_that_does_not_fit_is_a_validation_error_saying_why(
+    runs: RunsClient,
+) -> None:
+    run = await runs.start(RunStart(tenant_id="acme", agent_id="triage"))
+    asked = Interrupt(
+        tenant_id="acme", run_id=run.run_id, question="How many?", expects={"type": "integer"}
+    )
+    await runs.pause(asked)
+    answer = InterruptResolution(
+        interrupt_id=asked.interrupt_id,
+        run_id=run.run_id,
+        decision=InterruptDecision.ANSWER,
+        answer="a few",
+    )
+    with pytest.raises(ValidationError) as refused:
+        await runs.resume(answer, tenant="acme")
+    assert refused.value.status == 422 and not refused.value.retryable
+    assert "does not fit what was asked" in refused.value.message
 
 
 async def test_a_lost_lease_is_a_lease_lost_error_not_a_conflict(runs: RunsClient) -> None:
