@@ -54,7 +54,11 @@ from trellis.contracts.runs import (
 from trellis.runs import RunsClient
 
 async with RunsClient() as runs:  # RUNS_URL and TRELLIS_API_KEY from the environment
-    run = await runs.start(RunStart(tenant_id="acme", agent_id="procurement", input={"sku": "A-1"}))
+    run = await runs.start(
+        RunStart(
+            tenant_id="acme", agent_id="procurement", input={"sku": "A-1"}, timeout_seconds=600
+        )
+    )  # at most ten minutes of work, however long it waits for people
 
     # stop for a person: the run waits in role:procurement's inbox
     asked = Interrupt(
@@ -88,10 +92,12 @@ are grouped:
 |---|---|---|
 | `runs.start` | `start(start, *, queue=False)` | `RunRecord` (the existing one for a repeated `run_id` or `idempotency_key`) |
 | `runs.claim` | `claim(worker_id, agent_ids, *, lease_seconds=60)` | `Claimed` (`run`, `lease`), or `None` when nothing is queued |
-| `runs.heartbeat` | `heartbeat(run_id, worker_id, *, lease_seconds=60, checkpoint=None)` | `Lease` |
+| `runs.heartbeat` | `heartbeat(run_id, worker_id, *, lease_seconds=60, checkpoint=None)` | `Lease` (`remaining_seconds`, `cancel_requested`) |
+| `runs.release` | `release(run_id, worker_id, *, checkpoint=None)` | `RunRecord` (`QUEUED` for another worker) |
 | `runs.pause` | `pause(interrupt, *, checkpoint=None, worker_id=None)` | `RunRecord` (`PAUSED`) |
 | `runs.resume` | `resume(resolution)` | `RunRecord` |
-| `runs.finish` | `finish(run_id, status, *, output=None, error=None, worker_id=None)` | `RunRecord` |
+| `runs.cancel` | `cancel(run_id, *, reason=None)` | `RunRecord` (`CANCELLED`, or `RUNNING` until its worker stops) |
+| `runs.finish` | `finish(run_id, status, *, output=None, error=None, worker_id=None)` | `RunRecord` (`QUEUED` when a retryable `ERROR` is retried) |
 | `runs.get` | `get(run_id)` | `RunRecord`, or `None` |
 | `runs.list` | `list(*, status, assignee, agent_id, thread_id, parent_run_id, cursor, limit=50)` | `Page[RunSummary]` |
 | | `iterate(..., max_pages=None)` | every `RunSummary`, page after page |
@@ -99,7 +105,8 @@ are grouped:
 | `artifacts.upload` | `artifacts.upload(run_id, data, *, mime_type="application/json", worker_id=None)` | `ArtifactRef` (its SHA-256 is sent and checked) |
 | `artifacts.download` | `artifacts.download(artifact_id)` | `bytes`, or `None` |
 | `schedules.*` | `schedules.create(spec)`, `list(...)`, `get(id)`, `update(id, ScheduleUpdate(...))`, `delete(id)`, `fire(id, *, at=None)` | `Schedule`, `Page[Schedule]`, `Schedule` or `None`, `Schedule`, `None`, `FireResult` |
-| `webhooks.*` | `webhooks.create(url, events)`, `list()`, `get(id)`, `delete(id)` | `WebhookCreated` (with the secret), `Page[Webhook]`, `Webhook` or `None`, `None` |
+| `webhooks.*` | `webhooks.create(url, events)`, `list()`, `get(id)`, `delete(id)`, `rotate_secret(id)` | `WebhookCreated` (with the secret), `Page[Webhook]`, `Webhook` or `None`, `None`, `WebhookCreated` (the new secret) |
+| | `webhooks.deliveries(*, state=None, webhook_id=None, cursor, limit=50)`, `redeliver(delivery_id)` | `Page[DeliveryRecord]`, `DeliveryRecord` |
 | `ops.*` | `live()`, `ready()`, `metrics()` | `{"status": "ok"}`, `{"status": "ok"}`, Prometheus text |
 
 Reads by id answer `None` when the record does not exist; writes raise. Every call except
@@ -246,6 +253,35 @@ A `2xx` accepts the delivery; `408`, `429`, `5xx` and an unreachable receiver ar
 `sign(secret, timestamp, body)` is the one implementation of the scheme: agent-runs signs
 with it.
 
+**Rotating the secret** (a leak, a routine change) misses nothing:
+
+```python
+rotated = await runs.webhooks.rotate_secret(hook.webhook_id)
+store_secret(rotated.secret)  # before rotated.previous_secret_expires_at (24 h by default)
+```
+
+Until `previous_secret_expires_at` every delivery is signed with both secrets
+(`t=…,v1=<new>,v1=<old>`, `sign(secret, t, body, previous=old)`), and `verify_signature`
+accepts a header if any `v1` matches the secret it is given: a receiver on the old secret and
+one on the new both verify.
+
+**Deliveries given up on** (7 attempts over about a quarter of an hour, or a receiver that
+refused for good) are kept for seven days, dead, with the last error:
+
+```python
+from trellis.runs import DeliveryState
+
+async with RunsClient() as runs:
+    dead = await runs.webhooks.deliveries(state=DeliveryState.DEAD)
+    for missed in dead.items:
+        print(missed.run_id, missed.type, missed.last_error)  # e.g. "answered 503"
+        await runs.webhooks.redeliver(missed.delivery_id)  # sent within a tick, same event_id
+```
+
+Outside dev agent-runs delivers only to `https` URLs whose host resolves to public addresses
+(a subscription to a private, loopback or link-local one raises `ValidationError`), and
+checks the address again before each delivery, unless the operator allows private targets.
+
 ## The worker
 
 `Worker` claims queued runs of some agents and hands each to your handler, an
@@ -269,23 +305,36 @@ async with RunsClient() as runs:
 
 - The lease is renewed every third of `lease_seconds` (60) while the handler runs. A
   heartbeat refused with `LEASE_LOST` cancels the handler: another worker has the run, or
-  it was cancelled or ran past its `deadline` (agent-runs ended it `TIMEOUT`).
+  it ran past its `deadline` or its working-time limit (agent-runs ended it `TIMEOUT`).
+- `job.remaining_seconds` is the working time the run has left now (its `timeout_seconds`
+  or the operator's maximum, the lesser, less what every attempt worked; `None` without a
+  limit), kept current by every lease. Bound your own steps by it to stop in time; past it
+  agent-runs ends the run `TIMEOUT` and the next heartbeat cancels the handler.
+- Cancelling a run (`runs.cancel(run_id, reason=...)`, from anywhere) reaches its worker
+  through the next heartbeat (`cancel_requested`): the handler is cancelled and the worker
+  finishes the run `CANCELLED`. In the handler, `job.cancel_requested` tells that
+  cancellation from a lost lease (record it as the ending, or let the worker do it).
 - `concurrency` handlers run at once (default: the CPU count, 1 to 8). An idle worker asks
   again after 0.5 s, doubling to 10 s, jittered.
 - `serve()` stops on SIGTERM or SIGINT: no new claims, the runs held get 25 s to finish,
-  then are released (cancelled with the message `RELEASED`, nothing written; the lease lapses
-  and another worker runs them again). A second signal releases them at once. `run()` is the
-  same loop without signal handling (stop it with `stop()`), and `run_once()` claims and
-  executes one run.
+  then are released: their handlers are cancelled with the message `RELEASED` (nothing
+  written) and the worker hands each run back to the queue (`runs.release`), where another
+  worker claims it at once as its next attempt, no lapse counted. Only if that cannot be
+  sent does the run wait for its lease to lapse. A second signal releases them at once.
+  `run()` is the same loop without signal handling (stop it with `stop()`), and
+  `run_once()` claims and executes one run.
 - A handler that raises ends its run at once as `ERROR`, with the exception as the run's
   `AgentError` (`AgentError.of`: its class as `code`, its text, and `retryable` as the
-  contracts classify it); you need not catch anything to record a failure. Only if that
-  finish fails too does the run wait for its lease to lapse, as for a worker that died.
+  contracts classify it); you need not catch anything to record a failure. A retryable one
+  (a timeout, a rate limit, a dependency down) is retried by agent-runs: the run goes back
+  on the queue and is claimed again after 10 s, 20 s, then 40 s; the fourth such error
+  stands. Only if that finish fails does the run wait for its lease to lapse, as for a
+  worker that died.
 - `job.pause(interrupt, checkpoint=...)` and `job.finish(...)` are fenced: after the lease
   was lost they raise `LeaseLostError`. A handler that records a cancellation as the run's
   ending checks for `RELEASED in exc.args` and writes nothing then.
-- `store` is anything with `claim`, `heartbeat`, `pause` and `finish` as `RunsClient` has
-  them (the `WorkerStore` protocol). `tenant=` names the tenant a platform key claims for.
+- `store` is anything with `claim`, `heartbeat`, `release`, `pause` and `finish` as
+  `RunsClient` has them (the `WorkerStore` protocol). `tenant=` names the tenant a platform key claims for.
 
 ## Errors and retries
 
@@ -297,9 +346,9 @@ its status). Every error has `message`, `code`, `status` (0 without a response),
 |---|---|---|
 | `RunsError` | `INTERNAL` / 500, any other | the base class |
 | `AuthenticationError` | `AUTHENTICATION` / 401 | no key, or one the registry does not know |
-| `AuthorizationError` | `AUTHORIZATION` / 403 | another tenant, an `on_behalf_of` the key may not act as, a paused run the key may not answer |
+| `AuthorizationError` | `AUTHORIZATION` / 403 | another tenant, an `on_behalf_of` the key may not act as, a paused run the key may not answer (or a run it may not cancel) |
 | `NotFoundError` | `NOT_FOUND` / 404 | no such record (reads by id answer `None` instead) |
-| `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt |
+| `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt, a cancel of a run that ended, a redelivery of a delivery still owed |
 | `LeaseLostError` | `LEASE_LOST` / 409 | the worker no longer holds the run: stop, write nothing more. **Not** a `ConflictError` |
 | `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid, an answer that does not fit its question included (the message says what) |
 | `PayloadTooLargeError` | `PAYLOAD_TOO_LARGE` / 413 | a `ValidationError`: a body, payload, checkpoint or artifact too large |
@@ -310,7 +359,8 @@ A call that fails on the way (no response, `429`, `502`, `503`, `504`) is sent a
 `max_retries` times, after the `Retry-After` the service asked for (at most 30 s) or a
 full-jitter backoff from 0.25 s doubling to 5 s, unless the problem says
 `retryable: false`. Every write agent-runs takes is safe to repeat: a start is idempotent on
-its id, a repeated pause or finish answers the stored run, a repeated resume with the same
-`InterruptResolution` object answers the run as it is now (a new resolution for an
-interrupt already answered, a second click, is a `ConflictError`), the same artifact bytes
-are the same artifact, a schedule create is an upsert.
+its id, a repeated pause, finish or release answers the stored run, a repeated resume with
+the same `InterruptResolution` object answers the run as it is now (a new resolution for an
+interrupt already answered, a second click, is a `ConflictError`), a repeated cancel answers
+the run as it is, the same artifact bytes are the same artifact, a schedule create is an
+upsert.

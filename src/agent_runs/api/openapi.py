@@ -33,10 +33,10 @@ agent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key 
 tenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own
 tenant. The `ops` routes need no key.
 
-Reading is tenant-wide for every key. Answering a paused run (`resume`) is not: an admin or
-platform key, or one that may act for anyone (`*` in `may_act_as`, the default), answers any
-run; a key restricted to listed people answers only as one of them, and only a run assigned to
-that person or to nobody (never one assigned to a group).
+Reading is tenant-wide for every key. Answering a paused run (`resume`) and cancelling a run
+(`cancel`) are not: an admin or platform key, or one that may act for anyone (`*` in
+`may_act_as`, the default), answers or cancels any run; a key restricted to listed people only
+a run assigned to one of them or to nobody (never one assigned to a group).
 
 ### Errors
 Every error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on
@@ -45,10 +45,14 @@ run. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503
 `RATE_LIMIT` (429) are retryable after `Retry-After` seconds.
 
 ### Retries
-Starting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause` or
-`finish` by the caller that made it answers the stored run, and a repeated `resume` with the
-very same resolution answers the run as it is now; claims and heartbeats are safe to repeat.
-A client may retry transport errors, 429, 502, 503 and 504.
+Starting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause`,
+`finish` or `release` by the caller that made it answers the stored run, a repeated `resume`
+with the very same resolution answers the run as it is now, and a repeated `cancel` answers the
+run as it is; claims and heartbeats are safe to repeat. A client may retry transport errors,
+429, 502, 503 and 504. agent-runs retries on its own too: a queued run its worker ends `ERROR`
+with a retryable error goes back on the queue after a backoff (at most 3 times), a run whose
+lease lapsed after a short one, and a webhook delivery takes up to 7 attempts before it is kept
+as dead.
 
 ### Pages
 Every listing takes `cursor` and `limit` and answers `Link: <url>; rel="next"` when there is
@@ -64,8 +68,8 @@ TAGS: Final[list[dict[str, Any]]] = [
     {
         "name": "runs",
         "description": "Recording runs, the worker queue (claim, heartbeat with progress "
-        "checkpoints), pausing for a person and resuming, finishing, the inbox and each run's "
-        "answered interrupts.",
+        "checkpoints and the working time left, release), pausing for a person and resuming, "
+        "cancelling, finishing, the inbox and each run's answered interrupts.",
     },
     {
         "name": "artifacts",
@@ -80,7 +84,8 @@ TAGS: Final[list[dict[str, Any]]] = [
     {
         "name": "webhooks",
         "description": "The tenant's subscriptions to run events (paused, escalated, finished), "
-        "each signed with its own secret.",
+        "each signed with its own secret (rotated with an overlap); the deliveries owed to "
+        "them, and the dead ones to redeliver.",
     },
     {"name": "ops", "description": "Liveness, readiness and Prometheus metrics; no key."},
 ]

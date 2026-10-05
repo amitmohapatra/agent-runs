@@ -7,8 +7,9 @@ one PostgreSQL database, with run artifacts' bytes in blob storage (a filesystem
 This service never executes an agent. A harness (or any framework, through the
 [Python SDK](#the-python-sdk): the [two ways](#where-this-fits-two-ways-to-use-trellis)) does, either in its own process (it records the run here as
 `RUNNING`) or as a worker that claims `QUEUED` runs from here under a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
-at 9 a.m., a crashed worker's run goes back on the queue, and a schedule fires on behalf of a
-person who is not present.
+at 9 a.m., a crashed worker's run goes back on the queue, a run that failed on a blip is tried
+again later, a run that works too long is stopped, and a schedule fires on behalf of a person
+who is not present.
 
 Every record is a [trellis-contracts](../agent-contracts) type: a run is a `RunRecord`
 started from a `RunStart`, paused with an `Interrupt`, resumed with an
@@ -83,23 +84,25 @@ stateDiagram-v2
   [*] --> RUNNING: POST /v1/runs (queue false)
   [*] --> QUEUED: POST /v1/runs (queue true), or a schedule fires
 
-  QUEUED --> RUNNING: POST /v1/runs/claim (lease to worker_id)
-  QUEUED --> CANCELLED: finish CANCELLED
+  QUEUED --> RUNNING: POST /v1/runs/claim, once available_at passed (lease to worker_id)
+  QUEUED --> CANCELLED: cancel, or finish CANCELLED
   QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
   RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1)
+  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1, after a backoff)
+  RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
+  RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
   RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish, or ticker past the run's deadline (run_deadline)
-  RUNNING --> CANCELLED: finish
+  RUNNING --> TIMEOUT: finish, ticker past the run's deadline (run_deadline), or past its working-time limit (run_timeout)
+  RUNNING --> CANCELLED: finish, cancel of a run no worker holds, or after a cancel request: ticker when the lease runs out, pause, release
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
   PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
-  PAUSED --> CANCELLED: resume CANCEL, or finish CANCELLED
+  PAUSED --> CANCELLED: resume CANCEL, cancel, or finish CANCELLED
   PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
   PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
 
@@ -121,20 +124,25 @@ stateDiagram-v2
 | stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume` |
 | move an unanswered question up, or give up on it | the interrupt's `deadline` and `escalate_to`: the ticker reassigns it once, else ends the run `TIMEOUT` |
 | make sure a run is done by a time, whatever happens | `RunStart.deadline`: past it the ticker ends the run `TIMEOUT` (`run_deadline`, not retryable), queued, running or waiting for a person; a worker still running it is told `LEASE_LOST` and stops |
+| bound how long a run may work, not counting the queue or a person's answer | `RunStart.timeout_seconds`: the ticker ends a run whose time `RUNNING`, across attempts and crashes (`worked_seconds`), passes it `TIMEOUT` (`run_timeout`); each lease says the time left (`remaining_seconds`). The operator's `RUNS__RUNS__MAX_RUN_SECONDS` bounds every run |
 | show a reviewer something too big for a question (a table, a diff) | `POST /v1/runs/{id}/artifacts`, then the `ArtifactRef` as `Interrupt.payload_ref`; the UI reads `GET /v1/artifacts/{id}` |
 | build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…` |
 | prove who approved what, and when | `GET /v1/runs/{id}/resolutions` (append-only) |
-| cancel a run that is queued or waiting | `finish` with `CANCELLED` (or `resume` with `CANCEL`, recorded as an answer) |
+| cancel a run, whatever its status, saying why | `POST /v1/runs/{id}/cancel {reason}` (`RunsClient.cancel`): queued or waiting, it ends `CANCELLED` at once; held by a worker, the worker is told through its heartbeat and stops (the SDK's `Worker` does) |
+| stop a worker without losing what it runs | nothing: the SDK's `Worker` lets its runs finish for 25 s, then releases them (`POST /v1/runs/{id}/release`), back on the queue at once for another worker |
+| survive a model's rate limit or a dependency restarting | nothing: a queued run its worker ends `ERROR` with a retryable error is retried later, up to 3 times (10 s, 20 s, 40 s); a run kept in its caller's process is not |
 | start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert |
 | run a schedule now, or pause and resume it | `POST /v1/schedules/{id}/fire`; `PATCH {"enabled": false}` / `{"enabled": true}` |
 | hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once (`trellis.runs.webhooks.verify_signature`) |
+| change a webhook's secret without missing a delivery | `POST /v1/webhooks/{id}/rotate-secret`: both secrets sign for 24 h, and `verify_signature` accepts either |
+| find and resend the deliveries a receiver missed | `GET /v1/webhooks/deliveries?state=dead`, then `POST /v1/webhooks/deliveries/{id}/redeliver` |
 | drive all of it from Python, from any agent framework (Way 2) | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([below](#the-python-sdk)) |
 | have a wrapped agent use all of it with no code (Way 1) | `h.wrap(agent)` with `RUNS_URL` set ([the two ways](#where-this-fits-two-ways-to-use-trellis)) |
 
 ## The Python SDK
 
 [`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
-Python client of this API, versioned with it (0.3.1). It depends on `httpx`, `pydantic` and
+Python client of this API, versioned with it (0.3.2). It depends on `httpx`, `pydantic` and
 `trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
 plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
 into agent-harness, whose run store it is (Way 1):
@@ -145,11 +153,15 @@ into agent-harness, whose run store it is (Way 1):
   raise typed errors (`LeaseLostError`, `ConflictError`, …); failures on the way are
   retried, honouring `Retry-After`.
 - `Worker`: the claim loop: a heartbeat every third of the lease, a lost lease cancels the
-  handler, a handler that raises ends its run `ERROR` at once (the exception as the run's
-  `AgentError`), bounded concurrency, idle backoff, a graceful stop that releases what is
-  still running after 25 s.
+  handler, a cancel asked for (`cancel_requested` on the heartbeat's lease) cancels it and
+  ends the run `CANCELLED`, a handler that raises ends its run `ERROR` at once (the exception
+  as the run's `AgentError`; agent-runs retries a retryable one later), bounded concurrency,
+  idle backoff, a graceful stop that releases what is still running after 25 s back to the
+  queue. `Job` tells the handler the working time left (`remaining_seconds`) and whether a
+  cancel was asked (`cancel_requested`).
 - `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
-  `verify_signature` and `parse_delivery` for a receiver.
+  `verify_signature` (any matching signature, so a receiver keeps working through a secret's
+  rotation) and `parse_delivery` for a receiver.
 
 It lives in this repository as a uv workspace member, so a change to a route and to its
 client is one change; its suite (`make sdk`) checks it against `docs/openapi.json` and holds
@@ -168,10 +180,12 @@ exact claim, heartbeat and resume semantics a worker implements.
 |---|---|
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
 | `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
-| `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; `409 LEASE_LOST` = stop |
+| `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; the lease says the working time left and whether a cancel was asked; `409 LEASE_LOST` = stop |
+| `POST /v1/runs/{id}/release` | the lease holder lets go of the run (it is stopping): back on the queue at once, as the next attempt, no lapse counted |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
 | `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution`; the same resolution repeated answers the run as it is now |
-| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED`; the same finish repeated answers the stored run |
+| `POST /v1/runs/{id}/cancel` | cancel it, whatever its status, saying why: at once, or through the heartbeat of the worker holding it; the keys that may answer it may cancel it |
+| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` (a queued run's retryable `ERROR` is retried later instead); the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
 | `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role. Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
@@ -181,6 +195,8 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
 | `POST /v1/schedules/{id}/fire` | fire now |
 | `POST/GET /v1/webhooks` · `GET/DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
+| `POST /v1/webhooks/{id}/rotate-secret` | a new secret; the old one signs too for the overlap |
+| `GET /v1/webhooks/deliveries?state=&webhook_id=` · `POST /v1/webhooks/deliveries/{id}/redeliver` | the deliveries owed and the dead ones; owe a dead one again |
 | `GET /health/live` · `GET /health/ready` · `GET /metrics` | the process is up · the database answers · Prometheus metrics (no key) |
 
 ## The ticker
@@ -197,15 +213,27 @@ exact claim, heartbeat and resume semantics a worker implements.
    the run must be done by, so time in the queue and time waiting for a person count. A
    worker still running it loses the run: its next heartbeat or write is `409 LEASE_LOST`,
    and the SDK's `Worker` cancels its handler.
-3. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
-   back to `QUEUED` as the next attempt, or ends in `ERROR` (`lease_expired`) on its
-   `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses count toward that, never a person's answers:
-   a run reviewed ten times still survives four crashes.
-4. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
+3. **Working time.** A `RUNNING` run whose working time passed its limit ends in `TIMEOUT`
+   with code `run_timeout` (not retryable). The working time is the time the run spent
+   `RUNNING`, across attempts: kept on the run (`worked_seconds`) as each stretch ends, so a
+   crash does not reset it, and time queued or waiting for a person does not count. The
+   limit is the caller's `RunStart.timeout_seconds` or the operator's
+   `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; neither set, there is none. Every lease (claim,
+   heartbeat) says the time left (`remaining_seconds`), so a worker can stop in time; one
+   that does not is fenced off as for a deadline.
+4. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
+   back to `QUEUED` as the next attempt, after a short backoff (5 s, doubling per lapse, at
+   most 1 min, jittered: a run that kills its worker is not handed straight to the next), or
+   ends in `ERROR` (`lease_expired`) on its `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses
+   count toward that, never a person's answers: a run reviewed ten times still survives four
+   crashes. A run whose cancel was asked for ends `CANCELLED` instead.
+5. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
    (once) or ends in `TIMEOUT`, with a webhook event either way.
-5. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
-   then removed, or rescheduled with backoff.
-6. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
+6. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
+   then removed, rescheduled with backoff, or, given up on, kept as dead (below).
+7. **Dead deliveries.** Deliveries dead for more than `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS`
+   (7) are dropped.
+8. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
    are deleted: the blob, then the record.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
@@ -281,7 +309,9 @@ async with RunsClient(api_key=priya_key) as runs:
     )  # her run: answered; raj's or role:finance's: AuthorizationError
 ```
 
-The rule is `answering.py`, one function.
+The rule is `answering.py`, one function. Cancelling a run (`POST /v1/runs/{id}/cancel`,
+`RunsClient.cancel`) is checked by the same rule: a key may cancel a run it could answer, as
+any principal it may act for; a run that is not paused is assigned to nobody.
 
 ### An answer is taken once
 
@@ -340,6 +370,25 @@ implementation of the scheme: the ticker signs with it, and a receiver checks wi
 [the SDK's README](sdk/python/README.md#webhooks) has a receiver. `event_id` is stable per
 event, so a receiver drops repeats.
 
+- **Rotating a secret.** `POST /v1/webhooks/{id}/rotate-secret` answers a new secret, once.
+  For `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` (24) every delivery carries a signature with
+  each secret (`t=…,v1=<new>,v1=<old>`, as Stripe does) and `verify_signature` accepts any
+  matching one, so receivers switch to the new secret without a missed or refused delivery;
+  `previous_secret_expires_at` on the subscription says when the old one stops signing.
+- **Dead deliveries.** A delivery that used its 7 attempts (15 s doubling to 10 min apart),
+  or that its receiver refused for good (any `4xx` but `408` and `429`), is not deleted: it
+  is kept, dead, with its `last_error`, for `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` (7).
+  `GET /v1/webhooks/deliveries?state=dead` (or `&webhook_id=` for one subscription) lists
+  them and `POST /v1/webhooks/deliveries/{id}/redeliver` owes one again, at once, with all
+  its attempts ahead of it.
+- **Where deliveries may go.** Outside `dev` a subscription's URL must be `https` and its host
+  must resolve only to public addresses: not private, loopback, link-local (where cloud
+  metadata lives), carrier-grade NAT, reserved or multicast (`422` when subscribed). The
+  host is resolved again before every attempt, since a name may point elsewhere by then; a
+  delivery to one that now resolves to such an address is refused for good (dead), one that
+  does not resolve is retried. A deployment whose receivers are inside its own network sets
+  `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`; `dev` allows them unless it is `false`.
+
 ## Run it
 
 Needs PostgreSQL, the Memory Service (the key registry, `RUNS__MEMORY__URL`), a blob store
@@ -373,7 +422,7 @@ documented in [.env.example](.env.example); every other number is a named consta
 |---|---|---|---|
 | `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
 | `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
-| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs; anything else only `https`. Only `dev` and `test` may use the filesystem blob store |
+| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs, and private ones unless `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` says otherwise; anything else only `https` to public hosts. Only `dev` and `test` may use the filesystem blob store |
 | `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache, rate-limit buckets and metrics |
 | `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
 | `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB |
@@ -391,6 +440,10 @@ documented in [.env.example](.env.example); every other number is a named consta
 | `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` (dev and test only) or `gcs` |
 | `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
 | `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
+| `RUNS__RUNS__MAX_RUN_SECONDS` | unset | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter. Unset: no platform maximum |
+| `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` | unset (`true` in `dev` only) | API, ticker | deliver to hosts that resolve to private, loopback or link-local addresses |
+| `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` | `24` | API | after a rotation, how long the old secret signs deliveries too; `0` the new one only |
+| `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` | `7` | ticker | how long a dead delivery is kept to be redelivered |
 | `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |
 | `RUNS__TICKER__METRICS_PORT` | unset | ticker | serve the ticker's Prometheus metrics on this port |
 | `RUNS__OBSERVABILITY__LOG_LEVEL` | `INFO` | API, ticker | log level |
