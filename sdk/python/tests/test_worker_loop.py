@@ -8,12 +8,13 @@ import contextlib
 import logging
 import os
 import signal
+import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import pytest
 from conftest import NOW, interrupt
-from trellis.contracts.errors import AgentError
+from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import Interrupt, RunRecord, RunStatus
 from trellis.runs import (
     RELEASED,
@@ -702,28 +703,66 @@ async def test_serve_without_signal_handling_still_runs(monkeypatch: pytest.Monk
 
 
 async def test_a_handler_past_the_working_time_is_stopped_and_the_run_ends_timeout(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """At the working time the claim said was left, not when the ticker notices."""
+    """At the working time the claim said was left and its grace, not when the ticker
+    notices: a handler that ignores ``remaining_seconds`` is still stopped."""
+    monkeypatch.setattr(worker_module, "WORKING_TIME_GRACE_SECONDS", 0.1)
     store = Store(run())
     store.remaining = 0.05
     stopped = asyncio.Event()
+    stopped_after: list[float] = []
 
     async def slow(job: Job) -> None:
+        began = time.monotonic()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
+            stopped_after.append(time.monotonic() - began)
             stopped.set()
             raise
 
     with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
         assert await Worker(store, slow, ["triage"], worker_id="w-1").run_once()
     assert stopped.is_set()
+    # not at the working time itself: the grace went by first
+    assert stopped_after[0] >= 0.05 + 0.1 - 0.01
     assert "run run_1 used its working time: stopped it" in caplog.text
     ended = [call for verb, call in store.writes if verb == "finish"]
     assert [(e["status"], e["worker_id"]) for e in ended] == [(RunStatus.TIMEOUT, "w-1")]
     assert ended[0]["error"] == worker_module.OUT_OF_TIME
     assert (ended[0]["error"].code, ended[0]["error"].retryable) == ("run_timeout", False)
+
+
+async def test_a_handler_bounded_by_its_remaining_time_ends_the_run_itself(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A handler that times out at ``remaining_seconds`` gets the worker's grace to end the
+    run with its own TIMEOUT and what it records on the way out; the worker's clock, set at
+    the same instant, used to cancel it there first."""
+    store = Store(run())
+    store.remaining = 0.05
+    own = AgentError(code="agent_out_of_time", category=ErrorCategory.TIMEOUT, message="wrapped up")
+
+    async def punctual(job: Job) -> None:
+        try:
+            async with asyncio.timeout(job.remaining_seconds):
+                await asyncio.Event().wait()
+        except TimeoutError:
+            await asyncio.sleep(0.02)  # the way out takes a moment: a summary, its events
+            await job.checkpoint({"events": ["stopped: out of time"]})
+            await job.finish(RunStatus.TIMEOUT, output={"partial": True}, error=own)
+
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, punctual, ["triage"], worker_id="w-1").run_once()
+    assert "used its working time" not in caplog.text
+    assert [b["checkpoint"] for b in store.beats if b["checkpoint"]] == [
+        {"events": ["stopped: out of time"]}
+    ]
+    ended = [call for verb, call in store.writes if verb == "finish"]
+    assert [(e["status"], e["error"], e["output"]) for e in ended] == [
+        (RunStatus.TIMEOUT, own, {"partial": True})
+    ]
 
 
 async def test_a_handler_that_ends_in_time_is_not_stopped() -> None:

@@ -23,9 +23,11 @@ was cancelled). Schedules and resumed durable runs arrive the same way: as queue
 
 A handler still running when the run's working time is used up (:attr:`Job.remaining_seconds`
 as the claim gave it: its ``timeout_seconds`` or the service's maximum, less what earlier
-attempts worked) is cancelled there and then, and the worker finishes the run ``TIMEOUT``
-(``run_timeout``, not retried), instead of letting it work on until agent-runs' ticker ends
-it and the next heartbeat stops it.
+attempts worked) and :data:`WORKING_TIME_GRACE_SECONDS` more is cancelled then, and the worker
+finishes the run ``TIMEOUT`` (``run_timeout``, not retried), instead of letting it work on
+until agent-runs' ticker ends it and the next heartbeat stops it. The grace is the handler's:
+one that bounds its own steps by :attr:`Job.remaining_seconds` times out first and ends the
+run itself, with its own error and whatever it records on the way out.
 
 A handler that raises (anything but a lost lease or a cancellation) ends its run at once as
 ``ERROR``, the exception recorded as the contracts classify it (``AgentError.of``: its code,
@@ -74,6 +76,11 @@ IDLE_SECONDS: Final = 0.5
 IDLE_MAX_SECONDS: Final = 10.0
 #: How long a stopping worker lets the runs it holds finish before it releases them.
 GRACE_SECONDS: Final = 25.0
+#: How long past the working time the claim gave the worker lets a handler still running go on
+#: before it stops it. A handler that bounds itself by :attr:`Job.remaining_seconds` times out
+#: at the same instant the worker's own clock would, so without this its own ending (its
+#: ``TIMEOUT``, its events) was always cancelled midway; this second is for writing it.
+WORKING_TIME_GRACE_SECONDS: Final = 1.0
 #: The message a worker cancels a handler with when it stops before the run ends: the run
 #: is released (back on the queue), not cancelled. A handler that records a cancellation as
 #: the run's ending checks for it (``RELEASED in exc.args``) and writes nothing.
@@ -161,9 +168,10 @@ class Job:
     @property
     def remaining_seconds(self) -> float | None:
         """The working time the run has left now, in seconds: what agent-runs said with the
-        latest lease, less the time since (never below 0). ``None``: no limit. Past it
-        agent-runs ends the run ``TIMEOUT`` and the next heartbeat cancels the handler, so a
-        handler that bounds its own steps by it stops in time instead."""
+        latest lease, less the time since (never below 0). ``None``: no limit. Past it, and
+        :data:`WORKING_TIME_GRACE_SECONDS` more, the worker cancels the handler and ends the
+        run ``TIMEOUT``; a handler that bounds its own steps by it stops in time instead and
+        ends the run itself, in that grace."""
         lease = self._renewed.lease
         if lease is None or lease.remaining_seconds is None:
             return None
@@ -389,15 +397,18 @@ class Worker:
 
     async def _execute(self, claimed: Claimed) -> None:
         """Run the handler while the lease holds and the run has working time left; a lost
-        lease cancels it, and so does the end of the working time (then the run ends
-        ``TIMEOUT``)."""
+        lease cancels it, and so does the end of the working time and its grace (then the run
+        ends ``TIMEOUT``)."""
         record = claimed.run
         job = Job(record, self.worker_id, self.lease_seconds, self.store)
         job._renew(claimed.lease)
         execution = asyncio.ensure_future(self.handler(job))
         self._held[record.run_id] = (job, execution)
         heartbeat = asyncio.create_task(self._heartbeat(job, execution))
-        working = asyncio.timeout(job.remaining_seconds)
+        remaining = job.remaining_seconds
+        working = asyncio.timeout(
+            None if remaining is None else remaining + WORKING_TIME_GRACE_SECONDS
+        )
         try:
             async with working:
                 await execution

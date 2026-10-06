@@ -1,6 +1,6 @@
 [project]
 name = "agent-runs"
-version = "0.4.0"
+version = "0.4.1"
 description = "Durable agent runs, the worker queue, the human inbox and the schedules that start runs."
 requires-python = ">=3.12"
 dependencies = [

@@ -4,8 +4,16 @@ What changed in each version of `agent-runs` and its SDK `trellis-runs` (they ar
 together), and what a caller must do about it. Which versions of the other Trellis repos go
 with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/README.md).
 
-## Unreleased
+## 0.4.1 (2026-10-06)
 
+* **SDK `Worker`: a handler that honours `job.remaining_seconds` ends its own run.** The
+  worker's working-time clock fired at the same instant as a handler's own timeout on
+  `remaining_seconds`, and was set first, so the handler's ending (its `TIMEOUT`, its events)
+  was always cancelled midway and the worker's `run_timeout` stood instead. The worker now
+  waits `WORKING_TIME_GRACE_SECONDS` (1 s) past the working time before it stops a handler:
+  one that bounds itself by `remaining_seconds` finishes the run itself in that second, and
+  one that ignores it is still stopped and the run ended `TIMEOUT` (`run_timeout`), a second
+  later than before. The service is unchanged; nothing for a caller to do.
 * **Schedules carry everything a started run can** (trellis-contracts 0.6.1, its ADR 0007).
   A schedule also takes `priority` and `concurrency_key`, copied into every run it fires,
   and its `metadata` goes into each fired run's metadata under the fire's own keys
