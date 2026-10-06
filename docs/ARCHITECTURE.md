@@ -4,12 +4,60 @@ How the service is put together, drawn from the code: every name below is a modu
 method, route, column or constant in this repository (or in `trellis-contracts`, where
 marked). The wire contract is [api.md](api.md); this page is the inside.
 
+- [Among the five Trellis repos](#among-the-five-trellis-repos)
 - [Components](#components)
 - [The run lifecycle](#the-run-lifecycle)
-- [Start, interrupt, resume](#start-interrupt-resume)
-- [A scheduled run firing](#a-scheduled-run-firing)
+- Key flows, as sequence diagrams:
+  - [Start, interrupt, resume](#start-interrupt-resume) (the whole journey)
+  - [Claim, lease and heartbeat](#claim-lease-and-heartbeat) (and a lapsed lease)
+  - [Pause and resume, and the answer check](#pause-and-resume-and-the-answer-check)
+  - [Cancel and release](#cancel-and-release)
+  - [A scheduled run firing](#a-scheduled-run-firing)
+  - [Webhook delivery and dead letters](#webhook-delivery-and-dead-letters)
+  - [Run events and the SSE stream](#run-events-and-the-sse-stream)
+- [The ticker](#the-ticker)
 - [The tables](#the-tables)
 - [Code map](#code-map)
+
+The decisions behind the shape are the [ADRs](adr/README.md). Every flow below also runs as
+an example against the real app, in process ([examples/](../examples/README.md)).
+
+## Among the five Trellis repos
+
+Trellis is five repos. This one keeps what must outlive a process: runs, the queue, the
+inbox of paused runs, schedules and webhooks. It never executes an agent.
+
+```mermaid
+flowchart LR
+  subgraph exec["Executors (they run agents)"]
+    H["agent-harness<br/>Way 1: h.wrap(agent), h.worker(...)"]
+    F["your framework<br/>Way 2: LangGraph, OpenAI Agents, ..."]
+  end
+  SDK["trellis.runs (sdk/python)<br/>RunsClient · Worker · webhooks"]
+  R["agent-runs<br/>(this repo)"]
+  C[["agent-contracts<br/>RunStart · RunRecord · Interrupt<br/>InterruptResolution · Schedule"]]
+  M["agent-memory-service<br/>the key registry"]
+  B["bifrost-sdk<br/>(models, MCP tools)"]
+  UI["inbox UI, webhook receivers"]
+
+  H --> SDK
+  F --> SDK
+  SDK -- "HTTP /v1" --> R
+  R -- "GET /v1/keys/self" --> M
+  R -. "types" .-> C
+  SDK -. "types" .-> C
+  H -. "model calls" .-> B
+  R -- "signed webhooks" --> UI
+  UI -- "inbox, resume" --> SDK
+```
+
+| Repo | Relation to agent-runs |
+|---|---|
+| [agent-harness](https://github.com/amitmohapatra/agent-harness) | with `RUNS_URL` set, its run store is `trellis.runs.RunsClient`: it records, queues, pauses, resumes and schedules runs here, and `h.worker` is a `trellis.runs.Worker` |
+| [agent-contracts](https://github.com/amitmohapatra/agent-contracts) | the records on the wire: the API's bodies are its models (`RunCreate` subclasses `RunStart`), and `RunStatus.can_become` is the one transition check; pinned `>=0.6.1,<0.7` |
+| [agent-memory-service](https://github.com/amitmohapatra/agent-memory-service) | the one key registry: every `X-API-Key` is introspected there (`GET /v1/keys/self`) |
+| [bifrost-sdk](https://github.com/amitmohapatra/bifrost-sdk) | none: agent-runs makes no model calls |
+| **agent-runs** (this repo) | the service, and its SDK `trellis.runs` (`sdk/python`) |
 
 ## Components
 
@@ -250,7 +298,7 @@ sequenceDiagram
   A->>B: read, verified against the SHA-256
   A-->>U: 200 bytes
   U->>A: POST /v1/runs/{id}/resume {InterruptResolution APPROVE, reviewer}
-  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt (else the same resolution kept: 200 as is; another: 409), may this key answer its assignee now (403 if not), does the answer fit (422 if not)
+  A->>DB: SELECT … FOR UPDATE: still PAUSED on this interrupt (else the same resolution kept: 200 as is, another: 409), may this key answer its assignee now (403 if not), does the answer fit (422 if not)
   A->>DB: INSERT run_resolutions, then last_resolution, then PAUSED → QUEUED, attempt 2
   A-->>U: 200 RunRecord (QUEUED)
 
@@ -265,10 +313,146 @@ An in-process run is the same without the queue: `POST /v1/runs` records it `RUN
 pause takes no `worker_id`, and a resume that continues it moves it to `RUNNING` for the
 process that resumes it.
 
+## Claim, lease and heartbeat
+
+A worker leases one queued run at a time and keeps the lease alive; every write it makes
+names its `worker_id` and is fenced to the lease holder. A worker that stops heartbeating
+loses the run to the queue, with its checkpoint, after a backoff.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W1 as worker-a (trellis.runs Worker)
+  participant A as agent-runs API
+  participant DB as PostgreSQL
+  participant T as Ticker
+  participant W2 as worker-b
+
+  W1->>A: POST /v1/runs/claim {worker_id, agent_ids, lease_seconds (5 to 3600, default 60)}
+  A->>DB: _next_queued: FOR UPDATE SKIP LOCKED, available_at passed,<br/>tenant with fewest held first, then priority, then oldest queued_at,<br/>room under concurrency_key and the tenant cap (advisory lock while counting)
+  alt nothing may run now
+    A-->>W1: 204
+  else a run
+    A->>DB: QUEUED → RUNNING, lease_owner, lease_expires_at, running_since
+    A-->>W1: 200 Claimed {run (checkpoint, last_resolution), lease (remaining_seconds, cancel_requested)}
+  end
+  loop every third of the lease
+    W1->>A: POST /v1/runs/{id}/heartbeat {worker_id, lease_seconds, checkpoint?}
+    A->>DB: FOR UPDATE: RUNNING and lease_owner = worker_id (_fence), extend, save checkpoint
+    A-->>W1: 200 Lease {expires_at, remaining_seconds, cancel_requested}
+  end
+  Note over W1: worker-a dies: no more heartbeats
+  T->>DB: requeue_lapsed: RUNNING with lease_expires_at past
+  alt lease_lapses + 1 < MAX_LEASE_LAPSES (5)
+    T->>DB: RUNNING → QUEUED, attempt + 1, checkpoint kept,<br/>available_at = now + 5 s doubling per lapse (at most 1 min, jittered)
+  else the 5th lapse
+    T->>DB: RUNNING → ERROR (lease_expired), outbox run.finished
+  end
+  W1->>A: (back from a pause) POST /v1/runs/{id}/finish?worker_id=worker-a
+  A-->>W1: 409 LEASE_LOST: stop working the run (the SDK's Worker cancels its handler)
+  W2->>A: POST /v1/runs/claim, once available_at has passed
+  A-->>W2: 200 Claimed {run, attempt 2, the checkpoint worker-a saved}
+```
+
+The same fence ends a run whose time is up. Past the run's own `deadline` the ticker ends it
+`TIMEOUT` (`run_deadline`); past its working-time limit, `TIMEOUT` (`run_timeout`). The worker
+learns from its next heartbeat or write (`409 LEASE_LOST`), and every lease says the working
+time left (`remaining_seconds`) so a worker can stop in time.
+[examples/02_queue_claim_heartbeat.py](../examples/02_queue_claim_heartbeat.py) runs this flow.
+
+## Pause and resume, and the answer check
+
+A run pauses on one `Interrupt`; a person answers it from an inbox. The answer is checked
+under the run's row lock, in this order, before anything is written. A question that
+nobody answers in time is escalated once, or times out.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant X as Executor (worker or in-process)
+  participant A as agent-runs API
+  participant DB as PostgreSQL
+  participant U as Inbox UI (a person's key)
+  participant T as Ticker
+
+  X->>A: POST /v1/runs/{id}/pause?worker_id= {interrupt, checkpoint}
+  A->>A: schema_problem(interrupt.expects): not a JSON Schema → 422, the run keeps running
+  A->>DB: FOR UPDATE, fence, RUNNING → PAUSED: awaiting, assignee, awaiting_deadline,<br/>checkpoint, lease released, outbox run.paused
+  A-->>X: 200 RunRecord (PAUSED)
+  U->>A: GET /v1/runs?status=PAUSED&assignee=user:priya
+  A-->>U: 200 [RunSummary with awaiting]
+  U->>A: POST /v1/runs/{id}/resume InterruptResolution {decision, answer, reviewer, comment}
+  A->>DB: SELECT … FOR UPDATE
+  alt not PAUSED on this interrupt any more
+    alt the resolution kept for it is this very one (_answered_by)
+      A-->>U: 200 the run as it is now: no second answer, event or attempt
+    else
+      A-->>U: 409 CONFLICT: the question was already answered
+    end
+  else require_may_answer(key, the assignee now) refuses
+    A-->>U: 403 AUTHORIZATION, saying why
+  else answer_problem(interrupt, resolution): it does not fit expects or the options
+    A-->>U: 422 VALIDATION, saying what does not fit, the run keeps waiting
+  else accepted
+    A->>DB: INSERT run_resolutions, last_resolution,<br/>PAUSED → RUNNING (in process) or QUEUED (was queued), attempt + 1<br/>(CANCEL: → CANCELLED, outbox run.finished)
+    A-->>U: 200 RunRecord
+  end
+  opt nobody answered by the interrupt's deadline
+    T->>DB: escalate: assignee = escalate_to (once), outbox run.escalated,<br/>or, with no escalate_to, PAUSED → TIMEOUT, outbox run.finished
+  end
+```
+
+Who may answer is the rule in [the README](../README.md#who-may-answer-a-paused-run) and
+[api.md](api.md#who-may-answer-a-paused-run); the answer check is `trellis.runs.answers`, the
+same one the harness makes for a run it keeps in its own process.
+[examples/03_pause_resume_answer_check.py](../examples/03_pause_resume_answer_check.py) runs
+every branch.
+
+## Cancel and release
+
+A cancel ends a run that nobody holds at once and asks a worker that holds one to stop. A
+release is a worker letting go of a run because it is stopping itself.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Caller (UI, harness)
+  participant A as agent-runs API
+  participant DB as PostgreSQL
+  participant W as Worker (holds the run)
+  participant T as Ticker
+
+  C->>A: POST /v1/runs/{id}/cancel {reason}
+  A->>A: require_may_cancel: a key may cancel a run it could answer
+  alt QUEUED, PAUSED, or RUNNING with no lease (in process)
+    A->>DB: → CANCELLED, cancel_reason, cancelled_by, outbox run.finished
+    A-->>C: 200 RunRecord (CANCELLED)
+  else RUNNING under a worker's lease
+    A->>DB: cancel_requested_at = now
+    A-->>C: 200 RunRecord (RUNNING, the cancel asked)
+    W->>A: POST /v1/runs/{id}/heartbeat
+    A-->>W: 200 Lease {cancel_requested: true}
+    W->>W: the SDK's Worker cancels the handler
+    W->>A: POST /v1/runs/{id}/finish?worker_id= {status: CANCELLED}
+    A-->>W: 200 RunRecord (CANCELLED)
+    Note over A,T: a pause or release of that run ends it CANCELLED instead,<br/>and if the worker is gone the ticker does when the lease runs out
+  end
+
+  Note over W: SIGTERM: Worker.stop() claims no more and lets handlers run for 25 s
+  W->>A: POST /v1/runs/{id}/release {worker_id, checkpoint?}
+  A->>DB: fence, RUNNING → QUEUED, attempt + 1, no lapse counted, available at once
+  A-->>W: 200 RunRecord (QUEUED): the next claim, by any worker, resumes from the checkpoint
+```
+
+[examples/04_cancel_and_release.py](../examples/04_cancel_and_release.py) runs both.
+
 ## A scheduled run firing
 
 A schedule is created once (an upsert on its identity) and the ticker fires it from then
-on, as its `on_behalf_of`, while nobody is present. `POST /v1/schedules/{id}/fire` takes the
+on, as its `on_behalf_of`, while nobody is present. The run it queues is built from the
+stored schedule and nothing else, and carries everything a started run can: the schedule's
+`timeout_seconds`, `agent_version`, `priority` and `concurrency_key`, and its `metadata`
+under the fire's own keys, which win on conflict (`firing.py`; contracts ADR 0007). `POST /v1/schedules/{id}/fire` takes the
 same path (`Firing.fire`) for one schedule, on demand.
 
 ```mermaid
@@ -290,7 +474,7 @@ sequenceDiagram
       DB-->>T: no row, the fire step ends
     else a schedule is due
       DB-->>T: the schedule, locked for this transaction
-      T->>DB: SAVEPOINT, then INSERT agent_runs QUEUED,<br/>idempotency_key "schedule_id@fire_time"
+      T->>DB: SAVEPOINT, then INSERT agent_runs QUEUED, idempotency_key "schedule_id@fire_time",<br/>on_behalf_of, input, timeout_seconds, agent_version, priority, concurrency_key copied,<br/>metadata = the schedule's, then schedule_id, schedule_name, fire_time, created_by (these win)
       alt the run is queued (or already was for this tick)
         T->>DB: record_success: last_fired_at, last_run_id, failures 0,<br/>next_fire_at = next occurrence after max(fire_time, now)
       else the database refuses it (DBAPIError)
@@ -309,6 +493,152 @@ Two tickers on one tick both see the schedule; `SKIP LOCKED` gives it to one, an
 idempotency key would make a repeat find the same run anyway
 (`tests/test_ticker.py::test_two_tickers_on_one_tick_queue_one_run`). `next_fire_at` only
 moves forward past now, so a long outage fires each schedule once, not once per missed tick.
+
+## Webhook delivery and dead letters
+
+A run change writes its event to an outbox in the same transaction, one row per subscription
+of the tenant that wants it, and the ticker delivers it at least once. A delivery the
+receiver refuses for good, or one that used its attempts, is kept dead to be redelivered.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant X as Executor or person
+  participant A as agent-runs API
+  participant DB as PostgreSQL
+  participant T as Ticker (WebhookSender)
+  participant R as Receiver
+  participant O as Operator (a tenant key)
+
+  O->>A: POST /v1/webhooks {url, events}
+  A-->>O: 201 WebhookCreated (the secret, shown once)
+  X->>A: pause, finish, cancel, resume CANCEL, ...
+  A->>DB: the run change + INSERT webhook_deliveries (outbox), one transaction
+  loop every tick (5 s)
+    T->>DB: WebhookStore.claim_due (FOR UPDATE SKIP LOCKED, leased for 20 s)
+    T->>T: https only (http in dev), the host resolved now, every address public,<br/>unless private targets are allowed (egress.py)
+    T->>R: POST, connected only to a checked address (Host, SNI, cert name the host)<br/>X-Trellis-Signature: t=..,v1=<new>[,v1=<old> during a rotation]
+    alt 2xx
+      T->>DB: settle: delete the row
+    else 408, 429, 5xx or unreachable, attempts left (7 in all)
+      T->>DB: next_attempt_at = now + 15 s doubling (at most 10 min)
+    else any other answer (a 3xx too), a private address, or the 7th attempt
+      T->>DB: dead: dead_at, last_error (kept RUNS__WEBHOOKS__DEAD_RETENTION_DAYS, 7)
+    end
+  end
+  R->>R: verify_signature(secret, header, raw body), drop repeats by event_id
+  O->>A: GET /v1/webhooks/deliveries?state=dead
+  A-->>O: 200 [DeliveryRecord with last_error]
+  O->>A: POST /v1/webhooks/deliveries/{id}/redeliver
+  A->>DB: pending again, all its attempts ahead of it (409 if still owed)
+  O->>A: POST /v1/webhooks/{id}/rotate-secret
+  A-->>O: 200 the new secret, once: both sign for RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS (24)
+```
+
+- **Rotating a secret.** `POST /v1/webhooks/{id}/rotate-secret` answers a new secret, once.
+  For `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` (24) every delivery carries a signature with
+  each secret (`t=…,v1=<new>,v1=<old>`, as Stripe does) and `verify_signature` accepts any
+  matching one, so receivers switch to the new secret without a missed or refused delivery;
+  `previous_secret_expires_at` on the subscription says when the old one stops signing.
+- **Dead deliveries.** A delivery that used its 7 attempts (15 s doubling to 10 min apart),
+  or that its receiver refused for good (any `4xx` but `408` and `429`), is not deleted: it
+  is kept, dead, with its `last_error`, for `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` (7).
+  `GET /v1/webhooks/deliveries?state=dead` (or `&webhook_id=` for one subscription) lists
+  them and `POST /v1/webhooks/deliveries/{id}/redeliver` owes one again, at once, with all
+  its attempts ahead of it.
+- **Where deliveries may go.** Outside `dev` a subscription's URL must be `https` and its host
+  must resolve only to public addresses: not private, loopback, link-local (where cloud
+  metadata lives), carrier-grade NAT, reserved or multicast (`422` when subscribed). Every
+  attempt resolves the host again, once, checks every address, and connects only to an
+  address it checked (in the resolver's order, the next when one refuses the connection),
+  naming the host in `Host`, in TLS SNI and in the certificate check: a name that changes
+  between the check and the connection (DNS rebinding) cannot send a delivery elsewhere. A
+  host that now resolves to such an address is refused for good (dead), one that does not
+  resolve is retried. Redirects are never followed: a `3xx` is a final answer. A deployment
+  whose receivers are inside its own network sets `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`;
+  `dev` allows them unless it is `false`.
+
+The payload, headers and events are in [api.md](api.md#events-and-delivery);
+[examples/07_webhooks_and_dead_letters.py](../examples/07_webhooks_and_dead_letters.py) runs
+a delivery, a dead letter, a redelivery and a rotation.
+
+## Run events and the SSE stream
+
+The executor appends a run's `RunEvent`s while it runs; any replica serves them, by position
+or as server-sent events, so a UI that reconnects to another replica misses nothing.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant X as Executor (worker or in-process)
+  participant A1 as agent-runs replica 1
+  participant DB as PostgreSQL
+  participant A2 as agent-runs replica 2
+  participant UI as UI (SDK stream_events)
+
+  X->>A1: POST /v1/runs/{id}/events?worker_id= {events (1 to 500)}
+  A1->>DB: FOR UPDATE: RUNNING, fenced like a heartbeat,<br/>a position per event, a repeat (attempt, sequence) dropped
+  A1-->>X: 200 {appended, position}
+  UI->>A2: GET /v1/runs/{id}/events/stream (Last-Event-ID: last position seen)
+  loop every EVENT_POLL_SECONDS (0.5 s), in short transactions
+    A2->>DB: events past the position
+    A2-->>UI: id: <position>, data: RunEventEntry
+    A2-->>UI: a keepalive comment after EVENT_KEEPALIVE_SECONDS (15 s) of quiet
+  end
+  X->>A1: POST /v1/runs/{id}/finish
+  A2->>DB: the run has ended and every event was sent
+  A2-->>UI: event: end
+  Note over UI,A2: a stream lasts at most EVENT_STREAM_SECONDS (300 s),<br/>the SDK reopens from the last position, on any replica
+  UI->>A2: GET /v1/runs/{id}/events?after=&limit= (the same log, by page)
+```
+
+[examples/08_events_and_sse.py](../examples/08_events_and_sse.py) appends, pages and follows
+a run's events.
+
+## The ticker
+
+`agent-runs-ticker` is one loop (every `TICK_SECONDS`), straight against the database:
+
+1. **Schedules.** Each due schedule is claimed with `FOR UPDATE SKIP LOCKED` and fired: its
+   run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
+   fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
+   (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
+2. **Run deadlines.** A run not yet ended (`QUEUED`, `RUNNING` or `PAUSED`) past its own
+   `deadline` (`RunStart.deadline`) ends in `TIMEOUT` with an `AgentError` of code
+   `run_deadline` (`retryable: false`: a retry would only be later). The deadline is when
+   the run must be done by, so time in the queue and time waiting for a person count. A
+   worker still running it loses the run: its next heartbeat or write is `409 LEASE_LOST`,
+   and the SDK's `Worker` cancels its handler.
+3. **Working time.** A `RUNNING` run whose working time passed its limit ends in `TIMEOUT`
+   with code `run_timeout` (not retryable). The working time is the time the run spent
+   `RUNNING`, across attempts: kept on the run (`worked_seconds`) as each stretch ends, so a
+   crash does not reset it, and time queued or waiting for a person does not count. The
+   limit is the caller's `RunStart.timeout_seconds` or the operator's
+   `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; neither set, there is none. Every lease (claim,
+   heartbeat) says the time left (`remaining_seconds`), so a worker can stop in time; one
+   that does not is fenced off as for a deadline.
+4. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
+   back to `QUEUED` as the next attempt, after a short backoff (5 s, doubling per lapse, at
+   most 1 min, jittered: a run that kills its worker is not handed straight to the next), or
+   ends in `ERROR` (`lease_expired`) on its `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses
+   count toward that, never a person's answers: a run reviewed ten times still survives four
+   crashes. A run whose cancel was asked for ends `CANCELLED` instead.
+5. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
+   (once) or ends in `TIMEOUT`, with a webhook event either way.
+6. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
+   then removed, rescheduled with backoff, or, given up on, kept as dead (below).
+7. **Dead deliveries.** Deliveries dead for more than `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS`
+   (7) are dropped.
+8. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
+   are deleted: the blob, then the record.
+9. **Run retention.** Only when the operator sets `RUNS__RUNS__RETENTION_DAYS`: runs that
+   ended longer ago are deleted with their resolutions and events, a run with artifacts
+   still kept after them. Unset, every run is kept.
+
+Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
+(the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
+check (a heartbeat file touched after every tick, `RUNS__TICKER__HEARTBEAT_FILE`, one per
+ticker; unset, each ticker process beats into its own file in the temp directory).
 
 ## The tables
 
