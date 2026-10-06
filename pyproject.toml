@@ -96,5 +96,5 @@ concurrency = ["greenlet", "thread"]
 
 [tool.pyright]
 pythonVersion = "3.12"
-include = ["src", "tests", "sdk/python/src", "sdk/python/tests"]
+include = ["src", "tests", "sdk/python/src", "sdk/python/tests", "examples"]
 typeCheckingMode = "standard"

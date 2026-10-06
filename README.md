@@ -5,40 +5,43 @@ One service (it absorbed agent-schedules in 0.2.0): an API process and a ticker 
 one PostgreSQL database, with run artifacts' bytes in blob storage (a filesystem, or GCS).
 
 This service never executes an agent. A harness (or any framework, through the
-[Python SDK](#the-python-sdk): the [two ways](#where-this-fits-two-ways-to-use-trellis)) does, either in its own process (it records the run here as
+[Python SDK](sdk/python/README.md): the [two ways](#where-this-fits-two-ways-to-use-trellis)) does, either in its own process (it records the run here as
 `RUNNING`) or as a worker that claims `QUEUED` runs from here under a lease. This service remembers: a run that pauses for an approval at 2 a.m. is still there
 at 9 a.m., a crashed worker's run goes back on the queue, a run that failed on a blip is tried
 again later, a run that works too long is stopped, and a schedule fires on behalf of a person
 who is not present.
 
-Every record is a [trellis-contracts](../agent-contracts) type: a run is a `RunRecord`
+Every record is a [trellis-contracts](https://github.com/amitmohapatra/agent-contracts) type: a run is a `RunRecord`
 started from a `RunStart`, paused with an `Interrupt`, resumed with an
 `InterruptResolution`; a schedule is a `Schedule` created from a `ScheduleSpec`.
 
+## Start here
+
+1. **See it work, in one command.** `make install && make examples` runs nine scripts against
+   the real service in this process (the API, the ticker and the SDK; the local PostgreSQL in
+   a database of its own, no other network), from one run to webhooks and the event stream
+   ([examples/](examples/README.md)).
+2. **Run the service**: `make up` (Docker), or `make migrate` and two processes
+   ([Run it](#run-it)).
+3. **Drive it from Python** with the SDK, `trellis.runs`
+   ([Where this fits](#where-this-fits-two-ways-to-use-trellis), [the SDK](sdk/python/README.md)).
+4. **Pick the feature** you need in [When to use what](#when-to-use-what).
+5. **Go deeper** in the [documentation](#documentation): the architecture and its sequence
+   diagrams, every route, every setting, troubleshooting, versions and the ADRs.
+
 ## Where this fits: two ways to use Trellis
 
-Trellis is used in one of two ways, and each block works in both:
+Trellis is five repos: **agent-harness** runs your agent, **agent-runs** (this one) keeps its
+runs durable, **agent-memory-service** gives agents memory and issues the API keys this
+service checks, **agent-contracts** holds the types on this API's wire, and **bifrost-sdk**
+reaches models and MCP tools. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#among-the-five-trellis-repos)
+draws how they connect. Each block works in both ways of using Trellis:
 
 - **Way 1, wrapped.** `from trellis import Harness; h = Harness(); agent = h.wrap(my_agent)`.
   The harness runs your agent (LangGraph, Deep Agents, OpenAI Agents SDK, Claude Agent SDK,
-  a plain function) and uses every block automatically: memory context, recording and
-  feedback; durable runs, the inbox, schedules and the worker in agent-runs; governance of
-  tool calls; models and MCP tools through Bifrost; evals; the AG-UI and A2A surfaces.
-- **Way 2, pluggable blocks.** Keep your framework untouched and import only the blocks you
-  want: `trellis.memory` (`MemoryClient`), `trellis.runs` (`RunsClient`, `Worker`,
-  `webhooks.verify_signature`), `trellis.contracts` (the shared types), `bifrost_sdk` (models
-  and MCP tools through Bifrost), and from the harness repo `trellis.harness.governance`
-  (`Governance.from_env`, `check`, `governed`), `trellis.harness.evals` (`EvalServices`,
-  `evaluate`, `judge`) and `trellis.harness.a2a.remote`.
-
-A package shipped from its own repo is top-level `trellis.X`; anything from the harness repo
-is `trellis.harness.X`. `bifrost_sdk` (pip `bifrost-sdk`) is the exception: it keeps its own,
-older name.
-
-**This package** is the durable side of a run: agent-runs keeps runs, the worker queue, the
-inbox of paused runs, schedules and webhooks, and never executes an agent. `trellis.runs`
-(pip `trellis-runs`, in [`sdk/python`](sdk/python/README.md)) is its Python client and a
-framework-neutral worker loop.
+  a plain function) and uses this service through the SDK automatically.
+- **Way 2, pluggable blocks.** Keep your framework untouched and use `trellis.runs`
+  (`RunsClient`, `Worker`, `webhooks.verify_signature`) yourself.
 
 | | What happens with agent-runs and `trellis.runs` |
 |---|---|
@@ -67,52 +70,13 @@ async with RunsClient() as runs:  # RUNS_URL and TRELLIS_API_KEY
   all: a UI reading the inbox, or a webhook receiver (`trellis.runs.webhooks.verify_signature`,
   the same in both ways).
 
-Harness docs: [the two ways](https://github.com/amitmohapatra/agent-harness/blob/main/README.md#two-ways-to-use-trellis) · [every page](https://github.com/amitmohapatra/agent-harness/blob/main/docs/README.md) ·
-blocks: [runs](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/runs.md), [contracts](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/contracts.md), [governance](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/governance.md) ·
-recipes: [LangGraph](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/langgraph.md), [OpenAI Agents SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/openai-agents.md),
+Harness docs: [the two ways](https://github.com/amitmohapatra/agent-harness/blob/main/README.md#two-ways-to-use-trellis) ·
+[every page](https://github.com/amitmohapatra/agent-harness/blob/main/docs/README.md) ·
+blocks: [runs](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/runs.md),
+[governance](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/governance.md) ·
+recipes: [LangGraph](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/langgraph.md),
+[OpenAI Agents SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/openai-agents.md),
 [Claude Agent SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/claude-agent-sdk.md).
-
-## The state machine
-
-The contracts' `RunStatus.can_become` is the only transition check; anything else is a
-`409` that changes nothing. These are exactly the moves the routes and the ticker make
-([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has what each does to the row, the sequence
-diagrams and the tables):
-
-```mermaid
-stateDiagram-v2
-  [*] --> RUNNING: POST /v1/runs (queue false)
-  [*] --> QUEUED: POST /v1/runs (queue true), or a schedule fires
-
-  QUEUED --> RUNNING: POST /v1/runs/claim, once available_at passed and there is room (lease to worker_id)
-  QUEUED --> CANCELLED: cancel, or finish CANCELLED
-  QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
-
-  RUNNING --> PAUSED: pause (Interrupt, checkpoint), lease released
-  RUNNING --> QUEUED: ticker, lease lapsed, lease_lapses < MAX_LEASE_LAPSES (attempt + 1, after a backoff)
-  RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
-  RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
-  RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
-  RUNNING --> SUCCESS: finish
-  RUNNING --> PARTIAL: finish
-  RUNNING --> ERROR: finish
-  RUNNING --> TIMEOUT: finish, ticker past the run's deadline (run_deadline), or past its working-time limit (run_timeout)
-  RUNNING --> CANCELLED: finish, cancel of a run no worker holds, or after a cancel request: ticker when the lease runs out, pause, release
-  RUNNING --> REJECTED: finish
-
-  PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
-  PAUSED --> QUEUED: resume, not CANCEL, was queued (attempt + 1)
-  PAUSED --> CANCELLED: resume CANCEL, cancel, or finish CANCELLED
-  PAUSED --> TIMEOUT: finish TIMEOUT, ticker past the run's deadline, or past the interrupt's with no escalate_to
-  PAUSED --> PAUSED: ticker past the interrupt's deadline, assignee becomes escalate_to (once)
-
-  SUCCESS --> [*]
-  PARTIAL --> [*]
-  ERROR --> [*]
-  TIMEOUT --> [*]
-  CANCELLED --> [*]
-  REJECTED --> [*]
-```
 
 ## When to use what
 
@@ -142,129 +106,18 @@ stateDiagram-v2
 | hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once (`trellis.runs.webhooks.verify_signature`) |
 | change a webhook's secret without missing a delivery | `POST /v1/webhooks/{id}/rotate-secret`: both secrets sign for 24 h, and `verify_signature` accepts either |
 | find and resend the deliveries a receiver missed | `GET /v1/webhooks/deliveries?state=dead`, then `POST /v1/webhooks/deliveries/{id}/redeliver` |
-| drive all of it from Python, from any agent framework (Way 2) | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([below](#the-python-sdk)) |
+| drive all of it from Python, from any agent framework (Way 2) | the SDK, `trellis.runs`: `RunsClient` and `Worker` ([its README](sdk/python/README.md)) |
 | have a wrapped agent use all of it with no code (Way 1) | `h.wrap(agent)` with `RUNS_URL` set ([the two ways](#where-this-fits-two-ways-to-use-trellis)) |
 
-## The Python SDK
+How a run moves between its statuses, and what each move does:
+[the run lifecycle](docs/ARCHITECTURE.md#the-run-lifecycle). Every route, body and status
+code: [docs/api.md](docs/api.md).
 
-[`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
-Python client of this API, versioned with it (0.4.0). It depends on `httpx`, `pydantic` and
-`trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
-plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
-into agent-harness, whose run store it is (Way 1):
+## Who may answer a paused run
 
-- `RunsClient`: one method per operation, named by its operation id (`runs.start` is
-  `start`, `schedules.fire` is `schedules.fire`); reads by id answer `None` for a record that
-  does not exist; listings answer a `Page` (`iterate` follows the `Link` pages); problems
-  raise typed errors (`LeaseLostError`, `ConflictError`, …); failures on the way are
-  retried, honouring `Retry-After`.
-- `Worker`: the claim loop: a heartbeat every third of the lease, a lost lease cancels the
-  handler, a cancel asked for (`cancel_requested` on the heartbeat's lease) cancels it and
-  ends the run `CANCELLED`, a handler that raises ends its run `ERROR` at once (the exception
-  as the run's `AgentError`; agent-runs retries a retryable one later), bounded concurrency,
-  idle backoff, a graceful stop that releases what is still running after 25 s back to the
-  queue. A handler still running when the run's working time is used up is stopped and the
-  run ends `TIMEOUT` (`run_timeout`). `Job` tells the handler the working time left
-  (`remaining_seconds`) and whether a cancel was asked (`cancel_requested`). A worker with a
-  platform key and no tenant serves every tenant, fairly.
-- `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
-  `verify_signature` (any matching signature, so a receiver keeps working through a secret's
-  rotation) and `parse_delivery` for a receiver.
-
-It lives in this repository as a uv workspace member, so a change to a route and to its
-client is one change; its suite (`make sdk`) checks it against `docs/openapi.json` and holds
-it to 100% line and branch coverage.
-
-## The API
-
-Every `/v1` route needs `X-API-Key`; the ops routes do not. The OpenAPI document is
-[docs/openapi.json](docs/openapi.json) (live at `/openapi.json`, `/docs`, `/redoc`). Every error is an RFC 9457
-problem (`application/problem+json`) with a stable `code` (`LEASE_LOST` tells a worker to
-stop; `DEPENDENCY_UNAVAILABLE` and `RATE_LIMIT` come with `Retry-After`).
-[docs/api.md](docs/api.md) has every route, body, status code and problem `code`, and the
-exact claim, heartbeat and resume semantics a worker implements.
-
-| Route | What it does |
-|---|---|
-| `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
-| `POST /v1/runs/claim` | lease the next queued run of `agent_ids` to `worker_id` (highest `priority`, then oldest, with room under its `concurrency_key` and its tenant's cap), or `204`; a platform key with no tenant claims from every tenant, fairly |
-| `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; the lease says the working time left and whether a cancel was asked; `409 LEASE_LOST` = stop |
-| `POST /v1/runs/{id}/release` | the lease holder lets go of the run (it is stopping): back on the queue at once, as the next attempt, no lapse counted |
-| `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
-| `POST /v1/runs/{id}/resume` | answer it with an `InterruptResolution`; the same resolution repeated answers the run as it is now |
-| `POST /v1/runs/{id}/cancel` | cancel it, whatever its status, saying why: at once, or through the heartbeat of the worker holding it; the keys that may answer it may cancel it |
-| `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` (a queued run's retryable `ERROR` is retried later instead); the same finish repeated answers the stored run |
-| `GET /v1/runs/{id}` | one run, the full record |
-| `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
-| `POST /v1/runs/{id}/events` | append the run's `RunEvent`s to its log while it runs, fenced like a heartbeat; a repeated event is stored once |
-| `GET /v1/runs/{id}/events?after=` · `GET /v1/runs/{id}/events/stream` | the run's log past a position · followed as server-sent events (`Last-Event-ID`), ending with `event: end` once the run ended |
-| `GET /v1/runs?status=PAUSED&assignee=…&top_level=true` | run summaries; with these filters, the inbox of a person or role (`top_level` leaves out sub-agents). Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
-| `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
-| `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |
-| `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
-| `GET /v1/schedules` · `GET/PATCH/DELETE /v1/schedules/{id}` | list, read, change (`{"enabled": false}` pauses, `true` resumes), delete |
-| `POST /v1/schedules/{id}/fire` | fire now |
-| `POST/GET /v1/webhooks` · `GET/DELETE /v1/webhooks/{id}` | the tenant's webhook subscriptions |
-| `POST /v1/webhooks/{id}/rotate-secret` | a new secret; the old one signs too for the overlap |
-| `GET /v1/webhooks/deliveries?state=&webhook_id=` · `POST /v1/webhooks/deliveries/{id}/redeliver` | the deliveries owed and the dead ones; owe a dead one again |
-| `GET /health/live` · `GET /health/ready` · `GET /metrics` | the process is up · the database answers · Prometheus metrics (no key) |
-
-## The ticker
-
-`agent-runs-ticker` is one loop (every `TICK_SECONDS`), straight against the database:
-
-1. **Schedules.** Each due schedule is claimed with `FOR UPDATE SKIP LOCKED` and fired: its
-   run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
-   fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
-   (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
-2. **Run deadlines.** A run not yet ended (`QUEUED`, `RUNNING` or `PAUSED`) past its own
-   `deadline` (`RunStart.deadline`) ends in `TIMEOUT` with an `AgentError` of code
-   `run_deadline` (`retryable: false`: a retry would only be later). The deadline is when
-   the run must be done by, so time in the queue and time waiting for a person count. A
-   worker still running it loses the run: its next heartbeat or write is `409 LEASE_LOST`,
-   and the SDK's `Worker` cancels its handler.
-3. **Working time.** A `RUNNING` run whose working time passed its limit ends in `TIMEOUT`
-   with code `run_timeout` (not retryable). The working time is the time the run spent
-   `RUNNING`, across attempts: kept on the run (`worked_seconds`) as each stretch ends, so a
-   crash does not reset it, and time queued or waiting for a person does not count. The
-   limit is the caller's `RunStart.timeout_seconds` or the operator's
-   `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; neither set, there is none. Every lease (claim,
-   heartbeat) says the time left (`remaining_seconds`), so a worker can stop in time; one
-   that does not is fenced off as for a deadline.
-4. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
-   back to `QUEUED` as the next attempt, after a short backoff (5 s, doubling per lapse, at
-   most 1 min, jittered: a run that kills its worker is not handed straight to the next), or
-   ends in `ERROR` (`lease_expired`) on its `MAX_LEASE_LAPSES`-th (5th) lapse. Only lapses
-   count toward that, never a person's answers: a run reviewed ten times still survives four
-   crashes. A run whose cancel was asked for ends `CANCELLED` instead.
-5. **Escalation.** A `PAUSED` run past its interrupt's `deadline` moves to `escalate_to`
-   (once) or ends in `TIMEOUT`, with a webhook event either way.
-6. **Webhooks.** Due deliveries in the outbox are sent (one attempt each, concurrently),
-   then removed, rescheduled with backoff, or, given up on, kept as dead (below).
-7. **Dead deliveries.** Deliveries dead for more than `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS`
-   (7) are dropped.
-8. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
-   are deleted: the blob, then the record.
-9. **Run retention.** Only when the operator sets `RUNS__RUNS__RETENTION_DAYS`: runs that
-   ended longer ago are deleted with their resolutions and events, a run with artifacts
-   still kept after them. Unset, every run is kept.
-
-Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
-(the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
-check (a heartbeat file touched after every tick, `RUNS__TICKER__HEARTBEAT_FILE`, one per
-ticker; unset, each ticker process beats into its own file in the temp directory).
-
-## Authentication
-
-One scheme, one key system. `X-API-Key` is a key issued by the Memory Service; agent-runs
-introspects it there (`GET {RUNS__MEMORY__URL}/v1/keys/self`, cached 60 s, refusals 10 s)
-and learns the tenant it speaks for, the principal recorded as `created_by`, and the
-principals it may put in `on_behalf_of`. The contract is in
-[docs/api.md](docs/api.md#authentication). A platform key has no tenant of its own and names the tenant it acts
-for in `X-Trellis-Tenant`; a tenant key may send that header only to agree with itself
-(`403` otherwise).
-
-### Who may answer a paused run
+Every `/v1` route needs an `X-API-Key` issued by the Memory Service, which agent-runs
+introspects there ([the contract](docs/api.md#authentication)). A platform key names the
+tenant it acts for in `X-Trellis-Tenant`.
 
 Any key of the tenant reads every run, lists every inbox and works the queue: `assignee` is
 the filter an inbox shows, not a lock. Answering a paused run (`POST /v1/runs/{id}/resume`,
@@ -326,85 +179,12 @@ The rule is `answering.py`, one function. Cancelling a run (`POST /v1/runs/{id}/
 `RunsClient.cancel`) is checked by the same rule: a key may cancel a run it could answer, as
 any principal it may act for; a run that is not paused is assigned to nobody.
 
-### An answer is taken once
-
-A paused run continues once per question, automatically safe against retries and double
-clicks alike:
-
-- **The same answer sent again** (the SDK resends a resume whose answer it lost: no
-  response, `502`, `503`, `504`) answers `200` with the run as it is now and changes
-  nothing: no second resolution, no second event, no second attempt. "The same" means the
-  very same `InterruptResolution`, `resolved_at` included, which is set once, when the
-  person answered.
-- **Any other answer** to a question already answered (a second click, a second reviewer,
-  the same decision made again later) is `409 CONFLICT` (`ConflictError`): the run never
-  continues twice.
-
-### An answer must fit the question
-
-agent-runs checks every answer against what was asked before anything is written, so a
-run never continues on an answer its agent cannot use. The check is
-`trellis.runs.answers`, the same one the harness makes for a run it keeps in its own
-process:
-
-- An `ANSWER` must fit the interrupt's `expects` (a JSON Schema); without `expects`, an
-  interrupt with `options` takes only one of them.
-- An `EDIT` of a question (an interrupt with no `tool_call`) carries a `payload` that fits
-  `expects`. Edited tool-call arguments are checked by the harness, which knows the tool's
-  schema.
-- `APPROVE`, `REJECT` and `CANCEL` carry nothing to check.
-
-A misfit is `422 VALIDATION` (`ValidationError` in the SDK), its detail saying what does not
-fit (`the answer['qty'] does not fit what was asked: 'two' is not of type 'integer'`), and
-the run keeps waiting for a good answer. A question whose `expects` is not a JSON Schema at
-all is refused when it is asked: the `pause` is `422`, and the run keeps running.
-
-## Artifacts
-
-Large review payloads never live in a run's checkpoint. The harness uploads an `ask` table
-or a diff with `POST /v1/runs/{id}/artifacts` and pauses with the returned `ArtifactRef` as
-`Interrupt.payload_ref`; a UI reads it with `GET /v1/artifacts/{id}`. The bytes are in the
-blob store (`RUNS__BLOB__PROVIDER=filesystem` under `RUNS__BLOB__ROOT`, shared by the API
-and the ticker; or `gcs` in `RUNS__BLOB__BUCKET`, with the environment's Google
-credentials), written once, never overwritten, and verified against their SHA-256 on every
-read. While a run works, only its lease holder adds artifacts; while it waits, only a
-service key. Fencing, limits and retention are in [docs/api.md](docs/api.md#artifacts).
-
-## Webhooks
-
-A tenant subscribes URLs to run events (`POST /v1/webhooks`: `run.paused`,
-`run.escalated`, `run.finished`); each subscription has its own secret, shown once. An event
-is written to an outbox in the transaction of the run change that caused it and the ticker
-sends it, retried with the service's backoff, at least once. Every delivery carries
-`X-Trellis-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of "<t>.<body>">`, with
-`X-Trellis-Event` and `X-Trellis-Delivery`. The SDK's `trellis.runs.webhooks.sign` is the one
-implementation of the scheme: the ticker signs with it, and a receiver checks with
-`trellis.runs.webhooks.verify_signature` (five minutes' tolerance, constant-time compare);
-[the SDK's README](sdk/python/README.md#webhooks) has a receiver. `event_id` is stable per
-event, so a receiver drops repeats.
-
-- **Rotating a secret.** `POST /v1/webhooks/{id}/rotate-secret` answers a new secret, once.
-  For `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` (24) every delivery carries a signature with
-  each secret (`t=…,v1=<new>,v1=<old>`, as Stripe does) and `verify_signature` accepts any
-  matching one, so receivers switch to the new secret without a missed or refused delivery;
-  `previous_secret_expires_at` on the subscription says when the old one stops signing.
-- **Dead deliveries.** A delivery that used its 7 attempts (15 s doubling to 10 min apart),
-  or that its receiver refused for good (any `4xx` but `408` and `429`), is not deleted: it
-  is kept, dead, with its `last_error`, for `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` (7).
-  `GET /v1/webhooks/deliveries?state=dead` (or `&webhook_id=` for one subscription) lists
-  them and `POST /v1/webhooks/deliveries/{id}/redeliver` owes one again, at once, with all
-  its attempts ahead of it.
-- **Where deliveries may go.** Outside `dev` a subscription's URL must be `https` and its host
-  must resolve only to public addresses: not private, loopback, link-local (where cloud
-  metadata lives), carrier-grade NAT, reserved or multicast (`422` when subscribed). Every
-  attempt resolves the host again, once, checks every address, and connects only to an
-  address it checked (in the resolver's order, the next when one refuses the connection),
-  naming the host in `Host`, in TLS SNI and in the certificate check: a name that changes
-  between the check and the connection (DNS rebinding) cannot send a delivery elsewhere. A
-  host that now resolves to such an address is refused for good (dead), one that does not
-  resolve is retried. Redirects are never followed: a `3xx` is a final answer. A deployment
-  whose receivers are inside its own network sets `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS=true`;
-  `dev` allows them unless it is `false`.
+Two more checks come with every answer, before anything is written: **an answer is taken
+once** (the very same resolution resent is answered with the run as it is now; any other
+answer to a question already answered is `409 CONFLICT`), and **an answer must fit the
+question** (its `expects` and options: `422 VALIDATION` otherwise, and the run keeps
+waiting). [The sequence](docs/ARCHITECTURE.md#pause-and-resume-and-the-answer-check) shows
+the order; [the resume route](docs/api.md#post-v1runsidresume--200-runrecord) the details.
 
 ## Run it
 
@@ -429,49 +209,35 @@ sharing a blob volume; the API reaches the Memory Service on the host
 `../agent-contracts` as the `contracts` build context); `make down` stops everything and
 drops the volumes.
 
-### Configuration
+Every setting, its default, whether it applies without being set, and an example:
+[docs/configuration.md](docs/configuration.md). The ones a deployment sets first are
+`RUNS__DATABASE__URL`, `RUNS__MEMORY__URL` (or `MEMORY_URL`), `RUNS__SERVICE__ENVIRONMENT`
+and, outside `dev`, `RUNS__BLOB__PROVIDER=gcs` with `RUNS__BLOB__BUCKET`.
 
-Service settings are `RUNS__*` environment variables (or a `.env` file), each also
-documented in [.env.example](.env.example); every other number is a named constant in
-`src/agent_runs/config/constants.py`.
+## Documentation
 
-| Variable | Default | Read by | Meaning |
-|---|---|---|---|
-| `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
-| `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
-| `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs, and private ones unless `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` says otherwise; anything else only `https` to public hosts. Only `dev` and `test` may use the filesystem blob store |
-| `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache and metrics (rate-limit budgets are shared, in the database) |
-| `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
-| `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB |
-| `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` | API | a run's `input` or `output` past this (compact JSON) is `413` |
-| `RUNS__RATE_LIMIT__PER_MINUTE`, `RUNS__RATE_LIMIT__BURST` | `3000`, `500` | API | each tenant's request budget, one per tenant in PostgreSQL, shared by every worker of every replica (`429` + `Retry-After` when empty); `0` per minute turns it off |
-| `RUNS__MEMORY__URL` | `MEMORY_URL`, else `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self`. `MEMORY_URL` is the platform-wide name; this one wins when both are set |
-| `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
-| `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process (per worker) |
-| `RUNS__DATABASE__MAX_OVERFLOW` | `10` | API, ticker | connections opened past the pool under a burst |
-| `RUNS__DATABASE__POOL_TIMEOUT_SECONDS` | `5` | API, ticker | wait for a pooled connection before answering `503` |
-| `RUNS__DATABASE__POOL_RECYCLE_SECONDS` | `300` | API, ticker | a pooled connection older than this is replaced, not reused |
-| `RUNS__DATABASE__POOL_PRE_PING` | `true` | API, ticker | test a pooled connection on checkout; a dead one is replaced, not handed to a request |
-| `RUNS__DATABASE__CONNECT_TIMEOUT_SECONDS` | `5` | API, ticker | opening a connection to PostgreSQL |
-| `RUNS__DATABASE__STATEMENT_TIMEOUT_MS` | `15000` | API, ticker | PostgreSQL cancels a statement past this (`503` here); `0` is no limit |
-| `RUNS__BLOB__PROVIDER` | `filesystem` | API, ticker | `filesystem` (dev and test only) or `gcs` |
-| `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
-| `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
-| `RUNS__RUNS__MAX_RUN_SECONDS` | unset | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter. Unset: no platform maximum |
-| `RUNS__RUNS__CONCURRENCY_PER_KEY` | `1` | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once |
-| `RUNS__RUNS__MAX_RUNNING_PER_TENANT` | unset | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Unset: no cap (fair share between tenants needs no setting) |
-| `RUNS__RUNS__RETENTION_DAYS` | unset | ticker | days an ended run is kept, with its resolutions and events; unset, forever |
-| `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` | unset (`true` in `dev` only) | API, ticker | deliver to hosts that resolve to private, loopback or link-local addresses |
-| `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` | `24` | API | after a rotation, how long the old secret signs deliveries too; `0` the new one only |
-| `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` | `7` | ticker | how long a dead delivery is kept to be redelivered |
-| `RUNS__TICKER__HEARTBEAT_FILE` | unset | ticker, probe | the liveness file; unset, a per-process file in the temp directory and nothing for the probe to read |
-| `RUNS__TICKER__METRICS_PORT` | unset | ticker | serve the ticker's Prometheus metrics on this port |
-| `RUNS__OBSERVABILITY__LOG_LEVEL` | `INFO` | API, ticker | log level |
-| `RUNS__OBSERVABILITY__LOG_JSON` | `true` | API, ticker | `false` for the console renderer |
-| `RUNS_PORT`, `RUNS_DB_PORT` | `8090`, `5442` | docker compose | host ports of the API and PostgreSQL |
-| `RUNS_TEST_ADMIN_URL`, `RUNS_TEST_DB`, `RUNS_TEST_GCS` | see `.env.example` | the test suite | the admin connection, the test database's name, and the opt-in fake-GCS tests |
+| Page | What it answers |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Its place among the five repos, the components, the run lifecycle, sequence diagrams (start to finish; claim, lease and heartbeat; pause and resume with the answer check; cancel and release; a schedule firing; webhook delivery and dead letters; events and SSE), the ticker, the tables, the code map |
+| [docs/api.md](docs/api.md) · [docs/openapi.json](docs/openapi.json) | Every route, body, status and problem `code`; the OpenAPI 3.1 document (served live at `/openapi.json`, `/docs`, `/redoc`) |
+| [sdk/python/README.md](sdk/python/README.md) | The Python SDK, `trellis.runs`: the client, the worker, the inbox, schedules, webhooks |
+| [examples/](examples/README.md) | Nine runnable scripts, in process, simplest first |
+| [docs/configuration.md](docs/configuration.md) | Every setting: default, automatic or not, example; the SDK's and the test suite's variables |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Problem codes and operational symptoms, their causes and fixes; FAQ |
+| [docs/versioning.md](docs/versioning.md) | Which versions of the five repos go together; how the API and the schema change |
+| [CHANGELOG.md](CHANGELOG.md) | What each version changed |
+| [docs/adr/](docs/adr/README.md) | Why: leases and fencing, the ticker owns time, webhooks live here, schedules merged in |
 
 ## Develop
+
+```bash
+make lint typecheck test
+make coverage                # the service's suite with line and branch coverage, failing under 95%
+make sdk                     # the SDK's suite, failing under 100% line and branch coverage
+make examples                # every example, in process (the local PostgreSQL)
+make links                   # every relative Markdown link and anchor resolves
+make openapi                 # rewrite docs/openapi.json after changing a route or a model
+```
 
 ```bash
 make lint typecheck test
@@ -492,7 +258,8 @@ code maps.
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright
 (the service and the SDK), the migrations up, down to base and up again, the suite with the
-coverage floor, the SDK's suite at 100% line and branch coverage, and a diff
+coverage floor, the SDK's suite at 100% line and branch coverage, the examples, the link
+check, and a diff
 of `docs/openapi.json` against the document the code generates, against PostgreSQL 16 with
 `agent-contracts` checked out beside this repository. The OpenAPI document embeds the
 contracts' models, so it is regenerated whenever `agent-contracts` changes them.

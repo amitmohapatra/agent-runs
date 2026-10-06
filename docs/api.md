@@ -22,43 +22,9 @@ named by its operation id (`runs.start` is `RunsClient.start`, `schedules.fire` 
 retries what is safe to retry; its `Worker` implements the claim, heartbeat and release
 semantics of [Runs](#runs).
 
-0.3.0 changed the wire in place (its consumers are the platform's own repositories): errors
-are problems instead of `{"detail": …}`, listings page with `cursor` and `Link`, and the
-limits, the rate limit and the repeat semantics below are new.
-
-0.3.1 keeps every shape and changes what happens: a run's own `deadline` is enforced (the
-ticker ends it `TIMEOUT`); only lapsed leases count toward failing a run, not answers; the
-very same resolution repeated answers the run instead of `409`; an answer that does not fit
-its question, and a question whose `expects` is no JSON Schema, are `422`. The SDK's
-`Worker` ends a run whose handler raised as `ERROR` at once.
-
-0.3.2 adds to the wire without changing a shape (trellis-contracts 0.5.1): a run's
-working-time limit (`RunStart.timeout_seconds`, and `RUNS__RUNS__MAX_RUN_SECONDS`), its
-working time (`RunRecord.worked_seconds`) and `agent_version`; the lease's `remaining_seconds`
-and `cancel_requested`; `POST /v1/runs/{id}/cancel` and `POST /v1/runs/{id}/release`; a
-queued run's retryable `ERROR` retried later, and a lapsed lease requeued after a backoff;
-webhook dead letters (`GET /v1/webhooks/deliveries`, `…/redeliver`), secret rotation
-(`POST /v1/webhooks/{id}/rotate-secret`, two signatures during the overlap) and the address
-guard on subscription URLs.
-
-0.4.0 adds to the wire (trellis-contracts 0.6, ADR 0006 there): interrupts offer labelled
-options (`{value, label, description}`, plain strings still valid), several picks
-(`multiple`), form widget hints (`ui_schema`) and the asker's own screen (`component`,
-`props`), and every answer is checked against them; a resolution carries a `comment` and how
-far an approval reaches (`remember`). A run has a `priority` and a `concurrency_key` that a
-claim honours, a platform key may claim from every tenant (a fair share), and the operator
-may cap a tenant's running runs. A run's events are kept and served from any replica
-(`POST`/`GET /v1/runs/{id}/events`, `GET …/events/stream`). `GET /v1/runs` takes
-`top_level`. A schedule's `timeout_seconds` and `agent_version` go into every run it fires.
-The rate limit is one budget per tenant shared by every replica, and an operator may set a
-run retention. Every new field has a default that keeps the old behaviour; a run store on
-0.3 refuses a body that sets one (the contracts' models refuse unknown fields), so the
-service moves first.
-
-With trellis-contracts 0.6.1 (ADR 0007 there) a schedule carries everything a started run
-can: it also takes `priority` and `concurrency_key`, copied into every run it fires, and its
-`metadata` goes into each fired run's metadata under the fire's own keys, which win on
-conflict. A `PATCH` changes them like any other field.
+What changed on the wire in each version, and what a caller must do about it:
+[CHANGELOG.md](../CHANGELOG.md). Which versions of the other repos go with this one:
+[versioning.md](versioning.md).
 
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
