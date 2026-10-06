@@ -134,6 +134,40 @@ async def test_a_fired_run_takes_the_schedules_working_time_limit_and_agent_vers
     assert run["timeout_seconds"] is None and run["agent_version"] is None
 
 
+async def test_a_fired_run_takes_the_schedules_queue_order_and_metadata(app, client) -> None:
+    # what a started run can carry, a scheduled one carries: the harness keeps a run's
+    # selection and framework options in its metadata
+    meta = {"selection": {"without": ["memory"]}, "schedule_id": "sch_forged", "team": "ops"}
+    body = scheduled(priority=10, concurrency_key="digest:acme", metadata=meta)
+    schedule = (await client.post("/v1/schedules", json=body)).json()
+    assert (schedule["priority"], schedule["concurrency_key"]) == (10, "digest:acme")
+    sid = schedule["schedule_id"]
+    fired = (await client.post(f"/v1/schedules/{sid}/fire")).json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    assert (run["priority"], run["concurrency_key"]) == (10, "digest:acme")
+    assert run["metadata"]["selection"] == {"without": ["memory"]}
+    assert run["metadata"]["team"] == "ops"
+    # the fire's own keys win: a schedule cannot pass its run off as another's fire
+    assert run["metadata"]["schedule_id"] == sid
+    assert run["metadata"]["created_by"] == "user_ada"
+    # an update changes what the next fire copies; null removes the key
+    changed = await client.patch(
+        f"/v1/schedules/{sid}", json={"priority": -5, "concurrency_key": None}
+    )
+    assert (changed.json()["priority"], changed.json()["concurrency_key"]) == (-5, None)
+    again = (await client.post(f"/v1/schedules/{sid}/fire")).json()
+    run = (await client.get(f"/v1/runs/{again['run_id']}")).json()
+    assert (run["priority"], run["concurrency_key"]) == (-5, None)
+    for refused in ({"priority": 1001}, {"concurrency_key": ""}, {"priority": None}):
+        assert (await client.patch(f"/v1/schedules/{sid}", json=refused)).status_code == 422
+    assert (await client.post("/v1/schedules", json=scheduled(priority=-1001))).status_code == 422
+    # a schedule that sets neither fires runs at priority 0 with no key
+    plain = (await client.post("/v1/schedules", json=scheduled())).json()
+    fired = (await client.post(f"/v1/schedules/{plain['schedule_id']}/fire")).json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    assert run["priority"] == 0 and run["concurrency_key"] is None
+
+
 async def test_on_behalf_of_is_required_and_not_blank(client) -> None:
     body = scheduled()
     body.pop("on_behalf_of")

@@ -55,6 +55,11 @@ run retention. Every new field has a default that keeps the old behaviour; a run
 0.3 refuses a body that sets one (the contracts' models refuse unknown fields), so the
 service moves first.
 
+With trellis-contracts 0.6.1 (ADR 0007 there) a schedule carries everything a started run
+can: it also takes `priority` and `concurrency_key`, copied into every run it fires, and its
+`metadata` goes into each fired run's metadata under the fire's own keys, which win on
+conflict. A `PATCH` changes them like any other field.
+
 Every response carries `X-Request-ID`: the caller's when it sent one that is an id (a letter
 or digit, then letters, digits and `._:-`, at most 200 characters), else a generated
 `req_…`.
@@ -652,11 +657,16 @@ Body: a `ScheduleSpec` (`created_by` is refused; it is the key's principal):
 {"tenant_id": "acme", "agent_id": "briefing", "name": "morning briefing",
  "cadence": "0 8 * * 1-5", "timezone": "Europe/Berlin", "on_behalf_of": "user_ada",
  "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true,
- "timeout_seconds": 600, "agent_version": "2026.10.05-3f2a1c", "metadata": {}}
+ "timeout_seconds": 600, "agent_version": "2026.10.05-3f2a1c", "priority": 0,
+ "concurrency_key": null, "metadata": {}}
 ```
 
-`timeout_seconds` and `agent_version` (optional) are copied into the `RunStart` of every run
-the schedule fires: its working-time limit and which code set the schedule up.
+`timeout_seconds`, `agent_version`, `priority` and `concurrency_key` (optional) are copied
+into the `RunStart` of every run the schedule fires: its working-time limit, which code set
+the schedule up, and how its runs wait their turn on the queue (as on `POST /v1/runs`).
+`metadata` is copied into each fired run's `metadata`, under the fire's own keys
+(`schedule_id`, `schedule_name`, `fire_time`, `created_by`), which win on conflict; a
+scheduled run so carries whatever a caller keeps there for a started one.
 
 `cadence` is `hourly | daily | weekly | weekdays | manual` (local midnight; weekly on Monday;
 `manual` never fires on its own) or a cron expression firing at most once an hour.
@@ -681,7 +691,8 @@ deleting one needs a key that may act as its `on_behalf_of` (`404` before `403`)
 ### `PATCH /v1/schedules/{id}` → `Schedule`
 
 Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, timeout_seconds,
-agent_version, metadata` (`metadata` is merged; `null` removes a limit or a version). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
+agent_version, priority, concurrency_key, metadata` (`metadata` is merged; `null` removes a
+limit, a version or a concurrency key; `priority` takes a number, not `null`). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
 cadence or zone re-arms the next fire. A change that would give the schedule the identity of
 another one is `409`.
 
@@ -694,7 +705,8 @@ firing from the next occurrence it can still honour, never the backlog.
 Body (optional): `{"at": "2026-10-01T06:00:00Z"}`, an instant that has arrived (`422` for one
 more than a minute ahead, or without an offset). Without it, the fire is for the tick the
 schedule is due for, else for now. Queues the run (`QUEUED`, `idempotency_key =
-"<schedule_id>@<fire_time UTC ISO>"`, metadata `schedule_id`, `schedule_name`, `fire_time`,
+"<schedule_id>@<fire_time UTC ISO>"`, the schedule's limits, version, priority and
+concurrency key, and its metadata under `schedule_id`, `schedule_name`, `fire_time`,
 `created_by`) and advances the schedule:
 
 ```json

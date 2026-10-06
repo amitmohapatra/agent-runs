@@ -52,6 +52,18 @@ class ScheduleUpdate(BaseModel):
         max_length=128,
         description="The agent version its runs record; null removes it.",
     )
+    priority: int | None = Field(
+        default=None,
+        ge=-1000,
+        le=1000,
+        description="The claim order of the runs it fires, -1000 to 1000 (higher first).",
+    )
+    concurrency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="The concurrency key of the runs it fires; null removes it.",
+    )
     metadata: dict[str, Any] | None = Field(
         default=None, description="Merged into the schedule's metadata."
     )

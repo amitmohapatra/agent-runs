@@ -302,7 +302,7 @@ sequenceDiagram
   end
 
   W->>A: POST /v1/runs/claim
-  A-->>W: 200 Claimed (metadata: schedule_id, schedule_name, fire_time, created_by)
+  A-->>W: 200 Claimed (metadata: the schedule's, then schedule_id, schedule_name, fire_time, created_by)
 ```
 
 Two tickers on one tick both see the schedule; `SKIP LOCKED` gives it to one, and the
@@ -423,13 +423,15 @@ erDiagram
     boolean enabled
     float timeout_seconds "copied into every fired run"
     varchar agent_version "copied into every fired run"
+    int priority "copied into every fired run"
+    varchar concurrency_key "copied into every fired run"
     timestamptz next_fire_at
     timestamptz last_fired_at
     varchar last_run_id
     int consecutive_failures
     jsonb last_error
     timestamptz retry_after "backoff gate after a retryable failure"
-    jsonb schedule_metadata
+    jsonb schedule_metadata "under the fire's keys in every fired run"
     timestamptz created_at
     timestamptz updated_at
   }
@@ -493,7 +495,7 @@ and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run 
 `3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation,
 `5e1f6a7b8c9d` schedules' run limits, `6a2b7c8d9e0f` run priority and concurrency key,
 `7b3c8d9e0f1a` shared rate-limit budgets, `8c4d9e0f1a2b` run events, `9d5e0f1a2b3c` run
-retention. Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
+retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key. Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 
