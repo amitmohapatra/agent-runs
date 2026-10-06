@@ -26,18 +26,35 @@ from typing import Any, Final, Self
 
 import httpx
 from trellis.contracts.errors import AgentError
-from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStart, RunStatus
+from trellis.contracts.runs import (
+    Interrupt,
+    InterruptResolution,
+    RunEvent,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
+from trellis.runs import _transport
 from trellis.runs._transport import (
     NO_CONTENT,
     PAGE_LIMIT,
     RETRIES,
     TIMEOUT_SECONDS,
     Transport,
+    backoff,
     worker_params,
 )
 from trellis.runs.artifacts import ArtifactsAPI
-from trellis.runs.errors import ConflictError, LeaseLostError
-from trellis.runs.models import Claimed, Lease, Page, ResolutionEntry, RunSummary
+from trellis.runs.errors import ConflictError, DependencyUnavailableError, LeaseLostError
+from trellis.runs.models import (
+    Claimed,
+    EventsAppended,
+    Lease,
+    Page,
+    ResolutionEntry,
+    RunEventEntry,
+    RunSummary,
+)
 from trellis.runs.schedules import SchedulesAPI
 from trellis.runs.webhooks import WebhooksAPI
 
@@ -100,8 +117,11 @@ class RunsClient:
         lease_seconds: int = LEASE_SECONDS,
         tenant: str | None = None,
     ) -> Claimed | None:
-        """Lease the oldest queued run of ``agent_ids`` to ``worker_id`` (it is now
-        ``RUNNING``), or None when nothing is queued."""
+        """Lease the next queued run of ``agent_ids`` to ``worker_id`` (it is now
+        ``RUNNING``), or None when none may run now: the highest ``priority``, then the
+        oldest, among the runs with room under their ``concurrency_key``. A platform key with
+        no ``tenant`` (here or on the client) claims from every tenant's queue, the tenant
+        whose workers hold the fewest runs first; the run names its tenant."""
         body = {"worker_id": worker_id, "agent_ids": [*agent_ids], "lease_seconds": lease_seconds}
         response = await self._transport.send("POST", "/v1/runs/claim", tenant=tenant, json=body)
         if response.status_code == NO_CONTENT:
@@ -248,18 +268,21 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        top_level: bool = False,
         cursor: str | None = None,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
     ) -> Page[RunSummary]:
         """One page of the tenant's runs, newest first. ``status=PAUSED`` with ``assignee``
-        is the inbox of a person or role."""
+        is the inbox of a person or role; ``top_level=True`` leaves out the runs other runs
+        started (a paused sub-agent shows as its parent only)."""
         filters = {
             "status": status.value if status is not None else None,
             "assignee": assignee,
             "agent_id": agent_id,
             "thread_id": thread_id,
             "parent_run_id": parent_run_id,
+            "top_level": "true" if top_level else None,
             "cursor": cursor,
         }
         params = {name: value for name, value in filters.items() if value is not None}
@@ -278,6 +301,7 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        top_level: bool = False,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
         max_pages: int | None = None,
@@ -293,6 +317,7 @@ class RunsClient:
                 agent_id=agent_id,
                 thread_id=thread_id,
                 parent_run_id=parent_run_id,
+                top_level=top_level,
                 cursor=cursor,
                 limit=limit,
                 tenant=tenant,
@@ -323,6 +348,77 @@ class RunsClient:
         return Page[ResolutionEntry](
             items=[ResolutionEntry.model_validate(row) for row in rows], next_cursor=after
         )
+
+    # ------------------------------------------------------------------ events
+    async def append_events(
+        self,
+        run_id: str,
+        events: Sequence[RunEvent],
+        *,
+        worker_id: str | None = None,
+        tenant: str | None = None,
+    ) -> EventsAppended:
+        """Add the run's events to its log, in order, while it runs. ``worker_id`` fences the
+        write to the lease holder (:class:`LeaseLostError` otherwise); a run in the caller's
+        own process names none. Safe to retry: an event already logged (its ``attempt`` and
+        ``sequence``) is not added again. Append before pausing or finishing the run."""
+        body = {"events": [event.model_dump(mode="json") for event in events]}
+        data = await self._transport.json(
+            "POST",
+            f"/v1/runs/{run_id}/events",
+            tenant=tenant,
+            json=body,
+            params=worker_params(worker_id),
+        )
+        return EventsAppended.model_validate(data)
+
+    async def events(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        limit: int = PAGE_LIMIT,
+        tenant: str | None = None,
+    ) -> list[RunEventEntry]:
+        """The run's events past position ``after``, oldest first, at most ``limit``; pass the
+        last ``position`` back as ``after`` for the next ones."""
+        data = await self._transport.json(
+            "GET",
+            f"/v1/runs/{run_id}/events",
+            tenant=tenant,
+            params={"after": after, "limit": limit},
+        )
+        return [RunEventEntry.model_validate(entry) for entry in data]
+
+    async def stream_events(
+        self, run_id: str, *, after: int = 0, tenant: str | None = None
+    ) -> AsyncIterator[RunEventEntry]:
+        """Every event of the run past ``after``, then each one as it is appended (from
+        whichever replica), until the run has ended and its last event came. A dropped
+        connection, or a stream the service ended to bound its length, is opened again from
+        the last position yielded; ``max_retries`` connection failures in a row raise
+        :class:`DependencyUnavailableError`."""
+        failures = 0
+        while True:
+            try:
+                async for name, data in self._transport.events(
+                    f"/v1/runs/{run_id}/events/stream", tenant=tenant, params={"after": after}
+                ):
+                    if name == "end":
+                        return
+                    entry = RunEventEntry.model_validate_json(data)
+                    after, failures = entry.position, 0
+                    yield entry
+            except httpx.TransportError as exc:
+                if failures >= self._transport.max_retries:
+                    raise DependencyUnavailableError(
+                        f"agent-runs events of {run_id} unreachable: {type(exc).__name__}: {exc}",
+                        code="DEPENDENCY_UNAVAILABLE",
+                        status=0,
+                        retryable=True,
+                    ) from exc
+                await _transport._sleep(backoff(failures, None))
+                failures += 1
 
     # ------------------------------------------------------------------ ops
     async def live(self) -> dict[str, str]:

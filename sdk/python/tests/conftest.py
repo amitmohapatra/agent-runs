@@ -213,7 +213,7 @@ class OpenAPI:
             return []
         if media not in content:
             return [f"{where}: answers {media}, documented {sorted(content)}"]
-        if media == "text/plain":
+        if media in ("text/plain", "text/event-stream"):
             return []
         return self.check(where, content[media]["schema"], response.json())
 

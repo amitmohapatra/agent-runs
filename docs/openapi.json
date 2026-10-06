@@ -417,6 +417,48 @@
         "title": "ErrorCode",
         "type": "string"
       },
+      "EventsAppend": {
+        "additionalProperties": false,
+        "description": "Events of the run, to add to its log in this order. Each names the run and its tenant;\none already in the log (the same ``attempt`` and ``sequence``) is not added again, so a\nretried append is harmless.",
+        "properties": {
+          "events": {
+            "description": "The events, 1 to 500, in the order they happened.",
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "EventsAppend",
+        "type": "object"
+      },
+      "EventsAppended": {
+        "description": "What an append did.",
+        "properties": {
+          "appended": {
+            "description": "Events added (repeats of logged ones are not).",
+            "title": "Appended",
+            "type": "integer"
+          },
+          "position": {
+            "description": "The position of the run's last event now; 0 for none.",
+            "title": "Position",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended",
+          "position"
+        ],
+        "title": "EventsAppended",
+        "type": "object"
+      },
       "FireRequest": {
         "additionalProperties": false,
         "description": "Fire now, for the tick ``at`` (an instant that has arrived). ``at`` is half of the\nidempotency key: a repeat for the same instant returns the run the first fire queued.\nWithout it a fire is for the tick the schedule is due for, else for now (a manual\n\"run it again\", where two clicks are two runs).",
@@ -517,7 +559,7 @@
       },
       "Interrupt": {
         "additionalProperties": false,
-        "description": "The framework-neutral record of a paused run: what is asked, what shape an answer\ntakes, what the UI needs, who must answer by when, and the tool call under approval when\nthere is one. Surfaces translate it (AG-UI ``RunFinished{outcome: interrupt}``, A2A\n``input-required``, a webhook) and the run store keeps it as ``awaiting``.\n\n``ui`` is the control a surface renders; ``assignee`` is a principal (``user:u1``,\n``role:procurement``) an inbox is filtered by; past ``deadline`` the run goes to\n``escalate_to``, or times out when nobody is named. Data too large to travel with the\nquestion (a table, a diff) goes by reference in ``payload_ref``.",
+        "description": "The framework-neutral record of a paused run: what is asked, what shape an answer\ntakes, what the UI needs, who must answer by when, and the tool call under approval when\nthere is one. Surfaces translate it (AG-UI ``RunFinished{outcome: interrupt}``, A2A\n``input-required``, a webhook) and the run store keeps it as ``awaiting``.\n\n``ui`` is the control a surface renders; ``component`` names the asker's own screen, which\na surface that has it renders instead (with ``props`` as they are), ``ui`` staying the\nfallback; ``ui_schema`` gives widget hints for the form ``expects`` describes.\n``options`` are plain strings or :class:`Option` objects; with ``multiple`` the answer is a\nlist of their values. ``assignee`` is a principal (``user:u1``, ``role:procurement``) an\ninbox is filtered by; past ``deadline`` the run goes to ``escalate_to``, or times out when\nnobody is named. Data too large to travel with the question (a table, a diff) goes by\nreference in ``payload_ref``.",
         "properties": {
           "assignee": {
             "anyOf": [
@@ -534,6 +576,23 @@
               "role:procurement"
             ],
             "title": "Assignee"
+          },
+          "component": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name of the asker's own screen, rendered instead of ui by a surface that has it; needs no expects, but an answer still fits expects when given.",
+            "examples": [
+              "refund-review"
+            ],
+            "title": "Component"
           },
           "created_at": {
             "description": "When the run paused (ISO 8601, timezone-aware; UTC unless given).",
@@ -595,10 +654,32 @@
             "title": "Interrupt Id",
             "type": "string"
           },
+          "multiple": {
+            "default": false,
+            "description": "Whether several may be picked: the answer is then a list of distinct option values (or what expects describes); needs options or expects.",
+            "title": "Multiple",
+            "type": "boolean"
+          },
           "options": {
-            "description": "Choices offered, in display order; required (non-empty) for CHOICE.",
+            "description": "Choices offered, in display order: plain strings or Option objects (value, label, description), with distinct values; required (non-empty) for CHOICE.",
+            "examples": [
+              [
+                "EU",
+                {
+                  "label": "United States",
+                  "value": "us"
+                }
+              ]
+            ],
             "items": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/Option"
+                }
+              ]
             },
             "title": "Options",
             "type": "array"
@@ -626,6 +707,19 @@
               }
             ],
             "description": "Reference to data too large to travel with the question (a table, a diff), stored as a run artifact."
+          },
+          "props": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Data for component, passed to it as is and never interpreted (JSON object, unredacted); needs component.",
+            "title": "Props"
           },
           "question": {
             "description": "What the person is asked, shown as is; must not be blank.",
@@ -663,7 +757,7 @@
           },
           "ui": {
             "default": "approve",
-            "description": "Control a surface renders: approve (yes/no), form (fields shaped by expects), table, diff, or choice (one of options).",
+            "description": "Control a surface renders: approve (yes/no), form (fields shaped by expects), table, diff, or choice (one of options); the fallback when component is set.",
             "enum": [
               "approve",
               "form",
@@ -673,6 +767,26 @@
             ],
             "title": "Ui",
             "type": "string"
+          },
+          "ui_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Widget hints for the form expects describes, in the react-jsonschema-form uiSchema convention; None for the surface's defaults.",
+            "examples": [
+              {
+                "reason": {
+                  "ui:widget": "textarea"
+                }
+              }
+            ],
+            "title": "Ui Schema"
           }
         },
         "required": [
@@ -714,6 +828,22 @@
             "description": "The answer to a question, any JSON value shaped by the interrupt's expects; None for a decision about a tool call.",
             "title": "Answer"
           },
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The reviewer's remark on the decision, whatever it is; carried into the feedback record. None for none.",
+            "examples": [
+              "Fine this once; refunds over EUR 500 need finance."
+            ],
+            "title": "Comment"
+          },
           "decision": {
             "$ref": "#/components/schemas/InterruptDecision",
             "description": "What was decided. EDIT carries the edited arguments in payload."
@@ -735,6 +865,16 @@
             ],
             "description": "For EDIT, the tool call's edited arguments (required, non-empty); otherwise optional extra data.",
             "title": "Payload"
+          },
+          "remember": {
+            "default": "once",
+            "description": "once: the decision covers this call only. run: approve calls like it for the rest of the run without asking again (APPROVE of a tool call only).",
+            "enum": [
+              "once",
+              "run"
+            ],
+            "title": "Remember",
+            "type": "string"
           },
           "resolved_at": {
             "description": "When it was answered (ISO 8601, timezone-aware; UTC unless given).",
@@ -815,6 +955,52 @@
           "expires_at"
         ],
         "title": "Lease",
+        "type": "object"
+      },
+      "Option": {
+        "additionalProperties": false,
+        "description": "One choice an interrupt offers. ``value`` is what an answer that picks it carries;\n``label`` and ``description`` are what a person sees. A plain string among\n``Interrupt.options`` is an option whose value is that string, shown as it is.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A longer explanation shown with the label; None for none.",
+            "title": "Description"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What a person sees for it; None shows the value.",
+            "examples": [
+              "Europe (Frankfurt)"
+            ],
+            "title": "Label"
+          },
+          "value": {
+            "description": "What an answer that picks this option carries; not blank.",
+            "examples": [
+              "eu"
+            ],
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "Option",
         "type": "object"
       },
       "Problem": {
@@ -1013,6 +1199,23 @@
             ],
             "title": "Agent Version"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
+          },
           "deadline": {
             "anyOf": [
               {
@@ -1074,6 +1277,17 @@
             ],
             "description": "Run that started this one as a nested agent run; None for a top-level run.",
             "title": "Parent Run Id"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "queue": {
             "default": false,
@@ -1154,6 +1368,180 @@
         "title": "RunCreate",
         "type": "object"
       },
+      "RunEvent": {
+        "additionalProperties": false,
+        "description": "One event of a run's stream. ``sequence`` orders events within an attempt of a run\n(a sink may receive them out of order and dedupes on run, attempt and sequence);\n``tenant_id`` is what a hub fans out by, never the caller-chosen ``thread_id`` alone;\n``data`` carries the type's payload as the surface renders it (text delta, tool\narguments, state patch, the interrupt) and is unredacted.",
+        "properties": {
+          "attempt": {
+            "default": 1,
+            "description": "1-based attempt of the run that emitted the event.",
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "data": {
+            "additionalProperties": true,
+            "description": "The type's payload as a surface renders it (text delta, tool arguments, state patch, the interrupt); unredacted JSON object.",
+            "title": "Data",
+            "type": "object"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The failure a RUN_ERROR or a failed RUN_FINISHED reports; None otherwise."
+          },
+          "event_id": {
+            "description": "Event id, 'evt_' plus 32 hex characters unless given.",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Message the text belongs to; required on TEXT_MESSAGE_* events.",
+            "title": "Message Id"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the run finished; required on RUN_FINISHED and refused on any other type."
+          },
+          "run_id": {
+            "description": "Id of the run that emitted the event.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "sequence": {
+            "description": "0-based position within the run's attempt; sinks order and dedupe on run_id, attempt and sequence.",
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name of the step a STEP_STARTED or STEP_FINISHED event marks; None for other events.",
+            "title": "Step"
+          },
+          "tenant_id": {
+            "description": "Tenant of the run; what a hub fans events out by.",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Conversation thread of the run; None outside one.",
+            "title": "Thread Id"
+          },
+          "timestamp": {
+            "description": "When the event was emitted (ISO 8601, timezone-aware; UTC unless given).",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tool call the event belongs to; required on TOOL_CALL_* events.",
+            "title": "Tool Call Id"
+          },
+          "type": {
+            "$ref": "#/components/schemas/RunEventType",
+            "description": "Event type: AG-UI's spelling, plus the platform's CONTEXT_LOADED and INTERRUPT."
+          }
+        },
+        "required": [
+          "type",
+          "tenant_id",
+          "run_id",
+          "sequence"
+        ],
+        "title": "RunEvent",
+        "type": "object"
+      },
+      "RunEventEntry": {
+        "description": "One event of a run's log and its place in it.",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/RunEvent",
+            "description": "The event, as it was appended."
+          },
+          "position": {
+            "description": "The event's place in the run's log, from 1: what `after` and `Last-Event-ID` name.",
+            "title": "Position",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "position",
+          "event"
+        ],
+        "title": "RunEventEntry",
+        "type": "object"
+      },
+      "RunEventType": {
+        "description": "The event vocabulary every surface speaks. The AG-UI names are spelled as AG-UI\nspells them; ``CONTEXT_LOADED`` and ``INTERRUPT`` are the platform's own, which an AG-UI\ntransport carries as ``CUSTOM`` events.",
+        "enum": [
+          "RUN_STARTED",
+          "RUN_FINISHED",
+          "RUN_ERROR",
+          "STEP_STARTED",
+          "STEP_FINISHED",
+          "TEXT_MESSAGE_START",
+          "TEXT_MESSAGE_CONTENT",
+          "TEXT_MESSAGE_END",
+          "TOOL_CALL_START",
+          "TOOL_CALL_ARGS",
+          "TOOL_CALL_END",
+          "TOOL_CALL_RESULT",
+          "STATE_SNAPSHOT",
+          "STATE_DELTA",
+          "MESSAGES_SNAPSHOT",
+          "CONTEXT_LOADED",
+          "INTERRUPT",
+          "RAW",
+          "CUSTOM"
+        ],
+        "title": "RunEventType",
+        "type": "string"
+      },
       "RunFinish": {
         "additionalProperties": false,
         "description": "How a run ended. The contracts decide which endings may carry an ``error``.",
@@ -1183,6 +1571,20 @@
         ],
         "title": "RunFinish",
         "type": "object"
+      },
+      "RunOutcome": {
+        "description": "How a run finished, as ``RUN_FINISHED`` reports it. Lower case because AG-UI's\n``RunFinished.outcome`` spells ``success`` and ``interrupt`` that way; the rest are the\nplatform's endings in the same case, and an AG-UI transport reports ``error``,\n``rejected``, ``cancelled`` and ``timeout`` as ``RUN_ERROR``.",
+        "enum": [
+          "success",
+          "partial",
+          "error",
+          "rejected",
+          "interrupt",
+          "cancelled",
+          "timeout"
+        ],
+        "title": "RunOutcome",
+        "type": "string"
       },
       "RunPause": {
         "additionalProperties": false,
@@ -1269,6 +1671,23 @@
             ],
             "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; never on a final run. Size bounded by the service.",
             "title": "Checkpoint"
+          },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
           },
           "created_at": {
             "description": "When the run was created (ISO 8601, timezone-aware; UTC unless given).",
@@ -1363,6 +1782,17 @@
             ],
             "description": "Run that started this one as a nested agent run; None for a top-level run.",
             "title": "Parent Run Id"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "run_id": {
             "description": "Run id: the caller's context agent_run_id, or 'run_' plus 32 hex characters minted here.",
@@ -1548,6 +1978,22 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that set the schedule, copied into each fired run's RunStart.agent_version; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
+          },
           "cadence": {
             "description": "When it fires: a cron expression or a named bucket (hourly, daily, weekly, weekdays, manual), evaluated in timezone.",
             "examples": [
@@ -1690,6 +2136,22 @@
             "title": "Tenant Id",
             "type": "string"
           },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time each fired run may take, in seconds, copied into its RunStart.timeout_seconds; None: no limit of its own.",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
+          },
           "timezone": {
             "default": "UTC",
             "description": "IANA time zone the cadence is evaluated in.",
@@ -1731,12 +2193,28 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider.",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``\nand ``agent_version`` are copied into the :class:`RunStart` of every fire.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
             "title": "Agent Id",
             "type": "string"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Version of the agent's code that set the schedule, copied into each fired run's RunStart.agent_version; None when not known.",
+            "examples": [
+              "2026.10.05-3f2a1c"
+            ],
+            "title": "Agent Version"
           },
           "cadence": {
             "description": "When it fires: a cron expression or a named bucket (hourly, daily, weekly, weekdays, manual), evaluated in timezone.",
@@ -1786,6 +2264,22 @@
             "title": "Tenant Id",
             "type": "string"
           },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Most working time each fired run may take, in seconds, copied into its RunStart.timeout_seconds; None: no limit of its own.",
+            "examples": [
+              600
+            ],
+            "title": "Timeout Seconds"
+          },
           "timezone": {
             "default": "UTC",
             "description": "IANA time zone the cadence is evaluated in.",
@@ -1834,6 +2328,19 @@
             ],
             "description": "Fire runs of this agent instead.",
             "title": "Agent Id"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent version its runs record; null removes it.",
+            "title": "Agent Version"
           },
           "cadence": {
             "anyOf": [
@@ -1887,6 +2394,19 @@
             ],
             "description": "A new label (need not be unique).",
             "title": "Name"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The working-time limit of the runs it fires, in seconds; null removes it.",
+            "title": "Timeout Seconds"
           },
           "timezone": {
             "anyOf": [
@@ -2147,13 +2667,13 @@
       "name": "agent-runs",
       "url": "https://github.com/amitmohapatra/agent-runs"
     },
-    "description": "\nDurable agent runs, the worker queue, the human inbox, and the schedules that start runs.\nThis service never executes an agent: a harness does, in its own process or as a worker\nclaiming queued runs, and records here what happened.\n\n### Authentication\nEvery `/v1` route needs `X-API-Key` (any case), a key issued by the Memory Service, which\nagent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key names the\ntenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own\ntenant. The `ops` routes need no key.\n\nReading is tenant-wide for every key. Answering a paused run (`resume`) and cancelling a run\n(`cancel`) are not: an admin or platform key, or one that may act for anyone (`*` in\n`may_act_as`, the default), answers or cancels any run; a key restricted to listed people only\na run assigned to one of them or to nobody (never one assigned to a group).\n\n### Errors\nEvery error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on\n`code`. `LEASE_LOST` (409) tells a worker it no longer holds the run's lease: stop working the\nrun. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503) and\n`RATE_LIMIT` (429) are retryable after `Retry-After` seconds.\n\n### Retries\nStarting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause`,\n`finish` or `release` by the caller that made it answers the stored run, a repeated `resume`\nwith the very same resolution answers the run as it is now, and a repeated `cancel` answers the\nrun as it is; claims and heartbeats are safe to repeat. A client may retry transport errors,\n429, 502, 503 and 504. agent-runs retries on its own too: a queued run its worker ends `ERROR`\nwith a retryable error goes back on the queue after a backoff (at most 3 times), a run whose\nlease lapsed after a short one, and a webhook delivery takes up to 7 attempts before it is kept\nas dead.\n\n### Pages\nEvery listing takes `cursor` and `limit` and answers `Link: <url>; rel=\"next\"` when there is\nmore; the bodies are bare arrays.\n\n### Limits\nJSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint\n1 MiB, an artifact 50 MiB. Each tenant's requests draw on a per-process token bucket\n(`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).\n",
+    "description": "\nDurable agent runs, the worker queue, the human inbox, and the schedules that start runs.\nThis service never executes an agent: a harness does, in its own process or as a worker\nclaiming queued runs, and records here what happened.\n\n### Authentication\nEvery `/v1` route needs `X-API-Key` (any case), a key issued by the Memory Service, which\nagent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key names the\ntenant it acts for in `X-Trellis-Tenant` (on a claim it may leave it out, and claims from every\ntenant's queue, sharing the fleet fairly); a tenant key may send that header only with its own\ntenant. The `ops` routes need no key.\n\nReading is tenant-wide for every key. Answering a paused run (`resume`) and cancelling a run\n(`cancel`) are not: an admin or platform key, or one that may act for anyone (`*` in\n`may_act_as`, the default), answers or cancels any run; a key restricted to listed people only\na run assigned to one of them or to nobody (never one assigned to a group).\n\n### Errors\nEvery error is an RFC 9457 problem (`application/problem+json`, schema `Problem`): branch on\n`code`. `LEASE_LOST` (409) tells a worker it no longer holds the run's lease: stop working the\nrun. `CONFLICT` (409) is any other state conflict. `DEPENDENCY_UNAVAILABLE` (503) and\n`RATE_LIMIT` (429) are retryable after `Retry-After` seconds.\n\n### Retries\nStarting a run is idempotent on its `run_id` and its `idempotency_key`; a repeated `pause`,\n`finish` or `release` by the caller that made it answers the stored run, a repeated `resume`\nwith the very same resolution answers the run as it is now, and a repeated `cancel` answers the\nrun as it is; claims and heartbeats are safe to repeat. A client may retry transport errors,\n429, 502, 503 and 504. agent-runs retries on its own too: a queued run its worker ends `ERROR`\nwith a retryable error goes back on the queue after a backoff (at most 3 times), a run whose\nlease lapsed after a short one, and a webhook delivery takes up to 7 attempts before it is kept\nas dead.\n\n### Queue order and events\nA claim takes the highest `priority`, then the oldest, among the queued runs with room under\ntheir `concurrency_key` and their tenant's cap. A run's events are kept with it: appended by its\nworker, read by position, and followed as server-sent events from any replica.\n\n### Pages\nEvery listing takes `cursor` and `limit` and answers `Link: <url>; rel=\"next\"` when there is\nmore; the bodies are bare arrays.\n\n### Limits\nJSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint\n1 MiB, an artifact 50 MiB. Each tenant's requests draw on one budget, shared by every\nreplica (`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).\n",
     "license": {
       "name": "Proprietary"
     },
     "summary": "Durable agent runs, the worker queue, the human inbox and schedules.",
     "title": "agent-runs",
-    "version": "0.3.2"
+    "version": "0.4.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2310,7 +2830,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -2324,7 +2844,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -2653,7 +3173,7 @@
     },
     "/v1/runs": {
       "get": {
-        "description": "This tenant's runs, newest first, as summaries; the full record is\n``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox.",
+        "description": "This tenant's runs, newest first, as summaries; the full record is\n``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox, and\n``&top_level=true`` leaves out the runs other runs started (sub-agents).",
         "operationId": "runs.list",
         "parameters": [
           {
@@ -2747,6 +3267,18 @@
             }
           },
           {
+            "description": "true: only top-level runs (no parent_run_id), so an inbox lists a paused child's parent, not the child too.",
+            "in": "query",
+            "name": "top_level",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "true: only top-level runs (no parent_run_id), so an inbox lists a paused child's parent, not the child too.",
+              "title": "Top Level",
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Opaque position of the next page, copied from the previous response's `Link: <...>; rel=\"next\"`. Omit for the first page.",
             "in": "query",
             "name": "cursor",
@@ -2780,7 +3312,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -2794,7 +3326,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3053,7 +3585,7 @@
         "operationId": "runs.start",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3067,7 +3599,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3087,6 +3619,19 @@
                     "run_id": "run_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
                     "tenant_id": "acme",
                     "thread_id": "thr_42"
+                  }
+                },
+                "ordered": {
+                  "summary": "Queue an urgent run, one at a time per customer",
+                  "value": {
+                    "agent_id": "billing",
+                    "concurrency_key": "customer:c-7",
+                    "input": {
+                      "invoice_id": "inv_1002"
+                    },
+                    "priority": 10,
+                    "queue": true,
+                    "tenant_id": "acme"
                   }
                 },
                 "queued": {
@@ -3441,11 +3986,11 @@
     },
     "/v1/runs/claim": {
       "post": {
-        "description": "Lease the oldest queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone. The run is ``RUNNING`` and the worker holds it until ``lease.expires_at``;\n``lease.remaining_seconds`` is the working time it has left.",
+        "description": "Lease the next queued run of ``agent_ids`` to ``worker_id``, or 204 when there is\nnone that may run now. The run is ``RUNNING`` and the worker holds it until\n``lease.expires_at``; ``lease.remaining_seconds`` is the working time it has left.\n\nThe next run is the one with the highest ``priority``, then the oldest, among those\nwith room: fewer than ``RUNS__RUNS__CONCURRENCY_PER_KEY`` (1) runs of the tenant\nsharing its ``concurrency_key`` are ``RUNNING``, and the tenant's workers hold fewer\nthan ``RUNS__RUNS__MAX_RUNNING_PER_TENANT`` runs (no cap unless set). A platform key\nthat sends no ``X-Trellis-Tenant`` claims from every tenant's queue, the tenant whose\nworkers hold the fewest runs of these agents first: a fair share of the fleet, with\nnothing to set. The claimed run names its tenant (``run.tenant_id``), which the\nworker's later calls send.",
         "operationId": "runs.claim",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3459,7 +4004,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -3469,7 +4014,7 @@
             "application/json": {
               "examples": {
                 "claim": {
-                  "summary": "Lease the oldest queued run of two agents",
+                  "summary": "Lease the next queued run of two agents",
                   "value": {
                     "agent_ids": [
                       "triage",
@@ -3510,7 +4055,7 @@
             }
           },
           "204": {
-            "description": "Nothing is queued for these agents; poll later.",
+            "description": "Nothing is queued for these agents that may run now; poll later.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -3770,7 +4315,7 @@
             "ApiKeyAuth": []
           }
         ],
-        "summary": "Claim the oldest queued run",
+        "summary": "Claim the next queued run",
         "tags": [
           "runs"
         ]
@@ -3793,7 +4338,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -3807,7 +4352,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -4142,7 +4687,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -4156,7 +4701,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -4570,7 +5115,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -4584,7 +5129,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -4950,6 +5495,1120 @@
         ]
       }
     },
+    "/v1/runs/{run_id}/events": {
+      "get": {
+        "description": "The run's log from position ``after`` on, from any replica. The log is read by\nposition rather than by cursor: pass the last ``position`` seen as ``after`` for the\nnext page; the stream (``/events/stream``) counts the same positions.",
+        "operationId": "runs.events",
+        "parameters": [
+          {
+            "description": "The run's id (`run_…`, or the caller's own).",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "The run's id (`run_…`, or the caller's own).",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the events past this position: the last one seen (0, the default: from the first).",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "description": "Only the events past this position: the last one seen (0, the default: from the first).",
+              "minimum": 0,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page, 1 to 500.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Items per page, 1 to 500.",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunEventEntry"
+                  },
+                  "title": "Response Runs.Events",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The run's events past `after`, oldest first, at most `limit`.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Read a run's events",
+        "tags": [
+          "runs"
+        ]
+      },
+      "post": {
+        "description": "Add the run's events (``RunEvent``: AG-UI's vocabulary, each naming this run and\ntenant, else 422) to its log, in order, each at the next position. Only while the run\nruns, fenced as a heartbeat is: by the worker holding its lease (``worker_id``), or by\nthe caller it runs in when no worker holds it; 409 otherwise. An event already logged\n(the same ``attempt`` and ``sequence``) is not added again, so a retried append is safe.\nAppend before pausing or finishing: the log takes nothing after. The log goes when the\nrun is purged.",
+        "operationId": "runs.append_events",
+        "parameters": [
+          {
+            "description": "The run's id (`run_…`, or the caller's own).",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "The run's id (`run_…`, or the caller's own).",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The worker writing, when the run is leased (a worker always sends it): refused with 409 LEASE_LOST unless it still holds the run's lease. Omitted by a run recorded in the caller's own process.",
+            "in": "query",
+            "name": "worker_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The worker writing, when the run is leased (a worker always sends it): refused with 409 LEASE_LOST unless it still holds the run's lease. Omitted by a run recorded in the caller's own process.",
+              "title": "Worker Id"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "text": {
+                  "summary": "A step and the text it streamed",
+                  "value": {
+                    "events": [
+                      {
+                        "run_id": "run_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                        "sequence": 3,
+                        "step": "draft",
+                        "tenant_id": "acme",
+                        "type": "STEP_STARTED"
+                      },
+                      {
+                        "data": {
+                          "delta": "Two invoices are overdue",
+                          "role": "assistant"
+                        },
+                        "message_id": "msg_1",
+                        "run_id": "run_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                        "sequence": 4,
+                        "tenant_id": "acme",
+                        "type": "TEXT_MESSAGE_CONTENT"
+                      }
+                    ]
+                  }
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/EventsAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsAppended"
+                }
+              }
+            },
+            "description": "How many were added, and the position of the log's last event.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "CONFLICT",
+                  "detail": "run run_01J8 cannot move from SUCCESS to CANCELLED",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 409,
+                  "title": "Conflict",
+                  "type": "urn:trellis:problem:conflict"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "LEASE_LOST: the worker no longer holds the run's lease (it lapsed and the run was requeued, or the run was paused, cancelled or finished): stop working the run. CONFLICT: the run is not in a state that allows this.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "PAYLOAD_TOO_LARGE",
+                  "detail": "the body is larger than 4194304 bytes",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 413,
+                  "title": "Payload too large",
+                  "type": "urn:trellis:problem:payload-too-large"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Append events to a run's log",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/v1/runs/{run_id}/events/stream": {
+      "get": {
+        "description": "The run's events past ``after`` (or ``Last-Event-ID``), then each new one as it is\nappended, whichever replica it was appended to. The stream ends with ``event: end``\nonce the run has ended and every event was sent; a paused run's stream stays open. A\ncomment line every 15 s keeps idle connections open, and after five minutes the\nservice ends the stream without ``end``: reconnect with the last position seen.",
+        "operationId": "runs.stream_events",
+        "parameters": [
+          {
+            "description": "The run's id (`run_…`, or the caller's own).",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "description": "The run's id (`run_…`, or the caller's own).",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the events past this position: the last one seen (0, the default: from the first).",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "description": "Only the events past this position: the last one seen (0, the default: from the first).",
+              "minimum": 0,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The last position the client saw, as a reconnecting EventSource sends it; wins over a smaller `after`.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The last position the client saw, as a reconnecting EventSource sends it; wins over a smaller `after`.",
+              "title": "Last-Event-Id"
+            }
+          },
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "A `text/event-stream`: each event as `id: <position>`, `event: <type>` and `data: <the entry as JSON>`; `event: end` with `data: {\"status\": …}` once the run has ended and its last event was sent.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "NOT_FOUND",
+                  "detail": "no run run_01J8",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 404,
+                  "title": "Not found",
+                  "type": "urn:trellis:problem:not-found"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "NOT_FOUND: no such record in this tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/runs/{run_id}/events/stream",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Follow a run's events (server-sent events)",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
     "/v1/runs/{run_id}/finish": {
       "post": {
         "description": "End the run: from ``RUNNING`` any ending; from ``QUEUED`` or ``PAUSED`` only\n``CANCELLED`` or ``TIMEOUT`` (cancelling a queued or waiting run). Repeated by the same\ncaller with the same status, it answers the stored run and changes nothing. ``output``\nis at most ``RUNS__SERVICE__MAX_PAYLOAD_BYTES`` (1 MiB) of compact JSON.",
@@ -4986,7 +6645,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -5000,7 +6659,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -5400,7 +7059,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -5414,7 +7073,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -5827,7 +7486,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -5841,7 +7500,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -6245,7 +7904,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -6259,7 +7918,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -6684,7 +8343,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -6698,7 +8357,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -7002,7 +8661,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -7016,7 +8675,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -7465,7 +9124,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -7479,7 +9138,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -7738,7 +9397,7 @@
         "operationId": "schedules.create",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -7752,7 +9411,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8131,7 +9790,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8145,7 +9804,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8433,7 +10092,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8447,7 +10106,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -8742,7 +10401,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -8756,7 +10415,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9148,7 +10807,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9162,7 +10821,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9574,7 +11233,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9588,7 +11247,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -9847,7 +11506,7 @@
         "operationId": "webhooks.create",
         "parameters": [
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -9861,7 +11520,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10273,7 +11932,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10287,7 +11946,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10559,7 +12218,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10573,7 +12232,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -10902,7 +12561,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -10916,7 +12575,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11204,7 +12863,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -11218,7 +12877,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11515,7 +13174,7 @@
             }
           },
           {
-            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
             "in": "header",
             "name": "X-Trellis-Tenant",
             "required": false,
@@ -11529,7 +13188,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own); a tenant key may send it only with its own tenant (403 otherwise).",
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
               "title": "X-Trellis-Tenant"
             }
           }
@@ -11818,7 +13477,7 @@
   ],
   "tags": [
     {
-      "description": "Recording runs, the worker queue (claim, heartbeat with progress checkpoints and the working time left, release), pausing for a person and resuming, cancelling, finishing, the inbox and each run's answered interrupts.",
+      "description": "Recording runs, the worker queue (claim by priority, concurrency key and fair share; heartbeat with progress checkpoints and the working time left; release), pausing for a person and resuming, cancelling, finishing, the inbox, each run's answered interrupts and its event log (read or streamed).",
       "name": "runs"
     },
     {

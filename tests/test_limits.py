@@ -10,9 +10,9 @@ from typing import Any
 
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
+from sqlalchemy import text
 from trellis.contracts.ids import now
 
-from agent_runs.api import ratelimit
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
@@ -226,21 +226,48 @@ async def test_no_budget_headers_when_the_limit_is_off(migrated, memory, blobs) 
             assert "x-ratelimit-limit" not in response.headers
 
 
-def test_a_bucket_refills_at_the_rate_and_holds_at_most_the_burst(monkeypatch) -> None:
-    clock = [0.0]
-    limiter = TenantRateLimiter(RateLimitSettings(per_minute=60, burst=3), clock=lambda: clock[0])
-    assert [limiter.take("acme").allowed for _ in range(4)] == [True, True, True, False]
-    assert limiter.take("acme").retry_after == 1
-    clock[0] += 1.5
-    assert limiter.take("acme").allowed and not limiter.take("acme").allowed
-    clock[0] += 3600
-    decision = limiter.take("acme")
-    assert (decision.allowed, decision.remaining) == (True, 2), "never more than the burst"
+async def _elapse(app: Any, seconds: float) -> None:
+    """What the clock would do to every budget, straight on the rows, without the wait."""
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE rate_limit_buckets SET tat = tat - make_interval(secs => :s)"),
+            {"s": seconds},
+        )
 
-    monkeypatch.setattr(ratelimit, "MAX_BUCKETS", 2)
-    for tenant in ("a", "b", "c"):
-        limiter.take(tenant)
-    assert list(limiter._buckets) == ["b", "c"], "least recently used goes first"
+
+async def test_a_budget_refills_at_the_rate_and_holds_at_most_the_burst(app) -> None:
+    limiter = TenantRateLimiter(RateLimitSettings(per_minute=60, burst=3), app.state.engine)
+    taken = [await limiter.take("acme") for _ in range(4)]
+    assert [(d.allowed, d.remaining) for d in taken] == [
+        (True, 2),
+        (True, 1),
+        (True, 0),
+        (False, 0),
+    ]
+    assert taken[-1].retry_after == 1
+    await _elapse(app, 1.5)
+    assert (await limiter.take("acme")).allowed and not (await limiter.take("acme")).allowed
+    await _elapse(app, 3600)
+    decision = await limiter.take("acme")
+    assert (decision.allowed, decision.remaining) == (True, 2), "never more than the burst"
+    slow = TenantRateLimiter(RateLimitSettings(per_minute=1, burst=1), app.state.engine)
+    assert (await slow.take("globex")).allowed
+    assert (await slow.take("globex")).retry_after == 60
+
+
+async def test_every_replica_draws_on_one_budget(migrated, memory, blobs) -> None:
+    """Two apps on one database, as two replicas (or two workers of one) are: the budget
+    one spent is spent for the other."""
+    settings = _settings(rate_limit=RateLimitSettings(per_minute=60, burst=2))
+    async with (
+        serving(settings, memory, blobs) as first,
+        serving(settings, memory, blobs) as second,
+        client_of(first) as one,
+        client_of(second) as other,
+    ):
+        assert (await one.get("/v1/runs")).status_code == 200
+        assert (await other.get("/v1/runs")).headers["x-ratelimit-remaining"] == "0"
+        assert (await one.get("/v1/runs")).status_code == 429
 
 
 # ------------------------------------------------------------------ metrics

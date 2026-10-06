@@ -293,6 +293,17 @@ async def test_children_are_listed_by_parent(client) -> None:
     assert [r["run_id"] for r in kids] == [child["run_id"]]
 
 
+async def test_an_inbox_of_top_level_runs_leaves_paused_children_out(client) -> None:
+    parent = await paused(client)
+    child = await paused(client, parent_run_id=parent["run_id"])
+    inbox = {"status": "PAUSED", "top_level": "true", "limit": 1}
+    first = await client.get("/v1/runs", params=inbox)
+    assert [r["run_id"] for r in first.json()] == [parent["run_id"]]
+    assert "link" not in first.headers, "the child is not a page further on either"
+    every = (await client.get("/v1/runs", params={"status": "PAUSED"})).json()
+    assert {r["run_id"] for r in every} == {parent["run_id"], child["run_id"]}
+
+
 async def test_one_tenant_cannot_read_or_move_another_tenants_run(client, other_tenant) -> None:
     run = await paused(client)
     rid = run["run_id"]
@@ -423,6 +434,22 @@ async def test_an_answer_to_a_choice_is_one_of_its_options(client) -> None:
     await _refused(client, run, resolution(run, "ANSWER", answer="maybe"), "not one of the options")
     chosen = resolution(run, "ANSWER", answer="no")
     assert (await client.post(f"/v1/runs/{run['run_id']}/resume", json=chosen)).status_code == 200
+
+
+async def test_several_picks_are_option_values_and_the_comment_is_kept(client) -> None:
+    labelled = [{"value": "eu", "label": "Europe"}, {"value": "us", "label": "United States"}]
+    run = await _asked(client, reason="CHOICE", ui="choice", options=labelled, multiple=True)
+    assert [option["label"] for option in run["awaiting"]["options"]] == ["Europe", "United States"]
+    assert run["awaiting"]["multiple"] is True
+    await _refused(client, run, resolution(run, "ANSWER", answer="eu"), "is not a list")
+    await _refused(client, run, resolution(run, "ANSWER", answer=["Europe"]), "not among")
+    await _refused(client, run, resolution(run, "APPROVE", remember="run"), "remembered")
+    picked = resolution(run, "ANSWER", answer=["us", "eu"], comment="both regions")
+    resumed = await client.post(f"/v1/runs/{run['run_id']}/resume", json=picked)
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["last_resolution"]["comment"] == "both regions"
+    history = (await client.get(f"/v1/runs/{run['run_id']}/resolutions")).json()
+    assert history[0]["resolution"]["answer"] == ["us", "eu"]
 
 
 async def test_a_question_whose_expects_is_no_json_schema_is_refused(client) -> None:

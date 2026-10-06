@@ -30,7 +30,8 @@ claiming queued runs, and records here what happened.
 ### Authentication
 Every `/v1` route needs `X-API-Key` (any case), a key issued by the Memory Service, which
 agent-runs introspects there (`GET /v1/keys/self`, cached 60 s). A platform key names the
-tenant it acts for in `X-Trellis-Tenant`; a tenant key may send that header only with its own
+tenant it acts for in `X-Trellis-Tenant` (on a claim it may leave it out, and claims from every
+tenant's queue, sharing the fleet fairly); a tenant key may send that header only with its own
 tenant. The `ops` routes need no key.
 
 Reading is tenant-wide for every key. Answering a paused run (`resume`) and cancelling a run
@@ -54,22 +55,28 @@ with a retryable error goes back on the queue after a backoff (at most 3 times),
 lease lapsed after a short one, and a webhook delivery takes up to 7 attempts before it is kept
 as dead.
 
+### Queue order and events
+A claim takes the highest `priority`, then the oldest, among the queued runs with room under
+their `concurrency_key` and their tenant's cap. A run's events are kept with it: appended by its
+worker, read by position, and followed as server-sent events from any replica.
+
 ### Pages
 Every listing takes `cursor` and `limit` and answers `Link: <url>; rel="next"` when there is
 more; the bodies are bare arrays.
 
 ### Limits
 JSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint
-1 MiB, an artifact 50 MiB. Each tenant's requests draw on a per-process token bucket
-(`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).
+1 MiB, an artifact 50 MiB. Each tenant's requests draw on one budget, shared by every
+replica (`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).
 """
 
 TAGS: Final[list[dict[str, Any]]] = [
     {
         "name": "runs",
-        "description": "Recording runs, the worker queue (claim, heartbeat with progress "
-        "checkpoints and the working time left, release), pausing for a person and resuming, "
-        "cancelling, finishing, the inbox and each run's answered interrupts.",
+        "description": "Recording runs, the worker queue (claim by priority, concurrency key "
+        "and fair share; heartbeat with progress checkpoints and the working time left; "
+        "release), pausing for a person and resuming, cancelling, finishing, the inbox, each "
+        "run's answered interrupts and its event log (read or streamed).",
     },
     {
         "name": "artifacts",

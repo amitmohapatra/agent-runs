@@ -56,47 +56,68 @@ API_KEY = APIKeyHeader(
 )
 
 
-async def caller(
-    request: Request,
-    api_key: Annotated[str | None, Security(API_KEY)] = None,
-    tenant: Annotated[
-        str | None,
-        Header(
-            alias=HEADER_TENANT,
-            description="The tenant this request acts in. Required with a platform key "
-            "(one with no tenant of its own); a tenant key may send it only with its own "
-            "tenant (403 otherwise).",
-            max_length=128,
-        ),
-    ] = None,
-) -> Caller:
-    """One scheme: ``X-API-Key`` is the caller and names its tenant. A platform key (no
-    tenant of its own) names the tenant it acts for in ``X-Trellis-Tenant``; a tenant key may
-    send that header only to agree with itself. The key is introspected at the Memory
-    Service's key registry (cached)."""
+@dataclass(frozen=True)
+class Claimer:
+    """Who claims, and from which queue: the tenant's, or with a platform key that names no
+    tenant, every tenant's (``tenant_id`` None), shared fairly between them."""
+
+    credential: KeyInfo
+    tenant_id: str | None
+
+
+ApiKey = Annotated[str | None, Security(API_KEY)]
+TenantHeader = Annotated[
+    str | None,
+    Header(
+        alias=HEADER_TENANT,
+        description="The tenant this request acts in. Required with a platform key (one with "
+        "no tenant of its own), except on a claim, where leaving it out claims from every "
+        "tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+        max_length=128,
+    ),
+]
+
+
+async def _acting(request: Request, api_key: str | None, tenant: str | None) -> Claimer:
+    """The key, introspected at the Memory Service's key registry (cached), and the tenant
+    it acts in: its own, or the one a platform key names (``None`` when it names none). A
+    tenant key may send ``X-Trellis-Tenant`` only to agree with itself."""
     if not api_key:
         raise Unauthorized(f"missing {HEADER_API_KEY}")
     keys: KeyRegistry = request.app.state.keys
     credential = await keys.resolve(api_key)
     if credential.tenant_id is None:
-        if not tenant:
-            raise BadRequest(f"a platform key names the tenant in {HEADER_TENANT}")
-        acting = Caller(credential, tenant)
-    elif tenant is not None and tenant != credential.tenant_id:
+        return Claimer(credential, tenant or None)
+    if tenant is not None and tenant != credential.tenant_id:
         raise Forbidden(f"{HEADER_TENANT} is not the tenant of this api key")
-    else:
-        acting = Caller(credential, credential.tenant_id)
-    _within_budget(request, acting.tenant_id)
+    return Claimer(credential, credential.tenant_id)
+
+
+async def caller(request: Request, api_key: ApiKey = None, tenant: TenantHeader = None) -> Caller:
+    """One scheme: ``X-API-Key`` is the caller and names its tenant. A platform key (no
+    tenant of its own) names the tenant it acts for in ``X-Trellis-Tenant``."""
+    acting = await _acting(request, api_key, tenant)
+    if acting.tenant_id is None:
+        raise BadRequest(f"a platform key names the tenant in {HEADER_TENANT}")
+    await _within_budget(request, acting.tenant_id)
+    return Caller(acting.credential, acting.tenant_id)
+
+
+async def claimer(request: Request, api_key: ApiKey = None, tenant: TenantHeader = None) -> Claimer:
+    """The caller of a claim: as :func:`caller`, except that a platform key may name no
+    tenant, and then claims from every tenant's queue (its budget is the key's own)."""
+    acting = await _acting(request, api_key, tenant)
+    await _within_budget(request, acting.tenant_id or f"key:{acting.credential.key_id}")
     return acting
 
 
-def _within_budget(request: Request, tenant_id: str) -> None:
+async def _within_budget(request: Request, tenant_id: str) -> None:
     """Take one of the tenant's tokens (``api/ratelimit.py``), or refuse with 429. The
     budget headers go on the response either way (the request middleware writes them)."""
     limiter: TenantRateLimiter = request.app.state.limiter
     if not limiter.enabled:
         return
-    decision = limiter.take(tenant_id)
+    decision = await limiter.take(tenant_id)
     request.state.ratelimit = decision.headers()
     if not decision.allowed:
         rate_limited_total.inc()
@@ -110,3 +131,4 @@ def _within_budget(request: Request, tenant_id: str) -> None:
 
 Session = Annotated[AsyncSession, Depends(session)]
 Who = Annotated[Caller, Depends(caller)]
+Claiming = Annotated[Claimer, Depends(claimer)]

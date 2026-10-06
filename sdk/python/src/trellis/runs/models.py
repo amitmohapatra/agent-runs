@@ -3,9 +3,10 @@
 A run *is* the contracts' ``RunRecord`` (started from a ``RunStart``, paused with an
 ``Interrupt``, resumed with an ``InterruptResolution``) and a schedule *is* a ``Schedule``
 (created from a ``ScheduleSpec``); those are used as they are. What is here is the service's
-own shapes: a listing's summary, a lease and a claim, the resolution history, a schedule's
-partial update and a fire's result, webhook subscriptions, the outbox's deliveries and the
-delivery envelope, and a page of a listing. ``tests/test_contract.py`` checks every one
+own shapes: a listing's summary, a lease and a claim, the resolution history, the event
+log's entries and what an append did, a schedule's partial update and a fire's result,
+webhook subscriptions, the outbox's deliveries and the delivery envelope, and a page of a
+listing. ``tests/test_contract.py`` checks every one
 against the committed ``docs/openapi.json``.
 """
 
@@ -16,7 +17,14 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
-from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStatus, Schedule
+from trellis.contracts.runs import (
+    Interrupt,
+    InterruptResolution,
+    RunEvent,
+    RunRecord,
+    RunStatus,
+    Schedule,
+)
 
 
 class RunSummary(BaseModel):
@@ -74,6 +82,26 @@ class ResolutionEntry(BaseModel):
     recorded_at: datetime
 
 
+class RunEventEntry(BaseModel):
+    """One event of a run's log and its ``position`` there (from 1): what ``after`` names
+    when reading on from it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    position: int
+    event: RunEvent
+
+
+class EventsAppended(BaseModel):
+    """What an append did: the events added (a repeat of one logged is not), and the position
+    of the run's last event now."""
+
+    model_config = ConfigDict(frozen=True)
+
+    appended: int
+    position: int
+
+
 class ScheduleUpdate(BaseModel):
     """The fields a schedule's owner may change; only the ones set are sent, and only those
     change. ``enabled=False`` pauses the schedule; ``enabled=True`` resumes it, clearing an
@@ -88,6 +116,8 @@ class ScheduleUpdate(BaseModel):
     input: Any = None
     workspace_id: str | None = None
     enabled: bool | None = None
+    timeout_seconds: float | None = None
+    agent_version: str | None = None
     metadata: dict[str, Any] | None = None
 
 

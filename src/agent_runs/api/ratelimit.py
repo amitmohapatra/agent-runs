@@ -1,35 +1,41 @@
-"""Per-tenant rate limiting: a token bucket per tenant, in this process's memory.
+"""Per-tenant rate limiting, shared by every worker of every replica: one bucket per tenant,
+kept in PostgreSQL.
 
-Every ``/v1`` request of a tenant takes one token from that tenant's bucket, which holds at
-most ``burst`` tokens and refills at ``per_minute`` a minute. An empty bucket is a 429
-problem with ``Retry-After`` (seconds until a token is back); every counted response carries
-``X-RateLimit-Limit`` (the budget a minute) and ``X-RateLimit-Remaining`` (tokens left).
+Every ``/v1`` request of a tenant takes one request from that tenant's budget, which holds at
+most ``burst`` requests and refills at ``per_minute`` a minute. An empty budget is a 429
+problem with ``Retry-After`` (seconds until a request is allowed again); every counted
+response carries ``X-RateLimit-Limit`` (the budget a minute) and ``X-RateLimit-Remaining``
+(requests left now).
 
-Per process on purpose: agent-runs has no shared cache, and a limiter that asked PostgreSQL
-would put a write on every request of the database it protects. So each worker of each
-replica keeps its own buckets, and the budget a tenant really gets is ``per_minute`` times
-the number of workers: a guard against a runaway client (a worker loop claiming in a tight
-loop), not a quota. The tenant is the authenticated one, so a flood of bad keys never
-reaches here (the key cache answers those).
+The budget is a GCRA bucket (the token bucket, kept as one time): a row per tenant holds the
+instant its budget would be full again (``tat``). Taking a request moves it one interval
+(``60 / per_minute`` seconds) later, refused when that would put it more than the burst
+ahead of now. One statement does it, an upsert on the tenant's row under the database's own
+clock, so concurrent requests on any replica draw on the one budget and no replica's clock
+matters. That costs one small write per request, on its own connection, outside the
+request's transaction (a refused request leaves no trace beyond its 429). The tenant is the
+authenticated one, so a flood of bad keys never reaches here (the key cache answers those).
 """
 
 from __future__ import annotations
 
 import math
-import time
-from collections import OrderedDict
-from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Final
 
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from agent_runs.config.settings import RateLimitSettings
+from agent_runs.store.tables import RateLimitRow
 
 HEADER_LIMIT: Final = "X-RateLimit-Limit"
 HEADER_REMAINING: Final = "X-RateLimit-Remaining"
-#: Buckets kept per process (least recently used goes first): a full bucket costs nothing
-#: to forget, since a forgotten tenant starts full again.
-MAX_BUCKETS: Final = 10_000
 _SECONDS_PER_MINUTE: Final = 60.0
+#: Seconds compared on the database's microsecond clock: a budget exactly full is full.
+_PRECISION: Final = 6
 
 
 @dataclass(frozen=True)
@@ -37,7 +43,7 @@ class Decision:
     allowed: bool
     limit: int
     remaining: int
-    #: whole seconds until the next token, when refused
+    #: whole seconds until a request is allowed again, when refused
     retry_after: int
 
     def headers(self) -> dict[str, str]:
@@ -45,31 +51,45 @@ class Decision:
 
 
 class TenantRateLimiter:
-    def __init__(
-        self, settings: RateLimitSettings, *, clock: Callable[[], float] = time.monotonic
-    ) -> None:
+    """The tenants' budgets, in ``engine``'s ``rate_limit_buckets``."""
+
+    def __init__(self, settings: RateLimitSettings, engine: AsyncEngine) -> None:
         self._per_minute = settings.per_minute
-        self._burst = float(settings.burst)
-        self._rate = settings.per_minute / _SECONDS_PER_MINUTE
-        self._clock = clock
-        #: tenant -> (tokens, when they were counted)
-        self._buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
+        self._burst = settings.burst
+        self._engine = engine
 
     @property
     def enabled(self) -> bool:
         return self._per_minute > 0
 
-    def take(self, tenant_id: str) -> Decision:
-        """Take one token from the tenant's bucket, if there is one."""
-        now = self._clock()
-        tokens, then = self._buckets.get(tenant_id, (self._burst, now))
-        tokens = min(self._burst, tokens + (now - then) * self._rate)
-        allowed = tokens >= 1.0
-        if allowed:
-            tokens -= 1.0
-        self._buckets[tenant_id] = (tokens, now)
-        self._buckets.move_to_end(tenant_id)
-        while len(self._buckets) > MAX_BUCKETS:
-            self._buckets.popitem(last=False)
-        wait = 0 if allowed else max(1, math.ceil((1.0 - tokens) / self._rate))
-        return Decision(allowed, self._per_minute, math.floor(tokens), wait)
+    async def take(self, tenant_id: str) -> Decision:
+        """Take one request from the tenant's budget, if there is one left."""
+        interval = _SECONDS_PER_MINUTE / self._per_minute
+        tolerance = interval * (self._burst - 1)
+        clock = func.now()
+        due = func.greatest(RateLimitRow.tat, clock)
+        took = (
+            insert(RateLimitRow)
+            .values(bucket=tenant_id, tat=clock + timedelta(seconds=interval))
+            .on_conflict_do_update(
+                index_elements=[RateLimitRow.bucket],
+                set_={"tat": due + timedelta(seconds=interval)},
+                where=due - clock <= timedelta(seconds=tolerance),
+            )
+            .returning(RateLimitRow.tat)
+            .cte("took")
+        )
+        # the CTE's write is not visible to the outer query: ``ahead`` is the budget before
+        taken = select(func.extract("epoch", took.c.tat - clock)).scalar_subquery()
+        ahead = (
+            select(func.extract("epoch", RateLimitRow.tat - clock))
+            .where(RateLimitRow.bucket == tenant_id)
+            .scalar_subquery()
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(select(taken, ahead))).one()
+        if row[0] is not None:
+            left = round(self._burst - float(row[0]) / interval, _PRECISION)
+            return Decision(True, self._per_minute, max(0, math.floor(left)), 0)
+        wait = round(float(row[1]) - tolerance, _PRECISION)
+        return Decision(False, self._per_minute, 0, max(1, math.ceil(wait)))

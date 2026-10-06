@@ -30,12 +30,12 @@ flowchart LR
 
   subgraph runs["agent-runs"]
     subgraph api["API process: agent-runs (FastAPI, api/app.py)"]
-      deps["api/deps.py<br/>caller() → Caller"]
+      deps["api/deps.py<br/>caller() → Caller · claimer() → Claimer<br/>rate budget (api/ratelimit.py)"]
       mw["api/middleware.py<br/>request id · metrics · body cap · gzip"]
       routers["routers: runs · artifacts<br/>schedules · webhooks<br/>ops: /health/*, /metrics"]
     end
     subgraph tick["Ticker process: agent-runs-ticker (ticker.py)"]
-      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out (deadline, working time)<br/>requeue or cancel · escalate<br/>send webhooks · drop dead · purge artifacts"]
+      ticker["Ticker.tick() every TICK_SECONDS<br/>fire · time out (deadline, working time)<br/>requeue or cancel · escalate<br/>send webhooks · drop dead · purge artifacts<br/>purge ended runs (retention)"]
       sender["WebhookSender<br/>(webhooks.py, egress.py)"]
     end
     keys["KeyRegistry (keys.py)<br/>TTL cache of key answers"]
@@ -77,9 +77,11 @@ flowchart LR
 | OpenAPI | `api/openapi.py` `custom_openapi`, `api/examples.py`, `tools/export_openapi.py` | the document every route shares (metadata, `<tag>.<function>` ids, the `ApiKeyAuth` scheme, a problem on every error status, standard headers); `docs/openapi.json` is it committed, and `tests/test_openapi.py` fails when they differ |
 | Errors | `api/errors.py` `install_error_handlers`, `Problem`; `domain/errors.py` `ErrorCode` | every failure as an RFC 9457 problem: `ServiceError` subclasses with their status and `code`, FastAPI's validation and HTTP errors, a database that went away (`503`, `Retry-After`), anything else (`500`, no internals) |
 | Middleware | `api/middleware.py` `RequestContextMiddleware`, `BodyLimitMiddleware`, `CompressionMiddleware` | `X-Request-ID` in, out and in every problem; request metrics by route template; the JSON body cap counted as bytes arrive; gzip, except artifact bytes |
-| Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | a token bucket per tenant per worker process; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
+| Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | one budget per tenant in PostgreSQL (`rate_limit_buckets`, a GCRA bucket moved by one upsert under the database's clock, on its own connection), shared by every worker of every replica; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
-| Caller resolution | `api/deps.py` `caller`, `Caller` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for` |
+| Caller resolution | `api/deps.py` `caller`, `Caller`; `claimer`, `Claimer` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for`. A claim (`claimer`) also takes a platform key with no tenant: it claims from every tenant's queue |
+| Claim order | `store/runs.py` `RunStore.claim`, `_next_queued`, `_tenant_has_room`, `_key_has_room` | the next queued run: the tenant whose workers hold fewest runs of the claimed agents first (fair share), then `priority`, then `queued_at`, among runs with room under their `concurrency_key` (`RUNS__RUNS__CONCURRENCY_PER_KEY`) and their tenant's cap (`RUNS__RUNS__MAX_RUNNING_PER_TENANT`); the room recounted under `pg_try_advisory_xact_lock` on the key or tenant, a key another claim is counting passed over like a locked row |
+| Run events | `store/runs.py` `RunStore.append_events`, `events`; `api/routers/runs.py` `stream_events`, `_follow` | each run's event log (`run_events`): appends fenced like a heartbeat, a position per event under the run's row lock, repeats (`attempt`, `sequence`) dropped; reads by position, and a server-sent event stream that polls in short transactions of its own (`EVENT_POLL_SECONDS`), keeps quiet connections open (`EVENT_KEEPALIVE_SECONDS`), ends with `end` once the run has, and lasts at most `EVENT_STREAM_SECONDS` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Answering | `answering.py` `require_may_answer`, `require_may_cancel` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question. `RunStore.cancel` applies the same rule (as any principal the key may act for) |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
@@ -173,6 +175,13 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   on an escalation, `run.finished` on any ending (`domain/webhooks.py` `event_of`). A resume
   that continues the run, and a requeue, announce nothing.
 - `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
+- A claim takes a run only with room (`RunStore.claim`): fewer `RUNNING` runs of its
+  tenant share its `concurrency_key` than `RUNS__RUNS__CONCURRENCY_PER_KEY`, and fewer runs
+  of its tenant are leased than `RUNS__RUNS__MAX_RUNNING_PER_TENANT`. A run kept in its
+  caller's process takes its key's place while it runs, but is never held back.
+- With `RUNS__RUNS__RETENTION_DAYS` set, the ticker deletes runs that ended before it
+  (`RunStore.purge_ended`, `ix_runs_ended`) with their `run_resolutions` and `run_events`; a
+  run whose artifacts are still kept waits for them.
 - `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat or
   release; a requeue keeps it, so the next attempt's claim resumes from it; only an ending
   clears it.
@@ -215,7 +224,7 @@ sequenceDiagram
   A-->>W: 201 RunRecord (QUEUED, attempt 1)
 
   W->>A: POST /v1/runs/claim {worker_id, agent_ids, lease_seconds}
-  A->>DB: SELECT … FOR UPDATE SKIP LOCKED, oldest queued_at
+  A->>DB: SELECT … FOR UPDATE SKIP LOCKED: fewest held by its tenant, highest priority, oldest queued_at, with room (key, tenant cap)
   A-->>W: 200 Claimed {run RUNNING, lease}
   loop every third of the lease
     W->>A: POST /v1/runs/{id}/heartbeat {worker_id, checkpoint (progress, optional)}
@@ -303,8 +312,8 @@ moves forward past now, so a long outage fires each schedule once, not once per 
 
 ## The tables
 
-Six tables, built by the fourteen Alembic revisions in `alembic/versions` (head
-`4d0c5e6f7a8b`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
+Eight tables, built by the nineteen Alembic revisions in `alembic/versions` (head
+`9d5e0f1a2b3c`) and mapped in `store/tables.py`. Solid lines are foreign keys; the dotted
 line is the logical link a schedule fire leaves (no foreign key: a run outlives the schedule
 that fired it).
 
@@ -312,6 +321,7 @@ that fired it).
 erDiagram
   agent_runs ||--o{ run_resolutions : "answered interrupts"
   agent_runs ||--o{ run_artifacts : "artifacts"
+  agent_runs ||--o{ run_events : "event log (ON DELETE CASCADE)"
   webhooks ||--o{ webhook_deliveries : "outbox (ON DELETE CASCADE)"
   agent_schedules |o..o{ agent_runs : "fires (last_run_id, run metadata.schedule_id)"
 
@@ -341,6 +351,8 @@ erDiagram
     float worked_seconds "RUNNING stretches that ended"
     timestamptz running_since "set exactly while RUNNING"
     varchar agent_version "RunStart.agent_version"
+    int priority "RunStart.priority: claim order, higher first"
+    varchar concurrency_key "RunStart.concurrency_key: runs sharing it run a few at a time"
     varchar idempotency_key UK
     jsonb run_metadata
     timestamptz queued_at "set once the run entered the queue"
@@ -369,6 +381,21 @@ erDiagram
     timestamptz recorded_at
   }
 
+  run_events {
+    varchar run_id PK, FK
+    bigint position PK "1, 2, ...: assigned under the run's row lock"
+    varchar tenant_id
+    int attempt UK "uq_run_events_sequence with run_id and sequence"
+    int sequence UK
+    jsonb event "the RunEvent"
+    timestamptz recorded_at
+  }
+
+  rate_limit_buckets {
+    varchar bucket PK "the tenant, or key:<key_id> for a platform claim"
+    timestamptz tat "when the budget would be full again (GCRA)"
+  }
+
   run_artifacts {
     varchar artifact_id PK
     varchar run_id FK, UK "uq_run_artifacts_content with checksum"
@@ -394,6 +421,8 @@ erDiagram
     varchar workspace_id
     varchar created_by "the key's principal"
     boolean enabled
+    float timeout_seconds "copied into every fired run"
+    varchar agent_version "copied into every fired run"
     timestamptz next_fire_at
     timestamptz last_fired_at
     varchar last_run_id
@@ -443,6 +472,10 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
 | `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
 | `ix_runs_working` | `agent_runs (running_since) WHERE status = 'RUNNING'` | `RunStore.time_out_overworked` |
+| `ix_runs_concurrency` | `agent_runs (tenant_id, concurrency_key) WHERE status = 'RUNNING' AND concurrency_key IS NOT NULL` | `RunStore.claim`: the runs sharing a key |
+| `ix_runs_leased` | `agent_runs (tenant_id, agent_id) WHERE status = 'RUNNING' AND lease_owner IS NOT NULL` | `RunStore.claim`: what each tenant's workers hold (fair share, the cap) |
+| `ix_runs_ended` | `agent_runs (updated_at) WHERE status IN (the endings)` | `RunStore.purge_ended` |
+| `run_events` primary key | `run_events (run_id, position)` | `RunStore.events`, the stream |
 | `ix_run_resolutions_run` | `run_resolutions (tenant_id, run_id, recorded_at)` | `GET /v1/runs/{id}/resolutions` |
 | `ix_run_artifacts_expiry` | `run_artifacts (expires_at) WHERE expires_at IS NOT NULL` | `ArtifactStore.expired` |
 | `ix_schedules_tenant_created` | `agent_schedules (tenant_id, created_at)` | `GET /v1/schedules`, newest first |
@@ -457,8 +490,10 @@ and inbox, `8d2e3f4a5b6c` schedules, `9e3f4a5b6c7d` run checkpoint, `a0f4b5c6d7e
 identity, `b1a5c6d7e8f9` webhook subscriptions, `c2b6d7e8f9a0` run artifacts,
 `d3c8e9f0a1b2` run resolutions, `e4d9f0a1b2c3` run `settled_by`, `f5e0a1b2c3d4` lease lapses
 and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run retries,
-`3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation. Each has a
-downgrade; CI runs upgrade, downgrade to base and upgrade again.
+`3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation,
+`5e1f6a7b8c9d` schedules' run limits, `6a2b7c8d9e0f` run priority and concurrency key,
+`7b3c8d9e0f1a` shared rate-limit budgets, `8c4d9e0f1a2b` run events, `9d5e0f1a2b3c` run
+retention. Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 
@@ -480,9 +515,10 @@ src/agent_runs/
   api/pagination.py    cursor in, Link: rel="next" out
   api/openapi.py       the OpenAPI document: metadata, ids, problems, headers
   api/examples.py      a request example for every body
-  api/ratelimit.py     TenantRateLimiter: a token bucket per tenant, per process
+  api/ratelimit.py     TenantRateLimiter: one budget per tenant, in PostgreSQL
   api/routers/ops.py   /health/live, /health/ready, /metrics
-  api/deps.py          Caller, caller(), session(): who is calling, a session per request
+  api/deps.py          Caller, caller(), Claimer, claimer(), session(): who is calling (a
+                       claim may span tenants), a session per request
   api/routers/         runs.py, artifacts.py, schedules.py, webhooks.py
   domain/              runs.py, schedules.py, webhooks.py (request and answer models),
                        cadence.py (validate_cadence, next_fire_at), errors.py (status, ErrorCode)
@@ -496,14 +532,17 @@ src/agent_runs/
 
 sdk/python/src/trellis/runs/      (trellis-runs, a workspace member; no trellis/__init__.py)
   client.py            RunsClient: the run verbs (cancel and release among them), list/iterate,
-                       live/ready/metrics
+                       append_events/events/stream_events, live/ready/metrics
   artifacts.py         ArtifactsAPI: upload (with its SHA-256), download
   schedules.py         SchedulesAPI: create, list, get, update, delete, fire
   webhooks.py          WebhooksAPI (rotate_secret, deliveries, redeliver too); sign,
                        verify_signature, parse_delivery, the header names
-  worker.py            Worker, Job, WorkerStore, RELEASED: the claim loop
-  models.py            RunSummary, Lease, Claimed, ResolutionEntry, ScheduleUpdate, FireResult,
+  worker.py            Worker, Job, WorkerStore, RELEASED, OUT_OF_TIME: the claim loop (a
+                       handler is stopped at the run's working time)
+  models.py            RunSummary, Lease, Claimed, ResolutionEntry, RunEventEntry, EventsAppended,
+                       ScheduleUpdate, FireResult,
                        Webhook*, DeliveryRecord, DeliveryState, WebhookDelivery, Page
   errors.py            RunsError and its classes, error_from_problem
-  _transport.py        the key and tenant headers, retries, Retry-After, Link paging
+  _transport.py        the key and tenant headers, retries, Retry-After, Link paging, the
+                       server-sent event reader
 ```

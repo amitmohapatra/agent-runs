@@ -19,10 +19,12 @@ from trellis.runs.models import (
     Claimed,
     DeliveryRecord,
     DeliveryState,
+    EventsAppended,
     FireResult,
     Lease,
     Page,
     ResolutionEntry,
+    RunEventEntry,
     RunSummary,
     ScheduleUpdate,
     Webhook,
@@ -35,7 +37,7 @@ from trellis.runs.schedules import SchedulesAPI
 from trellis.runs.webhooks import WebhooksAPI, parse_delivery, sign, verify_signature
 from trellis.runs.worker import RELEASED, Job, Worker, WorkerStore
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "RELEASED",
@@ -47,6 +49,7 @@ __all__ = [
     "DeliveryRecord",
     "DeliveryState",
     "DependencyUnavailableError",
+    "EventsAppended",
     "FireResult",
     "Job",
     "Lease",
@@ -56,6 +59,7 @@ __all__ = [
     "PayloadTooLargeError",
     "RateLimitedError",
     "ResolutionEntry",
+    "RunEventEntry",
     "RunSummary",
     "RunsClient",
     "RunsError",

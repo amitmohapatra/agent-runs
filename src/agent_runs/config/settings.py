@@ -15,7 +15,7 @@ from typing import Final, Self
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agent_runs.config.constants import WEBHOOK_DEAD_RETENTION
+from agent_runs.config.constants import CONCURRENCY_PER_KEY, WEBHOOK_DEAD_RETENTION
 
 DEV = "dev"
 TEST = "test"
@@ -43,7 +43,7 @@ class ServiceSettings(BaseModel):
     #: environments the filesystem blob store may run in.
     environment: str = DEV
     #: Uvicorn worker processes; unset, one per CPU (1 to 8). Each worker keeps its own key
-    #: cache, rate-limit buckets and metrics.
+    #: cache and metrics; the rate-limit budgets are shared, in the database.
     workers: int | None = Field(default=None, ge=1)
     #: How long a stopping worker lets requests in flight finish before closing them.
     graceful_shutdown_seconds: int = Field(default=20, ge=0)
@@ -127,6 +127,20 @@ class RunsSettings(BaseModel):
     #: The most working time any run may take, in seconds (time RUNNING, across attempts): a
     #: run's own ``timeout_seconds`` may only be shorter. Unset: no platform maximum.
     max_run_seconds: float | None = Field(default=None, gt=0)
+    #: How many of a tenant's runs sharing a ``concurrency_key`` may be RUNNING at once; the
+    #: rest wait QUEUED.
+    concurrency_per_key: int = Field(default=CONCURRENCY_PER_KEY, ge=1)
+    #: The most runs one tenant's workers may hold at once (RUNNING with a lease), whoever
+    #: claims: a claim past it answers 204. Unset: no cap (a claim across tenants still
+    #: shares the fleet fairly).
+    max_running_per_tenant: int | None = Field(default=None, ge=1)
+    #: Days an ended run is kept, with its resolutions and events, before the ticker deletes
+    #: it (a run whose artifacts are still kept goes after them). Unset: kept forever.
+    retention_days: int | None = Field(default=None, ge=1)
+
+    @property
+    def retention(self) -> timedelta | None:
+        return None if self.retention_days is None else timedelta(days=self.retention_days)
 
 
 class WebhookSettings(BaseModel):
@@ -150,10 +164,9 @@ class WebhookSettings(BaseModel):
 
 
 class RateLimitSettings(BaseModel):
-    """Each tenant's request budget on the ``/v1`` routes: a token bucket refilled at
-    ``per_minute`` and holding at most ``burst`` requests. Kept in each worker process's
-    memory, so the budget a tenant really gets is about this times the number of workers and
-    replicas: a guard against a runaway client, not a quota. ``per_minute`` 0 turns it off."""
+    """Each tenant's request budget on the ``/v1`` routes: a bucket refilled at
+    ``per_minute`` and holding at most ``burst`` requests, kept in PostgreSQL and so shared by
+    every worker of every replica. ``per_minute`` 0 turns it off."""
 
     per_minute: int = Field(default=3000, ge=0)
     burst: int = Field(default=500, ge=1)

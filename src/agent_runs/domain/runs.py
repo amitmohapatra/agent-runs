@@ -11,11 +11,19 @@ from typing import Annotated, Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from trellis.contracts.errors import AgentError
-from trellis.contracts.runs import Interrupt, InterruptResolution, RunRecord, RunStart, RunStatus
+from trellis.contracts.runs import (
+    Interrupt,
+    InterruptResolution,
+    RunEvent,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
 
 from agent_runs.config.constants import (
     DEFAULT_LEASE_SECONDS,
     MAX_CHECKPOINT_BYTES,
+    MAX_EVENTS_PER_APPEND,
     MAX_LEASE_SECONDS,
     MIN_LEASE_SECONDS,
 )
@@ -227,3 +235,38 @@ class ResolutionEntry(BaseModel):
     resolution: InterruptResolution = Field(description="How it was answered.")
     attempt: int = Field(description="The attempt that paused.")
     recorded_at: AwareDatetime = Field(description="When the answer took effect here.")
+
+
+class EventsAppend(BaseModel):
+    """Events of the run, to add to its log in this order. Each names the run and its tenant;
+    one already in the log (the same ``attempt`` and ``sequence``) is not added again, so a
+    retried append is harmless."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    events: list[RunEvent] = Field(
+        min_length=1,
+        max_length=MAX_EVENTS_PER_APPEND,
+        description=f"The events, 1 to {MAX_EVENTS_PER_APPEND}, in the order they happened.",
+    )
+
+
+class EventsAppended(BaseModel):
+    """What an append did."""
+
+    model_config = ConfigDict(frozen=True)
+
+    appended: int = Field(description="Events added (repeats of logged ones are not).")
+    position: int = Field(description="The position of the run's last event now; 0 for none.")
+
+
+class RunEventEntry(BaseModel):
+    """One event of a run's log and its place in it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    position: int = Field(
+        description="The event's place in the run's log, from 1: what `after` and "
+        "`Last-Event-ID` name."
+    )
+    event: RunEvent = Field(description="The event, as it was appended.")

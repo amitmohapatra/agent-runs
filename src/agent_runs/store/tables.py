@@ -76,6 +76,10 @@ class RunRow(Base):
     running_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the version of the agent's code that started the run (RunStart.agent_version)
     agent_version: Mapped[str | None] = mapped_column(String(128))
+    #: claim order among the tenant's queued runs, higher first (RunStart.priority)
+    priority: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    #: the tenant's runs sharing it run a few at a time (RunStart.concurrency_key)
+    concurrency_key: Mapped[str | None] = mapped_column(String(200))
     idempotency_key: Mapped[str | None] = mapped_column(String(255))
     run_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: when it last entered the queue; set once a run is durable (queued at least once)
@@ -136,6 +140,28 @@ class RunRow(Base):
             "running_since",
             postgresql_where=text("status = 'RUNNING'"),
         ),
+        # the retention sweep: ended runs, by when they ended
+        Index(
+            "ix_runs_ended",
+            "updated_at",
+            postgresql_where=text(
+                "status IN ('SUCCESS', 'PARTIAL', 'ERROR', 'TIMEOUT', 'CANCELLED', 'REJECTED')"
+            ),
+        ),
+        # the claim: RUNNING runs sharing a concurrency key
+        Index(
+            "ix_runs_concurrency",
+            "tenant_id",
+            "concurrency_key",
+            postgresql_where=text("status = 'RUNNING' AND concurrency_key IS NOT NULL"),
+        ),
+        # the claim: each tenant's runs held by workers (fair share, the per-tenant cap)
+        Index(
+            "ix_runs_leased",
+            "tenant_id",
+            "agent_id",
+            postgresql_where=text("status = 'RUNNING' AND lease_owner IS NOT NULL"),
+        ),
     )
 
 
@@ -156,6 +182,9 @@ class ScheduleRow(Base):
     workspace_id: Mapped[str | None] = mapped_column(String(128))
     created_by: Mapped[str | None] = mapped_column(String(128))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: copied into every fired run's RunStart (ScheduleSpec.timeout_seconds, agent_version)
+    timeout_seconds: Mapped[float | None] = mapped_column(Float)
+    agent_version: Mapped[str | None] = mapped_column(String(128))
     next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_run_id: Mapped[str | None] = mapped_column(String(64))
@@ -263,6 +292,40 @@ class ResolutionRow(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (Index("ix_run_resolutions_run", "tenant_id", "run_id", "recorded_at"),)
+
+
+class RunEventRow(Base):
+    """One event of a run's log, at its ``position`` (1, 2, ...): assigned under the run's
+    row lock, so positions are never committed out of order. ``event`` is the
+    ``RunEvent``."""
+
+    __tablename__ = "run_events"
+
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    #: what the event says it is: a repeated append of it is stored once
+    attempt: Mapped[int] = mapped_column(Integer)
+    sequence: Mapped[int] = mapped_column(Integer)
+    event: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    recorded_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "attempt", "sequence", name="uq_run_events_sequence"),
+    )
+
+
+class RateLimitRow(Base):
+    """A tenant's request budget (``api/ratelimit.py``), shared by every replica: the instant
+    it would be full again."""
+
+    __tablename__ = "rate_limit_buckets"
+
+    #: the tenant (or ``key:<key_id>``, a platform key claiming across tenants)
+    bucket: Mapped[str] = mapped_column(String(256), primary_key=True)
+    tat: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ArtifactRow(Base):

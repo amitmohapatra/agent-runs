@@ -84,7 +84,7 @@ stateDiagram-v2
   [*] --> RUNNING: POST /v1/runs (queue false)
   [*] --> QUEUED: POST /v1/runs (queue true), or a schedule fires
 
-  QUEUED --> RUNNING: POST /v1/runs/claim, once available_at passed (lease to worker_id)
+  QUEUED --> RUNNING: POST /v1/runs/claim, once available_at passed and there is room (lease to worker_id)
   QUEUED --> CANCELLED: cancel, or finish CANCELLED
   QUEUED --> TIMEOUT: finish TIMEOUT, or ticker past the run's deadline (run_deadline)
 
@@ -119,19 +119,25 @@ stateDiagram-v2
 | You want to… | Use |
 |---|---|
 | keep a durable record of a run your own process executes | `POST /v1/runs` (it is `RUNNING`), then `finish` |
-| hand a run to a fleet of workers, surviving a worker that dies | `POST /v1/runs {queue: true}`; workers `claim`, `heartbeat` every third of the lease, and send `worker_id` on `pause`, `finish` and artifact uploads |
+| hand a run to a fleet of workers, surviving a worker that dies | `POST /v1/runs {queue: true}`; workers `claim`, `heartbeat` every third of the lease, and send `worker_id` on `pause`, `finish`, event appends and artifact uploads |
+| put an urgent run ahead of the others | `RunStart.priority` (`-1000` to `1000`, default `0`): a claim takes the highest first, then the oldest |
+| never run two runs of one conversation (or customer, or account) at once | `RunStart.concurrency_key`: at most `RUNS__RUNS__CONCURRENCY_PER_KEY` (1) of the tenant's runs sharing it are `RUNNING`; the rest wait `QUEUED`, in order |
+| share one worker fleet fairly between tenants | nothing to set: a platform key's claim with no `X-Trellis-Tenant` takes from every tenant's queue, the tenant whose workers hold the fewest runs first. The operator may also cap what any one tenant holds (`RUNS__RUNS__MAX_RUNNING_PER_TENANT`) |
+| show a run's progress from any replica, live | the worker appends its `RunEvent`s (`POST /v1/runs/{id}/events`); anyone reads them (`GET /v1/runs/{id}/events?after=`) or follows them as server-sent events (`GET /v1/runs/{id}/events/stream`), from whichever replica they reach |
 | make a retried start harmless | the same `run_id`, or an `idempotency_key` (one run per tenant and key) |
-| stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume` |
+| stop for a person's approval, answer or edit | `pause` with an `Interrupt` (`assignee`, `deadline`, `escalate_to`) and the executor's `checkpoint`; the person answers with `resume`, optionally with a `comment`, and approves similar calls for the rest of the run with `remember: "run"` (the harness keeps that promise) |
+| offer labelled choices, several picks, or your own review screen | `Interrupt.options` as `{value, label, description}` objects (or plain strings), `multiple: true` (the answer is a list of values), `ui_schema` (form widget hints), `component` and `props` (your screen, `ui` the fallback). Every answer is checked against `expects` and the options, whoever collected it |
 | move an unanswered question up, or give up on it | the interrupt's `deadline` and `escalate_to`: the ticker reassigns it once, else ends the run `TIMEOUT` |
 | make sure a run is done by a time, whatever happens | `RunStart.deadline`: past it the ticker ends the run `TIMEOUT` (`run_deadline`, not retryable), queued, running or waiting for a person; a worker still running it is told `LEASE_LOST` and stops |
 | bound how long a run may work, not counting the queue or a person's answer | `RunStart.timeout_seconds`: the ticker ends a run whose time `RUNNING`, across attempts and crashes (`worked_seconds`), passes it `TIMEOUT` (`run_timeout`); each lease says the time left (`remaining_seconds`). The operator's `RUNS__RUNS__MAX_RUN_SECONDS` bounds every run |
 | show a reviewer something too big for a question (a table, a diff) | `POST /v1/runs/{id}/artifacts`, then the `ArtifactRef` as `Interrupt.payload_ref`; the UI reads `GET /v1/artifacts/{id}` |
-| build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…` |
+| build a person's or a role's inbox | `GET /v1/runs?status=PAUSED&assignee=…`, with `&top_level=true` to leave out paused sub-agents (their parent is listed) |
 | prove who approved what, and when | `GET /v1/runs/{id}/resolutions` (append-only) |
 | cancel a run, whatever its status, saying why | `POST /v1/runs/{id}/cancel {reason}` (`RunsClient.cancel`): queued or waiting, it ends `CANCELLED` at once; held by a worker, the worker is told through its heartbeat and stops (the SDK's `Worker` does) |
 | stop a worker without losing what it runs | nothing: the SDK's `Worker` lets its runs finish for 25 s, then releases them (`POST /v1/runs/{id}/release`), back on the queue at once for another worker |
 | survive a model's rate limit or a dependency restarting | nothing: a queued run its worker ends `ERROR` with a retryable error is retried later, up to 3 times (10 s, 20 s, 40 s); a run kept in its caller's process is not |
-| start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert |
+| start runs on a timetable, as someone, while nobody is present | `POST /v1/schedules` (a cadence bucket or an hourly-or-slower cron, in the schedule's zone); repeat the create freely, it is an upsert. Its `timeout_seconds` and `agent_version` are copied into every run it fires |
+| keep the database from growing forever | `RUNS__RUNS__RETENTION_DAYS`: the ticker deletes runs that ended longer ago, with their resolutions and events (unset: kept forever) |
 | run a schedule now, or pause and resume it | `POST /v1/schedules/{id}/fire`; `PATCH {"enabled": false}` / `{"enabled": true}` |
 | hear about pauses, escalations and endings instead of polling | `POST /v1/webhooks`; verify `X-Trellis-Signature` with the secret shown once (`trellis.runs.webhooks.verify_signature`) |
 | change a webhook's secret without missing a delivery | `POST /v1/webhooks/{id}/rotate-secret`: both secrets sign for 24 h, and `verify_signature` accepts either |
@@ -142,7 +148,7 @@ stateDiagram-v2
 ## The Python SDK
 
 [`sdk/python`](sdk/python/README.md) is `trellis-runs` (imports as `trellis.runs`), the
-Python client of this API, versioned with it (0.3.2). It depends on `httpx`, `pydantic` and
+Python client of this API, versioned with it (0.4.0). It depends on `httpx`, `pydantic` and
 `trellis-contracts` only, so it plugs into LangGraph, OpenAI Agents, the Claude Agent SDK or
 plain code (Way 2, [the snippet above](#where-this-fits-two-ways-to-use-trellis)) as well as
 into agent-harness, whose run store it is (Way 1):
@@ -157,8 +163,10 @@ into agent-harness, whose run store it is (Way 1):
   ends the run `CANCELLED`, a handler that raises ends its run `ERROR` at once (the exception
   as the run's `AgentError`; agent-runs retries a retryable one later), bounded concurrency,
   idle backoff, a graceful stop that releases what is still running after 25 s back to the
-  queue. `Job` tells the handler the working time left (`remaining_seconds`) and whether a
-  cancel was asked (`cancel_requested`).
+  queue. A handler still running when the run's working time is used up is stopped and the
+  run ends `TIMEOUT` (`run_timeout`). `Job` tells the handler the working time left
+  (`remaining_seconds`) and whether a cancel was asked (`cancel_requested`). A worker with a
+  platform key and no tenant serves every tenant, fairly.
 - `trellis.runs.webhooks`: `sign` (the service signs every delivery with it),
   `verify_signature` (any matching signature, so a receiver keeps working through a secret's
   rotation) and `parse_delivery` for a receiver.
@@ -179,7 +187,7 @@ exact claim, heartbeat and resume semantics a worker implements.
 | Route | What it does |
 |---|---|
 | `POST /v1/runs` | record a run (`RUNNING`), or queue it (`queue: true` → `QUEUED`); idempotent on run id and `idempotency_key` |
-| `POST /v1/runs/claim` | lease the oldest queued run of `agent_ids` to `worker_id`, or `204` |
+| `POST /v1/runs/claim` | lease the next queued run of `agent_ids` to `worker_id` (highest `priority`, then oldest, with room under its `concurrency_key` and its tenant's cap), or `204`; a platform key with no tenant claims from every tenant, fairly |
 | `POST /v1/runs/{id}/heartbeat` | extend the lease, optionally saving a progress `checkpoint` the next attempt resumes from; the lease says the working time left and whether a cancel was asked; `409 LEASE_LOST` = stop |
 | `POST /v1/runs/{id}/release` | the lease holder lets go of the run (it is stopping): back on the queue at once, as the next attempt, no lapse counted |
 | `POST /v1/runs/{id}/pause` | the run waits on an `Interrupt` (assignee, deadline, escalation), keeping the executor's opaque `checkpoint` for whoever resumes it |
@@ -188,7 +196,9 @@ exact claim, heartbeat and resume semantics a worker implements.
 | `POST /v1/runs/{id}/finish` | end it: `SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`, `REJECTED` (a queued run's retryable `ERROR` is retried later instead); the same finish repeated answers the stored run |
 | `GET /v1/runs/{id}` | one run, the full record |
 | `GET /v1/runs/{id}/resolutions` | every interrupt the run paused on and how it was answered, oldest first (append-only audit trail) |
-| `GET /v1/runs?status=PAUSED&assignee=…` | run summaries; with these filters, the inbox of a person or role. Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
+| `POST /v1/runs/{id}/events` | append the run's `RunEvent`s to its log while it runs, fenced like a heartbeat; a repeated event is stored once |
+| `GET /v1/runs/{id}/events?after=` · `GET /v1/runs/{id}/events/stream` | the run's log past a position · followed as server-sent events (`Last-Event-ID`), ending with `event: end` once the run ended |
+| `GET /v1/runs?status=PAUSED&assignee=…&top_level=true` | run summaries; with these filters, the inbox of a person or role (`top_level` leaves out sub-agents). Every listing pages with `cursor` and `limit` and a `Link: rel="next"` header |
 | `POST /v1/runs/{id}/artifacts` | store a large payload (an `ask` table, a diff; ≤ 50 MiB) in blob storage and get its `ArtifactRef` for `Interrupt.payload_ref` |
 | `GET /v1/artifacts/{id}` | the artifact's bytes, checksum-verified, tenant-scoped |
 | `POST /v1/schedules` | create a schedule, or get the one with the same agent, `on_behalf_of`, cadence and input (an upsert) |
@@ -235,6 +245,9 @@ exact claim, heartbeat and resume semantics a worker implements.
    (7) are dropped.
 8. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
    are deleted: the blob, then the record.
+9. **Run retention.** Only when the operator sets `RUNS__RUNS__RETENTION_DAYS`: runs that
+   ended longer ago are deleted with their resolutions and events, a run with artifacts
+   still kept after them. Unset, every run is kept.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
 (the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
@@ -427,11 +440,11 @@ documented in [.env.example](.env.example); every other number is a named consta
 | `RUNS__SERVICE__HOST` | `0.0.0.0` | API | where uvicorn binds |
 | `RUNS__SERVICE__PORT` | `8090` | API | the API's port |
 | `RUNS__SERVICE__ENVIRONMENT` | `dev` | API, ticker | `dev` also accepts and delivers plain-`http` webhook URLs, and private ones unless `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` says otherwise; anything else only `https` to public hosts. Only `dev` and `test` may use the filesystem blob store |
-| `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache, rate-limit buckets and metrics |
+| `RUNS__SERVICE__WORKERS` | one per CPU, 1–8 | API | uvicorn worker processes; each keeps its own key cache and metrics (rate-limit budgets are shared, in the database) |
 | `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | API | on `SIGTERM`, how long requests in flight may finish before they are closed |
 | `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB |
 | `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` | API | a run's `input` or `output` past this (compact JSON) is `413` |
-| `RUNS__RATE_LIMIT__PER_MINUTE`, `RUNS__RATE_LIMIT__BURST` | `3000`, `500` | API | each tenant's token bucket per worker process (`429` + `Retry-After` when empty); `0` per minute turns it off |
+| `RUNS__RATE_LIMIT__PER_MINUTE`, `RUNS__RATE_LIMIT__BURST` | `3000`, `500` | API | each tenant's request budget, one per tenant in PostgreSQL, shared by every worker of every replica (`429` + `Retry-After` when empty); `0` per minute turns it off |
 | `RUNS__MEMORY__URL` | `MEMORY_URL`, else `http://localhost:8080` | API | the Memory Service; keys are introspected at `{url}/v1/keys/self`. `MEMORY_URL` is the platform-wide name; this one wins when both are set |
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | API, ticker, alembic | the database |
 | `RUNS__DATABASE__POOL_SIZE` | `10` | API, ticker | connections per process (per worker) |
@@ -445,6 +458,9 @@ documented in [.env.example](.env.example); every other number is a named consta
 | `RUNS__BLOB__ROOT` | `.blob` | API, ticker | the filesystem store's directory (shared by both processes) |
 | `RUNS__BLOB__BUCKET` | unset | API, ticker | the GCS bucket; required with `gcs` (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) |
 | `RUNS__RUNS__MAX_RUN_SECONDS` | unset | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter. Unset: no platform maximum |
+| `RUNS__RUNS__CONCURRENCY_PER_KEY` | `1` | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once |
+| `RUNS__RUNS__MAX_RUNNING_PER_TENANT` | unset | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Unset: no cap (fair share between tenants needs no setting) |
+| `RUNS__RUNS__RETENTION_DAYS` | unset | ticker | days an ended run is kept, with its resolutions and events; unset, forever |
 | `RUNS__WEBHOOKS__ALLOW_PRIVATE_TARGETS` | unset (`true` in `dev` only) | API, ticker | deliver to hosts that resolve to private, loopback or link-local addresses |
 | `RUNS__WEBHOOKS__SECRET_OVERLAP_HOURS` | `24` | API | after a rotation, how long the old secret signs deliveries too; `0` the new one only |
 | `RUNS__WEBHOOKS__DEAD_RETENTION_DAYS` | `7` | ticker | how long a dead delivery is kept to be redelivered |
