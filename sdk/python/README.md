@@ -343,10 +343,12 @@ async with RunsClient() as runs:
   it ran past its `deadline` or its working-time limit (agent-runs ended it `TIMEOUT`).
 - `job.remaining_seconds` is the working time the run has left now (its `timeout_seconds`
   or the operator's maximum, the lesser, less what every attempt worked; `None` without a
-  limit), kept current by every lease. The worker stops a handler still running when the
-  time the claim gave is used up and finishes the run `TIMEOUT` (`run_timeout`, not
-  retried); bound your own steps by it to end cleanly first. A `TimeoutError` of your own
-  (a model call) still ends the run `ERROR`.
+  limit), kept current by every lease. The worker stops a handler still running one second
+  (`WORKING_TIME_GRACE_SECONDS`) after the time the claim gave is used up and finishes the
+  run `TIMEOUT` (`run_timeout`, not retried). Bound your own steps by it to end cleanly
+  first: a handler that times out at `remaining_seconds` has that second to finish the run
+  itself, with its own error and events. A `TimeoutError` of your own (a model call) still
+  ends the run `ERROR`.
 - Cancelling a run (`runs.cancel(run_id, reason=...)`, from anywhere) reaches its worker
   through the next heartbeat (`cancel_requested`): the handler is cancelled and the worker
   finishes the run `CANCELLED`. In the handler, `job.cancel_requested` tells that

@@ -1,4 +1,4 @@
-# agent-runs API (0.4.0)
+# agent-runs API (0.4.1)
 
 Every `/v1` route needs `X-API-Key` (header names are case-insensitive: `X-Api-Key` is the
 same header), a key issued by the Memory Service (the one key registry; see
@@ -233,8 +233,10 @@ run working past its limit, the ticker ends it `TIMEOUT` with
 `run.finished`, and its worker is fenced off as for a deadline. The limit is
 `timeout_seconds` or the operator's `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; with neither
 there is none. Both a deadline and a limit may be set. Every lease answers the working time
-left (`remaining_seconds`), so a worker stops in time (the SDK's `Worker` stops its handler
-there and finishes the run `TIMEOUT` with the same `run_timeout` error).
+left (`remaining_seconds`), so a worker stops in time (the SDK's `Worker` stops a handler
+still running a second later, its `WORKING_TIME_GRACE_SECONDS`, and finishes the run
+`TIMEOUT` with the same `run_timeout` error; a handler that stopped itself at
+`remaining_seconds` has ended the run its own way by then).
 
 `priority` (`-1000` to `1000`, default `0`) and `concurrency_key` (optional, 1–200
 characters) say how a queued run waits its turn ([the claim](#post-v1runsclaim--200-claimed-or-204)):
