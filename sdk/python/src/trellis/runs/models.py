@@ -118,6 +118,8 @@ class ScheduleUpdate(BaseModel):
     enabled: bool | None = None
     timeout_seconds: float | None = None
     agent_version: str | None = None
+    priority: int | None = None
+    concurrency_key: str | None = None
     metadata: dict[str, Any] | None = None
 
 

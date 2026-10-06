@@ -227,6 +227,8 @@ async with RunsClient() as runs:
             timezone="Europe/Berlin",
             on_behalf_of="user_ada",
             input={"topic": "inbox"},
+            priority=-10,  # behind the runs people are waiting on
+            concurrency_key="briefing:user_ada",  # never two briefings at once
         )
     )  # an upsert: the same agent, person, cadence and input answer the existing one
     fired = await runs.schedules.fire(briefing.schedule_id)  # fired.run_id is QUEUED
@@ -234,7 +236,10 @@ async with RunsClient() as runs:
     await runs.schedules.update(briefing.schedule_id, ScheduleUpdate(enabled=True))  # resume
 ```
 
-A fired run is queued: a [worker](#the-worker) runs it.
+A fired run is queued: a [worker](#the-worker) runs it. It carries everything a started run
+can: the schedule's `timeout_seconds`, `agent_version`, `priority` and `concurrency_key`, and
+its `metadata` under the fire's own keys (`schedule_id`, `schedule_name`, `fire_time`,
+`created_by`), which win on conflict. `ScheduleUpdate` changes any of them.
 
 ## Webhooks
 

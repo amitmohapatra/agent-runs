@@ -9,7 +9,7 @@ dependencies = [
   "httpx>=0.28",
   "pydantic>=2.13,<3",
   # RunRecord, RunStart, Interrupt, Schedule…: the wire's records are the contracts' models
-  "trellis-contracts>=0.6,<0.7",
+  "trellis-contracts>=0.6.1,<0.7",
   "jsonschema>=4.23,<5",
 ]
 

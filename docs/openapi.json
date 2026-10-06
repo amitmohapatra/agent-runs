@@ -2004,6 +2004,23 @@
             "title": "Cadence",
             "type": "string"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
+          },
           "consecutive_failures": {
             "default": 0,
             "description": "Fires in a row that could not queue a run (not runs that failed); reset to 0 by a successful fire.",
@@ -2079,7 +2096,7 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "description": "Free-form JSON object kept with the schedule; the contract never reads it.",
+            "description": "Free-form JSON object kept with the schedule; the contract never reads it. agent-runs copies it into each fired run's RunStart.metadata, under the fire's own keys, which win on conflict.",
             "title": "Metadata",
             "type": "object"
           },
@@ -2112,6 +2129,17 @@
             ],
             "title": "On Behalf Of",
             "type": "string"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "retry_after": {
             "anyOf": [
@@ -2193,7 +2221,7 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``\nand ``agent_version`` are copied into the :class:`RunStart` of every fire.",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
@@ -2226,6 +2254,23 @@
             "title": "Cadence",
             "type": "string"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runs of the tenant sharing this key run only a few at a time (the run store's limit, one unless its operator says otherwise); the rest wait QUEUED. None: no such limit.",
+            "examples": [
+              "thread:chat-42"
+            ],
+            "title": "Concurrency Key"
+          },
           "enabled": {
             "default": true,
             "description": "Whether it fires; a disabled schedule is kept but skipped.",
@@ -2238,7 +2283,7 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "description": "Free-form JSON object kept with the schedule; the contract never reads it.",
+            "description": "Free-form JSON object kept with the schedule; the contract never reads it. agent-runs copies it into each fired run's RunStart.metadata, under the fire's own keys, which win on conflict.",
             "title": "Metadata",
             "type": "object"
           },
@@ -2258,6 +2303,17 @@
             ],
             "title": "On Behalf Of",
             "type": "string"
+          },
+          "priority": {
+            "default": 0,
+            "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
+            "examples": [
+              10
+            ],
+            "maximum": 1000.0,
+            "minimum": -1000.0,
+            "title": "Priority",
+            "type": "integer"
           },
           "tenant_id": {
             "description": "Tenant that owns the schedule.",
@@ -2354,6 +2410,20 @@
             "description": "hourly, daily, weekly, weekdays, manual, or a cron expression firing at most hourly; a change re-arms the next fire.",
             "title": "Cadence"
           },
+          "concurrency_key": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The concurrency key of the runs it fires; null removes it.",
+            "title": "Concurrency Key"
+          },
           "enabled": {
             "anyOf": [
               {
@@ -2394,6 +2464,20 @@
             ],
             "description": "A new label (need not be unique).",
             "title": "Name"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": -1000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The claim order of the runs it fires, -1000 to 1000 (higher first).",
+            "title": "Priority"
           },
           "timeout_seconds": {
             "anyOf": [

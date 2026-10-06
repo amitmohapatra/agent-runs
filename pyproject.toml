@@ -14,7 +14,7 @@ dependencies = [
   "structlog>=25.2",
   "croniter>=6",
   "httpx>=0.28",
-  "trellis-contracts>=0.6,<0.7",
+  "trellis-contracts>=0.6.1,<0.7",
   # the SDK (sdk/python, a workspace member): the service signs webhooks with its ``sign``
   "trellis-runs",
   "google-cloud-storage>=3.4",
