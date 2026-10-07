@@ -18,7 +18,13 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from agent_runs.config.constants import READY_TIMEOUT_SECONDS
+from agent_runs.config.constants import (
+    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_POOL_RECYCLE_SECONDS,
+    DB_POOL_TIMEOUT_SECONDS,
+    DB_STATEMENT_TIMEOUT_MS,
+    READY_TIMEOUT_SECONDS,
+)
 from agent_runs.config.settings import DatabaseSettings
 
 #: Resolved at import: reading the filesystem inside a coroutine blocks the loop.
@@ -26,19 +32,21 @@ ALEMBIC_INI = Path(__file__).resolve().parents[3] / "alembic.ini"
 _HEAD = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
 
 
-async def connect(config: DatabaseSettings) -> AsyncEngine:
-    """An engine on a database at the schema this build was written against, with the
-    pool and timeout protections of ``DatabaseSettings``."""
+async def connect(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
+    """An engine on a database at the schema this build was written against, its pool this
+    process's share of the budget (one of ``processes`` in the container), with the
+    protections ``DatabaseSettings`` describes."""
+    plan = config.pool_plan(processes)
     engine = create_async_engine(
         config.url,
-        pool_size=config.pool_size,
-        max_overflow=config.max_overflow,
-        pool_timeout=config.pool_timeout_seconds,
-        pool_recycle=config.pool_recycle_seconds,
-        pool_pre_ping=config.pool_pre_ping,
+        pool_size=plan.size,
+        max_overflow=plan.overflow,
+        pool_timeout=DB_POOL_TIMEOUT_SECONDS,
+        pool_recycle=DB_POOL_RECYCLE_SECONDS,
+        pool_pre_ping=True,
         connect_args={
-            "connect_timeout": config.connect_timeout_seconds,
-            "options": f"-c statement_timeout={config.statement_timeout_ms}",
+            "connect_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+            "options": f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
         },
     )
     async with engine.connect() as conn:

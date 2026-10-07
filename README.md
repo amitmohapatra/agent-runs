@@ -212,7 +212,7 @@ drops the volumes.
 Every setting, its default, whether it applies without being set, and an example:
 [docs/configuration.md](docs/configuration.md). The ones a deployment sets first are
 `RUNS__DATABASE__URL`, `RUNS__MEMORY__URL` (or `MEMORY_URL`), `RUNS__SERVICE__ENVIRONMENT`
-and, outside `dev`, `RUNS__BLOB__PROVIDER=gcs` with `RUNS__BLOB__BUCKET`.
+and, outside `dev`, `RUNS__BLOB__BUCKET` (artifacts go to GCS exactly when it is set).
 
 ## Documentation
 

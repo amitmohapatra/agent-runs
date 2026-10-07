@@ -4,6 +4,30 @@ What changed in each version of `agent-runs` and its SDK `trellis-runs` (they ar
 together), and what a caller must do about it. Which versions of the other Trellis repos go
 with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/README.md).
 
+## Unreleased
+
+Breaking configuration changes: three kinds of setting are gone, because the service can work
+them out or because they were never a deployment's choice. A variable left set is ignored, not
+an error; set the replacement where one is named.
+
+* **The blob store follows `RUNS__BLOB__BUCKET`.** `RUNS__BLOB__PROVIDER` is removed:
+  artifacts go to GCS exactly when `RUNS__BLOB__BUCKET` is set, and to the directory
+  `RUNS__BLOB__ROOT` otherwise (still `dev` and `test` only: elsewhere `Settings` refuses to
+  start without a bucket, naming `RUNS__BLOB__BUCKET`). *Migration:* drop
+  `RUNS__BLOB__PROVIDER`; keep `RUNS__BLOB__BUCKET` for GCS. A deployment that set a bucket
+  with `RUNS__BLOB__PROVIDER=filesystem` now writes to that bucket: unset the bucket to stay
+  on the filesystem.
+* **One connection budget replaces the pool settings.** `RUNS__DATABASE__POOL_SIZE` and
+  `RUNS__DATABASE__MAX_OVERFLOW` are replaced by `RUNS__DATABASE__CONNECTION_BUDGET`, the
+  connections one container may open across all its processes (the Memory Service's design):
+  each process (an API worker; the ticker is one) takes `budget // processes`, half kept open
+  and half for a burst. Unset, a process opens 10 + 10, as before. *Migration:* drop both;
+  to keep a custom size set `CONNECTION_BUDGET` to `(POOL_SIZE + MAX_OVERFLOW) × workers`.
+* **The pool's protections are constants.** `RUNS__DATABASE__POOL_PRE_PING` (always on),
+  `POOL_TIMEOUT_SECONDS` (5), `POOL_RECYCLE_SECONDS` (300), `CONNECT_TIMEOUT_SECONDS` (5)
+  and `STATEMENT_TIMEOUT_MS` (15000) are removed; their values are the `DB_*` constants in
+  `config/constants.py`, unchanged. *Migration:* drop them.
+
 ## 0.4.1 (2026-10-06)
 
 * **SDK `Worker`: a handler that honours `job.remaining_seconds` ends its own run.** The

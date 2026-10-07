@@ -6,8 +6,8 @@ decisions are constants in ``constants.py``.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import timedelta
-from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Final, Self
@@ -15,7 +15,11 @@ from typing import Final, Self
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agent_runs.config.constants import CONCURRENCY_PER_KEY, WEBHOOK_DEAD_RETENTION
+from agent_runs.config.constants import (
+    CONCURRENCY_PER_KEY,
+    DB_CONNECTIONS_PER_PROCESS,
+    WEBHOOK_DEAD_RETENTION,
+)
 
 DEV = "dev"
 TEST = "test"
@@ -27,6 +31,8 @@ MEMORY_URL_ENV: Final = "MEMORY_URL"
 #: Uvicorn processes when ``RUNS__SERVICE__WORKERS`` is unset: one per CPU, within these.
 MIN_WORKERS: Final = 1
 MAX_WORKERS: Final = 8
+#: The smallest pool a process may have: one connection kept, one for a burst.
+MIN_CONNECTIONS_PER_PROCESS: Final = 2
 
 
 def default_workers(cpus: int | None = None) -> int:
@@ -73,46 +79,56 @@ class MemorySettings(BaseModel):
     url: str = Field(default_factory=_memory_url)
 
 
+@dataclass(frozen=True)
+class PoolPlan:
+    """One process's share of the container's connection budget (``pool_plan``)."""
+
+    #: SQLAlchemy ``pool_size``: connections kept open.
+    size: int
+    #: SQLAlchemy ``max_overflow``: opened past ``size`` under a burst, closed when returned.
+    overflow: int
+
+
 class DatabaseSettings(BaseModel):
-    """The engine both processes use, with the protections a pooled connection needs: a
-    pre-ping on checkout (a connection the server or a proxy closed while pooled is replaced,
-    not handed to a request), a recycle window shorter than the idle timeouts in between, a
-    bounded wait for a pooled connection, a connect timeout, and a statement timeout so one
-    slow query cannot hold a connection (and a row lock) indefinitely."""
+    """Where PostgreSQL is, and how many connections a container may hold to it. The pool's
+    protections are not settings (``connect``): a pre-ping on checkout (a connection the
+    server or a proxy closed while pooled is replaced, not handed to a request), a recycle
+    window shorter than the idle timeouts in between, a bounded wait for a pooled connection,
+    a connect timeout, and a statement timeout so one slow query cannot hold a connection (and
+    a row lock) indefinitely; their values are constants (``DB_*``)."""
 
     url: str = "postgresql+psycopg://memory:memory@localhost:5432/agent_runs"
-    pool_size: int = Field(default=10, ge=1)
-    #: Connections opened past ``pool_size`` under a burst, closed when returned.
-    max_overflow: int = Field(default=10, ge=0)
-    #: Seconds a request waits for a pooled connection before a 503.
-    pool_timeout_seconds: float = Field(default=5.0, gt=0)
-    #: Seconds after which a pooled connection is replaced rather than reused.
-    pool_recycle_seconds: int = Field(default=300, ge=1)
-    pool_pre_ping: bool = True
-    #: Seconds to open a connection to PostgreSQL.
-    connect_timeout_seconds: int = Field(default=5, ge=1)
-    #: Milliseconds after which PostgreSQL cancels a statement (a 503 here); 0 is no limit.
-    statement_timeout_ms: int = Field(default=15_000, ge=0)
+    #: Connections one container may open to PostgreSQL, across all its processes (the API's
+    #: uvicorn workers; the ticker is one). Each process takes ``budget // processes``
+    #: (``pool_plan``). Unset: 20 per process.
+    connection_budget: int | None = Field(default=None, ge=MIN_CONNECTIONS_PER_PROCESS)
 
+    def pool_plan(self, processes: int) -> PoolPlan:
+        """One process's pool, from the container's budget::
 
-class BlobProvider(StrEnum):
-    FILESYSTEM = "filesystem"
-    GCS = "gcs"
+            per_process = connection_budget // processes   (unset: 20; at least 2)
+            size        = ceil(per_process / 2)
+            overflow    = floor(per_process / 2)
+
+        The overflow is the burst a pool may open past its steady size and closes again; the
+        budget counts both, because a burst is when the budget matters.
+        """
+        if self.connection_budget is None:
+            per_process = DB_CONNECTIONS_PER_PROCESS
+        else:
+            per_process = max(
+                MIN_CONNECTIONS_PER_PROCESS, self.connection_budget // max(1, processes)
+            )
+        return PoolPlan(size=-(-per_process // 2), overflow=per_process // 2)
 
 
 class BlobSettings(BaseModel):
-    """Where run artifacts' bytes live. ``filesystem`` writes under ``root`` (the API and the
-    ticker must share it); ``gcs`` writes to ``bucket`` with the environment's credentials."""
+    """Where run artifacts' bytes live: GCS exactly when ``bucket`` is set (with the
+    environment's credentials), else a directory, ``root``, that the API and the ticker share
+    (dev and test only)."""
 
-    provider: BlobProvider = BlobProvider.FILESYSTEM
     root: Path = Path(".blob")
     bucket: str | None = None
-
-    @model_validator(mode="after")
-    def _gcs_names_a_bucket(self) -> Self:
-        if self.provider is BlobProvider.GCS and not self.bucket:
-            raise ValueError("RUNS__BLOB__BUCKET is required when RUNS__BLOB__PROVIDER=gcs")
-        return self
 
 
 class TickerSettings(BaseModel):
@@ -197,10 +213,10 @@ class Settings(BaseSettings):
         """A directory on one machine is not where a deployment keeps artifacts: replicas
         would not share it, and a redeploy would lose it."""
         environment = self.service.environment
-        if self.blob.provider is BlobProvider.FILESYSTEM and environment not in LOCAL_ENVIRONMENTS:
+        if not self.blob.bucket and environment not in LOCAL_ENVIRONMENTS:
             raise ValueError(
-                f"RUNS__BLOB__PROVIDER=filesystem is for dev and test only, not {environment!r}: "
-                "use gcs (RUNS__BLOB__BUCKET)"
+                f"RUNS__BLOB__BUCKET is required in {environment!r}: without it artifacts go to "
+                "the filesystem blob store, which is for dev and test only"
             )
         return self
 

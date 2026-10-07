@@ -1,5 +1,5 @@
-"""Design decisions, named once. Deployment facts (URLs, secrets, ports, pool sizes) are
-settings (``settings.py``); nothing here differs between deployments."""
+"""Design decisions, named once. Deployment facts (URLs, secrets, ports, the connection
+budget) are settings (``settings.py``); nothing here differs between deployments."""
 
 from __future__ import annotations
 
@@ -48,6 +48,22 @@ MAX_PAGE: Final = 500
 #: journal and a framework's resume state fit well inside it; anything bigger belongs in an
 #: artifact the checkpoint refers to.
 MAX_CHECKPOINT_BYTES: Final = 1024 * 1024
+
+# --------------------------------------------------------------------------- the database
+
+#: Connections one process (an API worker, the ticker) opens when no budget is set
+#: (``RUNS__DATABASE__CONNECTION_BUDGET``): 10 kept and 10 more under a burst.
+DB_CONNECTIONS_PER_PROCESS: Final = 20
+#: Seconds a request waits for a pooled connection before a 503.
+DB_POOL_TIMEOUT_SECONDS: Final = 5.0
+#: Seconds after which a pooled connection is replaced rather than reused: under the idle
+#: timeout of anything between the service and PostgreSQL (a proxy, a load balancer).
+DB_POOL_RECYCLE_SECONDS: Final = 300
+#: Seconds to open a connection to PostgreSQL.
+DB_CONNECT_TIMEOUT_SECONDS: Final = 5
+#: Milliseconds after which PostgreSQL cancels a statement (a 503 here): one slow query
+#: cannot hold a connection, and a row lock, indefinitely.
+DB_STATEMENT_TIMEOUT_MS: Final = 15_000
 
 # --------------------------------------------------------------------------- run events
 
