@@ -297,7 +297,7 @@ async def test_metrics_count_requests_by_route_template_and_status(client) -> No
     claims = _samples(text, "runs_claims_total")
     assert claims[(("outcome", "claimed"),)] >= 1 and claims[(("outcome", "empty"),)] >= 1
     pool = _samples(text, "runs_db_pool_connections")
-    assert pool[(("state", "size"),)] == SETTINGS.database.pool_size
+    assert pool[(("state", "size"),)] == SETTINGS.database.pool_plan(1).size
     assert "runs_http_request_seconds_bucket" in text
 
 

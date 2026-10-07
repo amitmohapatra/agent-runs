@@ -17,7 +17,6 @@ from typing import Any
 import httpx
 import pytest
 from google.api_core import exceptions as gexc
-from pydantic import ValidationError
 from trellis.contracts.ids import now
 
 from agent_runs.blob import (
@@ -31,7 +30,7 @@ from agent_runs.blob import (
 from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.blob.gcs import GCSBlobStore
 from agent_runs.config.constants import ARTIFACT_RETENTION
-from agent_runs.config.settings import BlobProvider, BlobSettings
+from agent_runs.config.settings import BlobSettings
 from tests.conftest import started
 
 FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:latest"
@@ -262,10 +261,10 @@ def test_the_filesystem_store_refuses_keys_that_leave_its_root(tmp_path) -> None
 # ------------------------------------------------------------------ settings
 
 
-def test_the_provider_is_chosen_by_settings(tmp_path) -> None:
-    assert isinstance(open_blob_store(BlobSettings(root=tmp_path)), FilesystemBlobStore)
-    with pytest.raises(ValidationError, match="RUNS__BLOB__BUCKET"):
-        BlobSettings(provider=BlobProvider.GCS)
+def test_without_a_bucket_artifacts_go_to_the_filesystem(tmp_path) -> None:
+    for bucket in (None, ""):
+        store = open_blob_store(BlobSettings(root=tmp_path, bucket=bucket))
+        assert isinstance(store, FilesystemBlobStore)
 
 
 def test_gcs_settings_open_the_gcs_adapter_on_their_bucket(monkeypatch) -> None:
@@ -276,13 +275,13 @@ def test_gcs_settings_open_the_gcs_adapter_on_their_bucket(monkeypatch) -> None:
             opened.append(bucket)
 
     monkeypatch.setattr("agent_runs.blob.GCSBlobStore", Recorded)
-    store = open_blob_store(BlobSettings(provider=BlobProvider.GCS, bucket="b-1"))
+    store = open_blob_store(BlobSettings(bucket="b-1"))
     assert isinstance(store, Recorded) and opened == ["b-1"]
 
 
 def test_gcs_is_chosen_with_a_bucket(fake_gcs, monkeypatch) -> None:
     monkeypatch.setenv("STORAGE_EMULATOR_HOST", fake_gcs)
-    settings = BlobSettings(provider=BlobProvider.GCS, bucket=BUCKET)
+    settings = BlobSettings(bucket=BUCKET)
     assert isinstance(open_blob_store(settings), GCSBlobStore)
 
 

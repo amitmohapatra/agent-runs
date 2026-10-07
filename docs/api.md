@@ -553,8 +553,8 @@ The log is deleted with its run ([run retention](#run-retention)).
 ## Artifacts
 
 A payload too large for a checkpoint or an interrupt (an `ask` table, a diff, a report) is
-uploaded as a **run artifact**: its bytes go to blob storage (`RUNS__BLOB__PROVIDER`:
-filesystem or GCS), its record to PostgreSQL, and the run carries only the returned
+uploaded as a **run artifact**: its bytes go to blob storage (GCS when
+`RUNS__BLOB__BUCKET` is set, else a directory), its record to PostgreSQL, and the run carries only the returned
 `ArtifactRef`, typically as `Interrupt.payload_ref`. Checkpoints stay small.
 
 ### `POST /v1/runs/{id}/artifacts?worker_id=&checksum=` → `201 ArtifactRef` (`200` for a repeat)

@@ -37,7 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = await connect(settings.database)
+        engine = await connect(settings.database, settings.service.worker_count)
         app.state.engine = engine
         app.state.sessions = async_sessionmaker(engine, expire_on_commit=False)
         app.state.limiter = TenantRateLimiter(settings.rate_limit, engine)

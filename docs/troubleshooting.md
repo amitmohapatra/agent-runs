@@ -17,7 +17,7 @@ means in practice, and what to do.
 | `413 PAYLOAD_TOO_LARGE` | `PayloadTooLargeError` | a body past 4 MiB, a run's `input` or `output` past 1 MiB, a `checkpoint` past 1 MiB, an artifact past 50 MiB | put large payloads in an artifact (`artifacts.upload`) and pass its `ArtifactRef` |
 | `422 VALIDATION` | `ValidationError` | the body fails the contracts' validators; an answer that does not fit the interrupt's `expects` or options; a pause whose `expects` is no JSON Schema; a webhook URL this deployment does not deliver to | the detail says what does not fit; the run keeps waiting for a good answer |
 | `429 RATE_LIMIT` | `RateLimitedError` | the tenant's request budget is spent | the SDK waits `Retry-After` and retries; raise `RUNS__RATE_LIMIT__PER_MINUTE` or `BURST` |
-| `503 DEPENDENCY_UNAVAILABLE` | `DependencyUnavailableError` | PostgreSQL did not answer (or no pooled connection was free in time, or a statement passed its timeout), or the Memory Service could not be asked | the SDK retries; check the database and `RUNS__MEMORY__URL`, and the pool settings under load |
+| `503 DEPENDENCY_UNAVAILABLE` | `DependencyUnavailableError` | PostgreSQL did not answer (or no pooled connection was free in time, or a statement passed its timeout), or the Memory Service could not be asked | the SDK retries; check the database and `RUNS__MEMORY__URL`, and `RUNS__DATABASE__CONNECTION_BUDGET` under load |
 | `500 INTERNAL` | `RunsError` | a fault here, such as an artifact whose bytes no longer match their checksum | the response's `request_id` finds it in the logs |
 
 ## Symptoms
@@ -26,8 +26,8 @@ means in practice, and what to do.
 `make migrate` (`alembic upgrade head`) against `RUNS__DATABASE__URL` first. `make up` runs
 the migration as a one-shot service.
 
-**`RUNS__BLOB__PROVIDER=filesystem is for dev and test only`.** Outside `dev` and `test` set
-`RUNS__BLOB__PROVIDER=gcs` and `RUNS__BLOB__BUCKET`.
+**`RUNS__BLOB__BUCKET is required in 'prod'`.** Outside `dev` and `test` artifacts need a
+GCS bucket: set `RUNS__BLOB__BUCKET` (the filesystem blob store is for a single machine).
 
 **A queued run is never claimed.** One of these:
 

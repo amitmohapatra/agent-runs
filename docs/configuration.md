@@ -19,15 +19,14 @@ production deployment sets at least these:
 RUNS__SERVICE__ENVIRONMENT=prod
 RUNS__DATABASE__URL=postgresql+psycopg://runs:${DB_PASSWORD}@db.internal:5432/agent_runs
 RUNS__MEMORY__URL=https://memory.internal
-RUNS__BLOB__PROVIDER=gcs
 RUNS__BLOB__BUCKET=acme-agent-runs-artifacts
 RUNS__TICKER__HEARTBEAT_FILE=/run/agent-runs/ticker.beat
 RUNS__RUNS__MAX_RUN_SECONDS=3600
 RUNS__RUNS__RETENTION_DAYS=90
 ```
 
-`Settings` refuses to start with the filesystem blob store outside `dev` and `test`, and with
-`gcs` and no bucket.
+`Settings` refuses to start outside `dev` and `test` without `RUNS__BLOB__BUCKET`: the
+filesystem blob store is for one machine.
 
 ## Service (`RUNS__SERVICE__*`)
 
@@ -52,21 +51,19 @@ RUNS__RUNS__RETENTION_DAYS=90
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | **set it** | API, ticker, alembic | the database; both processes refuse to start on one that is not at the head revision (`make migrate`) | `postgresql+psycopg://runs:…@db:5432/agent_runs` |
-| `RUNS__DATABASE__POOL_SIZE` | `10` | yes | API, ticker | connections per process (per worker) | `20` |
-| `RUNS__DATABASE__MAX_OVERFLOW` | `10` | yes | API, ticker | connections opened past the pool under a burst | `5` |
-| `RUNS__DATABASE__POOL_TIMEOUT_SECONDS` | `5` | yes | API, ticker | wait for a pooled connection before answering `503` | `2` |
-| `RUNS__DATABASE__POOL_RECYCLE_SECONDS` | `300` | yes | API, ticker | a pooled connection older than this is replaced, not reused | `120` |
-| `RUNS__DATABASE__POOL_PRE_PING` | `true` | yes | API, ticker | test a pooled connection on checkout; a dead one is replaced, not handed to a request | `true` |
-| `RUNS__DATABASE__CONNECT_TIMEOUT_SECONDS` | `5` | yes | API, ticker | opening a connection to PostgreSQL | `3` |
-| `RUNS__DATABASE__STATEMENT_TIMEOUT_MS` | `15000` | yes | API, ticker | PostgreSQL cancels a statement past this (`503` here); `0` is no limit | `5000` |
+| `RUNS__DATABASE__CONNECTION_BUDGET` | unset: 20 per process | yes | API, ticker | connections one container may open, all its processes together (at least 2): each process (an API worker; the ticker is one) takes `budget // processes`, half kept open and half for a burst | `40` |
+
+The pool's protections are not settings: every pooled connection is pre-pinged on checkout (a
+dead one is replaced, not handed to a request) and replaced after 300 s, a request waits at
+most 5 s for one (then `503`), opening one times out after 5 s, and PostgreSQL cancels a
+statement past 15 s (`503`). They are the `DB_*` constants.
 
 ## Blob storage, for artifacts (`RUNS__BLOB__*`)
 
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
-| `RUNS__BLOB__PROVIDER` | `filesystem` | **set it** | API, ticker | `filesystem` (dev and test only) or `gcs` | `gcs` |
-| `RUNS__BLOB__ROOT` | `.blob` | yes (dev) | API, ticker | the filesystem store's directory, shared by both processes | `/var/lib/agent-runs/blobs` |
-| `RUNS__BLOB__BUCKET` | unset | **set it** with `gcs` | API, ticker | the GCS bucket (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) | `acme-agent-runs-artifacts` |
+| `RUNS__BLOB__BUCKET` | unset: the filesystem store (dev and test only) | **set it** | API, ticker | artifacts go to this GCS bucket exactly when it is set (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) | `acme-agent-runs-artifacts` |
+| `RUNS__BLOB__ROOT` | `.blob` | yes (dev) | API, ticker | without a bucket, the filesystem store's directory, shared by both processes | `/var/lib/agent-runs/blobs` |
 
 ## Runs (`RUNS__RUNS__*`)
 

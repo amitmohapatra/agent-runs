@@ -13,9 +13,9 @@ from sqlalchemy import text
 
 from agent_runs.api.errors import is_unavailable
 from agent_runs.config.settings import (
-    BlobProvider,
     BlobSettings,
     DatabaseSettings,
+    PoolPlan,
     ServiceSettings,
     Settings,
     get_settings,
@@ -46,40 +46,68 @@ def test_the_memory_url_falls_back_to_the_platform_name(fresh_settings, monkeypa
 
 
 @pytest.mark.parametrize("environment", ["staging", "prod", "production"])
-def test_the_filesystem_blob_store_is_refused_outside_dev_and_test(environment) -> None:
-    with pytest.raises(ValidationError, match="filesystem is for dev and test only"):
+def test_a_deployment_needs_a_bucket(environment) -> None:
+    with pytest.raises(ValidationError, match="RUNS__BLOB__BUCKET is required"):
         Settings(service=ServiceSettings(environment=environment))
     deployed = Settings(
-        service=ServiceSettings(environment=environment),
-        blob=BlobSettings(provider=BlobProvider.GCS, bucket="artifacts"),
+        service=ServiceSettings(environment=environment), blob=BlobSettings(bucket="artifacts")
     )
-    assert deployed.blob.provider is BlobProvider.GCS
+    assert deployed.blob.bucket == "artifacts"
 
 
 @pytest.mark.parametrize("environment", ["dev", "test"])
 def test_the_filesystem_blob_store_runs_on_a_laptop_and_in_the_suite(environment) -> None:
-    assert Settings(service=ServiceSettings(environment=environment)).blob.provider is (
-        BlobProvider.FILESYSTEM
-    )
+    assert Settings(service=ServiceSettings(environment=environment)).blob.bucket is None
+
+
+def test_settings_that_were_removed_are_ignored_when_left_set(fresh_settings, monkeypatch) -> None:
+    for name, value in {
+        "RUNS__BLOB__PROVIDER": "filesystem",
+        "RUNS__DATABASE__POOL_SIZE": "3",
+        "RUNS__DATABASE__POOL_PRE_PING": "false",
+        "RUNS__DATABASE__STATEMENT_TIMEOUT_MS": "100",
+    }.items():
+        monkeypatch.setenv(name, value)
+    assert get_settings().database.pool_plan(1) == PoolPlan(size=10, overflow=10)
+
+
+@pytest.mark.parametrize(
+    ("budget", "processes", "plan"),
+    [
+        (None, 1, PoolPlan(10, 10)),
+        (None, 8, PoolPlan(10, 10)),
+        (40, 4, PoolPlan(5, 5)),
+        (25, 2, PoolPlan(6, 6)),
+        (9, 1, PoolPlan(5, 4)),
+        (2, 8, PoolPlan(1, 1)),
+    ],
+)
+def test_the_connection_budget_is_split_between_the_processes(budget, processes, plan) -> None:
+    assert DatabaseSettings(connection_budget=budget).pool_plan(processes) == plan
+
+
+def test_a_budget_below_one_pool_is_refused() -> None:
+    with pytest.raises(ValidationError):
+        DatabaseSettings(connection_budget=1)
 
 
 async def test_the_engine_carries_its_pool_and_timeout_protections(migrated) -> None:
-    config = SETTINGS.database.model_copy(
-        update={"pool_timeout_seconds": 2.5, "pool_recycle_seconds": 120, "max_overflow": 3}
-    )
-    engine = await connect(config)
+    engine = await connect(SETTINGS.database.model_copy(update={"connection_budget": 12}), 2)
     try:
         pool = engine.pool
-        assert (pool.timeout(), pool._recycle, pool._pre_ping) == (2.5, 120, True)  # type: ignore[attr-defined]
-        assert pool._max_overflow == 3  # type: ignore[attr-defined]
+        assert (pool.timeout(), pool._recycle, pool._pre_ping) == (5.0, 300, True)  # type: ignore[attr-defined]
+        assert (pool.size(), pool._max_overflow) == (3, 3)  # type: ignore[attr-defined]
         async with engine.connect() as conn:
             assert await conn.scalar(text("SHOW statement_timeout")) == "15s"
     finally:
         await engine.dispose()
 
 
-async def test_a_statement_past_its_timeout_is_cancelled_as_unavailable(migrated) -> None:
-    engine = await connect(SETTINGS.database.model_copy(update={"statement_timeout_ms": 100}))
+async def test_a_statement_past_its_timeout_is_cancelled_as_unavailable(
+    migrated, monkeypatch
+) -> None:
+    monkeypatch.setattr("agent_runs.store.database.DB_STATEMENT_TIMEOUT_MS", 100)
+    engine = await connect(SETTINGS.database)
     try:
         async with engine.connect() as conn:
             with pytest.raises(Exception) as cancelled:
@@ -87,13 +115,6 @@ async def test_a_statement_past_its_timeout_is_cancelled_as_unavailable(migrated
         assert is_unavailable(cancelled.value), "a 503, retryable, not a 500"
     finally:
         await engine.dispose()
-
-
-def test_the_database_defaults_are_the_documented_ones() -> None:
-    config = DatabaseSettings()
-    assert (config.pool_size, config.max_overflow, config.pool_pre_ping) == (10, 10, True)
-    assert (config.pool_timeout_seconds, config.pool_recycle_seconds) == (5.0, 300)
-    assert (config.connect_timeout_seconds, config.statement_timeout_ms) == (5, 15_000)
 
 
 async def test_the_registry_client_bounds_its_waits_and_keeps_connections_alive() -> None:
