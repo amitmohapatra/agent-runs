@@ -250,11 +250,10 @@ The suite runs against the local PostgreSQL in its own database (`agent_runs_tes
 and recreated per run) and skips with a reason when there is none. The key registry is a
 fake (`tests/conftest.py`, `FakeMemory`, a tiny ASGI app answering `/v1/keys/self`); the
 blob store is a filesystem one per test, and the GCS adapter also runs over an in-memory
-stand-in for the Google client. `RUNS_TEST_GCS=1` also runs the GCS adapter and an
-end-to-end artifact test against a fake GCS server (`fsouza/fake-gcs-server`, started in
-Docker on a free port and removed afterwards; needs Docker); without it those six tests
-skip. Migrations live in `alembic/versions`; a test checks they build exactly the schema the
-code maps.
+stand-in for the Google client and against a fake GCS server (`fsouza/fake-gcs-server`,
+started in Docker on a free port and removed afterwards, so the suite needs Docker), with an
+end-to-end artifact test on it. Migrations live in `alembic/versions`; a test checks they
+build exactly the schema the code maps.
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: ruff, pyright
 (the service and the SDK), the migrations up, down to base and up again, the suite with the

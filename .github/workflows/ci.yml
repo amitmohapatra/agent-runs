@@ -45,8 +45,7 @@ jobs:
       - run: uv run ruff format --check src tests alembic sdk/python examples scripts
       - run: uv run pyright
       - run: uv run alembic upgrade head && uv run alembic downgrade base && uv run alembic upgrade head
-      # the GCS adapter's fake-server tests stay opt-in (RUNS_TEST_GCS=1); the in-memory
-      # client covers the adapter here
+      # the GCS adapter's tests start a fake GCS server in Docker (the runner has it)
       - run: uv run pytest -q --cov --cov-report=term-missing --cov-fail-under=95
       # the SDK (sdk/python, trellis.runs): every line and branch
       - run: uv run pytest sdk/python/tests --cov=trellis.runs --cov-branch --cov-fail-under=100

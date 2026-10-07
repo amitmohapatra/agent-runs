@@ -14,7 +14,7 @@ lint: ## Ruff check and format check
 typecheck: ## Pyright
 	uv run pyright
 
-test: ## Run the service's suite (needs the local PostgreSQL), then the SDK's
+test: ## Run the service's suite (needs the local PostgreSQL and Docker), then the SDK's
 	uv run pytest -q
 	uv run pytest -q sdk/python/tests
 

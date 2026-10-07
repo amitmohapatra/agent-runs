@@ -117,7 +117,6 @@ RUNS__RUNS__RETENTION_DAYS=90
 | `RUNS_TEST_ADMIN_URL` | `postgresql://memory:memory@localhost:5432/postgres` | the test suite, the examples | the admin connection that creates their databases |
 | `RUNS_TEST_DB` | `agent_runs_tests` | the test suite | the test database's name (dropped and recreated per run) |
 | `RUNS_EXAMPLES_DB` | `agent_runs_examples` | the examples | the examples' database's name (dropped and recreated per example) |
-| `RUNS_TEST_GCS` | unset | the test suite | `1` also runs the GCS adapter against a fake GCS server in Docker |
 
 The SDK's own defaults (a 10 s timeout, 3 retries, a 60 s lease, a 25 s graceful stop) are
 constructor arguments and constants, listed in
