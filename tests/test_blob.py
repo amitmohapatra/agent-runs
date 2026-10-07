@@ -1,13 +1,12 @@
 """The blob port, against both adapters: create-only puts, reads verified against the
 recorded checksum as they stream, idempotent deletes. The GCS adapter runs over an in-memory
-stand-in for the Google client in every suite, and against a local fake GCS server
-(``fsouza/fake-gcs-server`` in Docker, on a free port, removed afterwards) when
-``RUNS_TEST_GCS=1``; the end-to-end test drives the API and the ticker on it."""
+stand-in for the Google client, and against a local fake GCS server
+(``fsouza/fake-gcs-server`` in Docker, on a free port, removed afterwards); the end-to-end test
+drives the API and the ticker on it."""
 
 from __future__ import annotations
 
 import hashlib
-import os
 import socket
 import subprocess
 import time
@@ -35,7 +34,6 @@ from agent_runs.config.constants import ARTIFACT_RETENTION
 from agent_runs.config.settings import BlobProvider, BlobSettings
 from tests.conftest import started
 
-GCS_OPT_IN = os.environ.get("RUNS_TEST_GCS") == "1"
 FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:latest"
 BUCKET = "runs-artifacts-test"
 
@@ -49,8 +47,6 @@ def _free_port() -> int:
 @pytest.fixture(scope="session")
 def fake_gcs() -> Iterator[str]:
     """A fake GCS server for this session, and its URL; stopped and removed afterwards."""
-    if not GCS_OPT_IN:
-        pytest.skip("set RUNS_TEST_GCS=1 to run the GCS adapter against a fake GCS server")
     port = _free_port()
     name = f"agent-runs-fake-gcs-{port}"
     url = f"http://127.0.0.1:{port}"
@@ -152,8 +148,8 @@ def fake_gcs_store() -> tuple[GCSBlobStore, FakeGCSClient]:
 
 @pytest.fixture(params=["filesystem", "gcs", "gcs-in-memory"])
 def store(request: pytest.FixtureRequest, tmp_path: Any) -> BlobStore:
-    """Each adapter. ``gcs`` is the real client against the fake GCS server (opt-in, needs
-    Docker); ``gcs-in-memory`` is the same adapter over an in-memory stand-in for the client,
+    """Each adapter. ``gcs`` is the real client against the fake GCS server (needs Docker);
+    ``gcs-in-memory`` is the same adapter over an in-memory stand-in for the client,
     so its own logic runs in every suite."""
     if request.param == "gcs":
         return request.getfixturevalue("gcs")
