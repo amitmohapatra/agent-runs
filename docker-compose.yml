@@ -33,6 +33,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   migrate:
     # One shot that the API and the ticker wait for: migrating from inside a process would
