@@ -37,7 +37,7 @@ service checks, **agent-contracts** holds the types on this API's wire, and **bi
 reaches models and MCP tools. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#among-the-five-trellis-repos)
 draws how they connect. Each block works in both ways of using Trellis:
 
-- **Way 1, wrapped.** `from trellis import Harness; h = Harness(); agent = h.wrap(my_agent)`.
+- **Way 1, wrapped.** `from trellis import Harness; h = Harness(); agent = h.wrap(my_agent, id="my-agent")`.
   The harness runs your agent (LangGraph, Deep Agents, OpenAI Agents SDK, Claude Agent SDK,
   a plain function) and uses this service through the SDK automatically.
 - **Way 2, pluggable blocks.** Keep your framework untouched and use `trellis.runs`
