@@ -8,6 +8,11 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # requires-python is ">=3.12": every supported minor version is proven, not just the oldest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     services:
       postgres:
         image: postgres:16
@@ -37,7 +42,7 @@ jobs:
           path: agent-contracts
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: agent-runs/uv.lock
       - run: uv sync --all-extras
