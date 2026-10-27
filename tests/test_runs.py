@@ -248,6 +248,19 @@ async def test_a_failure_carries_a_typed_error(client) -> None:
     assert ended["error"]["category"] == "TOOL"
 
 
+async def test_a_failure_an_acp_agent_reported_is_stored_and_read_back(client) -> None:
+    """The harness records an ACP agent's failed run (Kimi Code) under its adapter, ``acp``
+    (trellis-contracts 0.6.2): the run keeps it as it does every adapter's."""
+    run = (await client.post("/v1/runs", json=started())).json()
+    error = {"code": "ACPRunError", "category": "UNKNOWN", "message": "exit 3", "source": "acp"}
+    finished = await client.post(
+        f"/v1/runs/{run['run_id']}/finish", json={"status": "ERROR", "error": error}
+    )
+    assert finished.status_code == 200 and finished.json()["error"]["source"] == "acp"
+    stored = (await client.get(f"/v1/runs/{run['run_id']}")).json()
+    assert stored["status"] == "ERROR" and stored["error"]["source"] == "acp"
+
+
 async def test_an_ending_that_is_not_one_or_a_success_with_an_error_is_refused(client) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
     rid = run["run_id"]

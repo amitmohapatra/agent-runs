@@ -6,6 +6,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Requires `trellis-contracts>=0.6.2`**, whose `ErrorSource` has `acp`: the harness's
+  adapter for agents spoken to over the Agent Client Protocol (Kimi Code) records its failed
+  runs under it, and a run stores that error as it is. `docs/openapi.json` lists the value.
+  *Migration:* none; install the 0.6.2 contracts with this release.
+
 Breaking configuration changes: three kinds of setting are gone, because the service can work
 them out or because they were never a deployment's choice. A variable left set is ignored, not
 an error; set the replacement where one is named.

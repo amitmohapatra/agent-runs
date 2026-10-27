@@ -10,7 +10,7 @@ the service's committed `docs/openapi.json`. The pins below are copied from each
 | Package | Version | Relation |
 |---|---|---|
 | `agent-runs` and `trellis-runs` | **0.4.1** | this repo |
-| `trellis-contracts` (agent-contracts) | **0.6.1** | required by both: `>=0.6.1,<0.7` (schedules' `priority`, `concurrency_key` and `metadata` need 0.6.1) |
+| `trellis-contracts` (agent-contracts) | **0.6.2** | required by both: `>=0.6.2,<0.7` (schedules' `priority`, `concurrency_key` and `metadata` need 0.6.1; the `acp` error source, 0.6.2) |
 | `trellis-harness` (agent-harness) | **0.4.0** | requires `trellis-runs>=0.4.0`; its run store is `RunsClient` when `RUNS_URL` is set |
 | agent-memory-service | **0.3.0** | the key registry: `GET /v1/keys/self` ([the contract](api.md#the-introspection-contract-get-runs__memory__urlv1keysself)) |
 | bifrost-sdk | **0.3.0** | none |
