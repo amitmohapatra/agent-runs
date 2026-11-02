@@ -16,7 +16,11 @@ A claimed run is leased to this worker; a heartbeat extends the lease every thir
 the handler runs, and a worker that dies lets the lease lapse, after which agent-runs queues
 the run again as its next attempt. A heartbeat refused with ``LEASE_LOST`` (the lease lapsed
 and another worker took the run, or the run ended: past its deadline or its working time)
-cancels the handler: it must write nothing more. A heartbeat that says ``cancel_requested``
+cancels the handler: it must write nothing more. So does a lease no heartbeat could renew for
+its whole length (agent-runs unreachable): agent-runs may give the run to another worker then.
+A run claimed again by the worker still working its earlier attempt (whose lease lapsed) stops
+that attempt first: both name this worker, so agent-runs' fence cannot tell them apart. A
+heartbeat that says ``cancel_requested``
 (someone cancelled the run: ``RunsClient.cancel``) cancels the handler too, and the worker
 then finishes the run ``CANCELLED`` (:attr:`Job.cancel_requested` tells the handler why it
 was cancelled). Schedules and resumed durable runs arrive the same way: as queued runs.
@@ -408,6 +412,17 @@ class Worker:
         lease cancels it, and so does the end of the working time and its grace (then the run
         ends ``TIMEOUT``)."""
         record = claimed.run
+        stale = self._held.get(record.run_id)
+        if stale is not None:
+            # its earlier attempt's lease lapsed (its heartbeats did not arrive) and agent-runs
+            # gave the run to this worker again: both name this worker, so agent-runs' fence
+            # cannot tell them apart. The earlier one stops (writing nothing) before this one
+            log.warning(
+                "run %s claimed again while its earlier attempt works: stopping that attempt",
+                record.run_id,
+            )
+            stale[1].cancel()
+            await asyncio.wait({stale[1]})
         job = Job(record, self.worker_id, self.lease_seconds, self.store)
         job._renew(claimed.lease)
         execution = asyncio.ensure_future(self.handler(job))
@@ -435,7 +450,8 @@ class Worker:
                 log.exception("run %s failed in the worker", record.run_id)
                 await self._end(job, RunStatus.ERROR, error=AgentError.of(exc))
         finally:
-            self._held.pop(record.run_id, None)
+            # its own entry only: a later attempt of the run may hold the run's id by now
+            self._held = {run: held for run, held in self._held.items() if held[1] is not execution}
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
@@ -483,6 +499,16 @@ class Worker:
                 return
             except Exception as exc:
                 log.warning("heartbeat for %s failed: %s", record.run_id, exc)
+                if _clock() - job._renewed.at >= self.lease_seconds:
+                    # no heartbeat renewed the lease for its whole length: agent-runs may give
+                    # the run to another worker now, so this attempt writes nothing more
+                    log.warning(
+                        "lease on %s lapsed: no heartbeat answered for %s s: stopping it",
+                        record.run_id,
+                        self.lease_seconds,
+                    )
+                    execution.cancel()
+                    return
             else:
                 job._renew(lease)
                 if lease.cancel_requested:

@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **SDK `Worker`: one attempt of a run at a time, and none past its lease.** A handler whose
+  lease no heartbeat could renew for the lease's length (agent-runs unreachable) is stopped as
+  for a lost lease, writing nothing more: agent-runs may already have given the run to another
+  worker. A run the worker claims again while it still works the earlier attempt stops that
+  attempt first (both name the worker, so the service's fence cannot tell them apart). Before,
+  both attempts went on side by side: with agent-runs down 75 s, a run's writes were done twice
+  (14 of 25, live). Nothing to do.
 * **A run's inbox** (**requires `trellis-contracts>=0.6.4`**). `POST /v1/runs/{id}/messages`
   keeps an `INSTRUCTION` or a `PAUSE` (`RunMessage`) at the next position of the run's inbox,
   and `GET /v1/runs/{id}/messages?after=` reads it; the lease says the newest position
