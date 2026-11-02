@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Listing one user's or one thread's runs reads an index.** `GET /v1/runs?user_id=` (a
+  person's tasks) and `?thread_id=` (a conversation's turns and its tasks, read at each turn)
+  were served by the tenant's newest runs, filtered: at 100k runs, 22k rows filtered for a
+  user (2.3 ms) and a sequential scan for an old thread (9.5 ms). `ix_runs_user` and
+  `ix_runs_thread` (tenant, filter, `created_at`) serve them: 0.19 ms and 0.15 ms.
+  *Migration:* `alembic upgrade head` (`2c8d3e4f5a6b`: two indexes; `downgrade` drops them).
 * **A run's inbox** (**requires `trellis-contracts>=0.6.4`**). `POST /v1/runs/{id}/messages`
   keeps an `INSTRUCTION` or a `PAUSE` (`RunMessage`) at the next position of the run's inbox,
   and `GET /v1/runs/{id}/messages?after=` reads it; the lease says the newest position
