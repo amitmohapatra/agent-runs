@@ -450,8 +450,8 @@ class Worker:
                 log.exception("run %s failed in the worker", record.run_id)
                 await self._end(job, RunStatus.ERROR, error=AgentError.of(exc))
         finally:
-            if self._held.get(record.run_id, (None, None))[1] is execution:
-                del self._held[record.run_id]
+            # its own entry only: a later attempt of the run may hold the run's id by now
+            self._held = {run: held for run, held in self._held.items() if held[1] is not execution}
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
