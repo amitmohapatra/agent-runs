@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, Header, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import now
-from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
+from trellis.contracts.runs import InterruptResolution, RunMessage, RunRecord, RunStatus
 
 from agent_runs.api import examples
 from agent_runs.api.deps import Claiming, Session, Who
@@ -40,6 +40,7 @@ from agent_runs.domain.runs import (
     EventsAppended,
     HeartbeatRequest,
     Lease,
+    MessageSend,
     ReleaseRequest,
     ResolutionEntry,
     RunCancel,
@@ -514,6 +515,68 @@ async def _follow(request: Request, tenant_id: str, run_id: str, after: int) -> 
             yield ": keepalive\n\n"
 
 
+@router.post(
+    "/{run_id}/messages",
+    status_code=_CREATED,
+    summary="Send a run a message: an instruction, or a pause",
+    response_description="Created: the message as the run's inbox keeps it, with its position.",
+    responses={
+        200: {
+            "model": RunMessage,
+            "description": "A repeat: this `message_id` was sent already; the message as kept.",
+        },
+        403: {
+            "description": "AUTHORIZATION: the key may not act for the run's user (a key "
+            "restricted to listed people reaches only their runs, as them)."
+        },
+        **conflict(
+            "CONFLICT: the run has ended; a PAUSE of a run already waiting on a person; or "
+            "this `message_id` was sent with another message."
+        ),
+    },
+)
+async def send_message(
+    run_id: RunId,
+    body: Annotated[MessageSend, Body(openapi_examples=examples.MESSAGE)],
+    db: Session,
+    who: Who,
+    response: Response,
+) -> RunMessage:
+    """Put a message in the run's inbox, at its next position: an ``INSTRUCTION`` the run
+    takes at its next step, its work so far kept, or a ``PAUSE`` (the run pauses at its next
+    step and waits on a person: resume it with ``POST /v1/runs/{run_id}/resume``). The worker
+    holding the run reads the inbox past the last position it read; its lease says the newest
+    one (``inbox``). A queued or paused run reads it when it works. ``sender`` is the key's
+    principal unless the key names the person it acts for."""
+    message, created = await RunStore(db).send_message(
+        who.tenant_id, run_id, body, sender=who.credential, now=now()
+    )
+    await db.commit()
+    if not created:
+        response.status_code = 200
+    return message
+
+
+@router.get(
+    "/{run_id}/messages",
+    summary="Read a run's inbox",
+    response_description="The run's messages past `after`, oldest first, at most `limit`.",
+    responses={403: {"description": "AUTHORIZATION: the key may not act for the run's user."}},
+)
+async def messages(
+    run_id: RunId,
+    db: Session,
+    who: Who,
+    after: AfterQuery = 0,
+    limit: LimitQuery = DEFAULT_LIMIT,
+) -> list[RunMessage]:
+    """The run's inbox from position ``after`` on, as its worker reads it at each step: pass
+    the last ``position`` taken as ``after`` for the rest."""
+    return await RunStore(db).messages(
+        who.tenant_id, run_id, reader=who.credential, after=after, limit=limit
+    )
+
+
 _RESOLUTIONS_CURSOR = {"recorded_at": datetime, "resolution_id": str}
 _RUNS_CURSOR = {"created_at": datetime, "run_id": str}
 
@@ -565,6 +628,7 @@ async def listing(
     parent_run_id: Annotated[
         str | None, Query(description="Only the child runs of this run.")
     ] = None,
+    user_id: Annotated[str | None, Query(description="Only the runs of this user.")] = None,
     top_level: Annotated[
         bool,
         Query(
@@ -585,6 +649,7 @@ async def listing(
         agent_id=agent_id,
         thread_id=thread_id,
         parent_run_id=parent_run_id,
+        user_id=user_id,
         top_level=top_level,
         limit=limit,
         after=decode_cursor(cursor, fields=_RUNS_CURSOR),

@@ -54,6 +54,8 @@ class Store:
         #: the working time left that every lease reports, and whether a cancel was asked
         self.remaining: float | None = None
         self.cancelling = False
+        #: the newest position of the run's inbox every heartbeat reports
+        self.inbox = 0
         #: set on every claim and heartbeat, for a test waiting until enough of them came
         self.changed = asyncio.Event()
 
@@ -100,6 +102,7 @@ class Store:
             expires_at=NOW,
             remaining_seconds=self.remaining,
             cancel_requested=self.cancelling,
+            inbox=self.inbox,
         )
 
     async def release(
@@ -313,6 +316,21 @@ async def test_the_job_says_the_working_time_left_as_the_leases_come(
 
     assert await Worker(store, handler, ["triage"]).run_once()
     assert seen == [60.0, 45.0, 30.0, 0.0, 20.0]
+
+
+async def test_the_job_says_the_newest_position_of_the_inbox_as_the_leases_come() -> None:
+    store = Store(run())
+    seen: list[int] = []
+
+    async def handler(job: Job) -> None:
+        seen.append(job.inbox)
+        store.inbox = 2
+        await job.checkpoint({"step": 1})
+        seen.append(job.inbox)
+
+    assert await Worker(store, handler, ["triage"]).run_once()
+    assert seen == [0, 2]
+    assert Job(run(), "w-1", 60, Store()).inbox == 0
 
 
 async def test_a_run_without_a_limit_has_no_remaining_time() -> None:

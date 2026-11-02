@@ -30,9 +30,12 @@ from trellis.contracts.runs import (
     Interrupt,
     InterruptResolution,
     RunEvent,
+    RunMessage,
+    RunMessageKind,
     RunRecord,
     RunStart,
     RunStatus,
+    RunUsage,
 )
 from trellis.runs import _transport
 from trellis.runs._transport import (
@@ -135,14 +138,19 @@ class RunsClient:
         *,
         lease_seconds: int = LEASE_SECONDS,
         checkpoint: dict[str, Any] | None = None,
+        usage: RunUsage | None = None,
         tenant: str | None = None,
     ) -> Lease:
         """Extend the lease; with ``checkpoint``, also save it as the run's progress (it
-        replaces the run's checkpoint; without, the one there is kept). Any ``409`` raises
-        :class:`LeaseLostError`: this worker does not hold a running lease on the run."""
+        replaces the run's checkpoint; without, the one there is kept), and with ``usage``
+        what the run has used so far. The lease says the newest position of the run's inbox
+        (``inbox``). Any ``409`` raises :class:`LeaseLostError`: this worker does not hold a
+        running lease on the run."""
         body: dict[str, Any] = {"worker_id": worker_id, "lease_seconds": lease_seconds}
         if checkpoint is not None:
             body["checkpoint"] = checkpoint
+        if usage is not None:
+            body["usage"] = usage.model_dump(mode="json")
         try:
             data = await self._transport.json(
                 "POST", f"/v1/runs/{run_id}/heartbeat", tenant=tenant, json=body
@@ -184,10 +192,17 @@ class RunsClient:
         *,
         checkpoint: dict[str, Any] | None = None,
         worker_id: str | None = None,
+        usage: RunUsage | None = None,
     ) -> RunRecord:
         """The run (``interrupt.run_id``) waits on ``interrupt``, keeping ``checkpoint`` for
-        whichever worker resumes it. ``worker_id`` fences the write to the lease holder."""
-        body = {"interrupt": interrupt.model_dump(mode="json"), "checkpoint": checkpoint}
+        whichever worker resumes it (and ``usage``, what it has used so far). ``worker_id``
+        fences the write to the lease holder."""
+        body: dict[str, Any] = {
+            "interrupt": interrupt.model_dump(mode="json"),
+            "checkpoint": checkpoint,
+        }
+        if usage is not None:
+            body["usage"] = usage.model_dump(mode="json")
         data = await self._transport.json(
             "POST",
             f"/v1/runs/{interrupt.run_id}/pause",
@@ -239,13 +254,17 @@ class RunsClient:
         output: Any = None,
         error: AgentError | None = None,
         worker_id: str | None = None,
+        usage: RunUsage | None = None,
         tenant: str | None = None,
     ) -> RunRecord:
-        """End the run with ``status`` (an ending). The same finish repeated answers the
-        stored run. ``worker_id`` fences the write to the lease holder."""
+        """End the run with ``status`` (an ending), keeping ``usage`` (what it used) when
+        given. The same finish repeated answers the stored run. ``worker_id`` fences the
+        write to the lease holder."""
         body: dict[str, Any] = {"status": status.value, "output": output}
         if error is not None:
             body["error"] = error.model_dump(mode="json")
+        if usage is not None:
+            body["usage"] = usage.model_dump(mode="json")
         data = await self._transport.json(
             "POST",
             f"/v1/runs/{run_id}/finish",
@@ -268,6 +287,7 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        user_id: str | None = None,
         top_level: bool = False,
         cursor: str | None = None,
         limit: int = PAGE_LIMIT,
@@ -282,6 +302,7 @@ class RunsClient:
             "agent_id": agent_id,
             "thread_id": thread_id,
             "parent_run_id": parent_run_id,
+            "user_id": user_id,
             "top_level": "true" if top_level else None,
             "cursor": cursor,
         }
@@ -301,6 +322,7 @@ class RunsClient:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        user_id: str | None = None,
         top_level: bool = False,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
@@ -317,6 +339,7 @@ class RunsClient:
                 agent_id=agent_id,
                 thread_id=thread_id,
                 parent_run_id=parent_run_id,
+                user_id=user_id,
                 top_level=top_level,
                 cursor=cursor,
                 limit=limit,
@@ -348,6 +371,46 @@ class RunsClient:
         return Page[ResolutionEntry](
             items=[ResolutionEntry.model_validate(row) for row in rows], next_cursor=after
         )
+
+    # ------------------------------------------------------------------ the inbox
+    async def send_message(
+        self,
+        run_id: str,
+        kind: RunMessageKind,
+        *,
+        message_id: str,
+        text: str | None = None,
+        sender: str | None = None,
+        tenant: str | None = None,
+    ) -> RunMessage:
+        """Put a message in the run's inbox: an ``INSTRUCTION`` (``text``) the run takes at
+        its next step, wherever it works, or a ``PAUSE``. ``sender`` names the person it is
+        from (a key that may act for them); absent, the key's own principal. Safe to retry
+        with the same ``message_id``. :class:`ConflictError` once the run ended (or for a
+        pause of a run already waiting on a person); :class:`AuthorizationError` for a key
+        that may not act for the run's user."""
+        body: dict[str, Any] = {"message_id": message_id, "kind": RunMessageKind(kind).value}
+        if text is not None:
+            body["text"] = text
+        if sender is not None:
+            body["sender"] = sender
+        data = await self._transport.json(
+            "POST", f"/v1/runs/{run_id}/messages", tenant=tenant, json=body
+        )
+        return RunMessage.model_validate(data)
+
+    async def messages(
+        self, run_id: str, *, after: int = 0, limit: int = PAGE_LIMIT, tenant: str | None = None
+    ) -> list[RunMessage]:
+        """The run's inbox past position ``after``, oldest first, at most ``limit``: what a
+        run reads at each step, past the last position it took."""
+        data = await self._transport.json(
+            "GET",
+            f"/v1/runs/{run_id}/messages",
+            tenant=tenant,
+            params={"after": after, "limit": limit},
+        )
+        return [RunMessage.model_validate(message) for message in data]
 
     # ------------------------------------------------------------------ events
     async def append_events(

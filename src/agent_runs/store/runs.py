@@ -24,13 +24,20 @@ from trellis.contracts.runs import (
     InterruptDecision,
     InterruptResolution,
     RunEvent,
+    RunMessage,
+    RunMessageKind,
     RunRecord,
     RunStart,
     RunStatus,
+    RunUsage,
 )
 from trellis.runs.answers import answer_problem, schema_problem
 
-from agent_runs.answering import require_may_answer, require_may_cancel
+from agent_runs.answering import (
+    require_may_answer,
+    require_may_cancel,
+    require_may_message,
+)
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     CONCURRENCY_PER_KEY,
@@ -51,6 +58,7 @@ from agent_runs.domain.runs import (
     EventsAppended,
     HeartbeatRequest,
     Lease,
+    MessageSend,
     ReleaseRequest,
     ResolutionEntry,
     RunCancel,
@@ -64,7 +72,13 @@ from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import ArtifactRow, ResolutionRow, RunEventRow, RunRow
+from agent_runs.store.tables import (
+    ArtifactRow,
+    ResolutionRow,
+    RunEventRow,
+    RunMessageRow,
+    RunRow,
+)
 
 _RECORD_FIELDS = (
     "run_id",
@@ -89,6 +103,7 @@ _RECORD_FIELDS = (
     "agent_version",
     "priority",
     "concurrency_key",
+    "usage",
     "created_at",
     "updated_at",
 )
@@ -146,6 +161,25 @@ def _record(row: RunRow, now: datetime) -> RunRecord:
 
 def _json(model: Any) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True) if model is not None else None
+
+
+def _used(row: RunRow, usage: RunUsage | None) -> None:
+    """Keep what the run has used, when its executor said (absent: kept as it is)."""
+    if usage is not None:
+        row.usage = usage.model_dump(mode="json")
+
+
+def _message(row: RunMessageRow) -> RunMessage:
+    return RunMessage(
+        message_id=row.message_id,
+        tenant_id=row.tenant_id,
+        run_id=row.run_id,
+        kind=RunMessageKind(row.kind),
+        text=row.text,
+        sender=row.sender,
+        position=row.position,
+        created_at=row.created_at,
+    )
 
 
 def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: bool) -> list[str]:
@@ -376,6 +410,7 @@ class RunStore:
             await self._ended([row], now)
             return await self._flushed(row, now), True
         _move(row, RunStatus.PAUSED, now)
+        _used(row, pause.usage)
         row.checkpoint = checkpoint
         row.awaiting = interrupt.awaiting()
         row.assignee = interrupt.assignee
@@ -518,6 +553,7 @@ class RunStore:
         if _settled(row, ending.status, worker_id) or requeued:
             return _record(row, now), False
         _fence(row, worker_id)
+        _used(row, ending.usage)
         if _retried(row, ending):
             row.error_retries += 1
             wait = backoff(ERROR_RETRY_BASE, row.error_retries, cap=ERROR_RETRY_CAP)
@@ -652,6 +688,9 @@ class RunStore:
         if checkpoint is not None:
             row.checkpoint = checkpoint
             row.updated_at = now
+        if request.usage is not None:
+            _used(row, request.usage)
+            row.updated_at = now
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
         return lease
@@ -694,6 +733,7 @@ class RunStore:
             expires_at=expires_at,
             remaining_seconds=remaining,
             cancel_requested=cancelling is not None,
+            inbox=row.inbox_position,
         )
 
     # ------------------------------------------------------------------ the ticker's sweeps
@@ -962,6 +1002,62 @@ class RunStore:
         ended = [row.run_id for row in rows if RunStatus(row.status).final]
         await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
 
+    # ------------------------------------------------------------------ the inbox
+    async def send_message(
+        self, tenant_id: str, run_id: str, send: MessageSend, *, sender: KeyInfo, now: datetime
+    ) -> tuple[RunMessage, bool]:
+        """Keep ``send`` at the next position of the run's inbox, as ``sender`` may: a key that
+        may act for the run's user (``answering.require_may_message``), checked before
+        anything is written. A run that has not ended takes it (a queued or paused one reads
+        it when it works); a pause of a run already waiting on a person is a ``Conflict``.
+        Returns ``(message, created)``: the same ``message_id`` sent again answers the kept
+        message with ``created`` false, and a different message under it is a ``Conflict``."""
+        row = await self._locked(tenant_id, run_id, worker_id=None)
+        principal = require_may_message(sender, row.user_id, send.sender)
+        kept = await self._session.scalar(
+            select(RunMessageRow).where(
+                RunMessageRow.run_id == run_id, RunMessageRow.message_id == send.message_id
+            )
+        )
+        if kept is not None:
+            if (kept.kind, kept.text, kept.sender) != (send.kind.value, send.text, principal):
+                raise Conflict(f"message {send.message_id} was sent with another message")
+            return _message(kept), False
+        status = RunStatus(row.status)
+        if status.final:
+            raise Conflict(f"run {run_id} is {status}; its inbox takes nothing more")
+        if send.kind is RunMessageKind.PAUSE and status is RunStatus.PAUSED:
+            raise Conflict(f"run {run_id} already waits on a person: resume it instead")
+        row.inbox_position += 1
+        added = RunMessageRow(
+            run_id=run_id,
+            position=row.inbox_position,
+            tenant_id=tenant_id,
+            message_id=send.message_id,
+            kind=send.kind.value,
+            text=send.text,
+            sender=principal,
+            created_at=now,
+        )
+        self._session.add(added)
+        await self._session.flush()
+        return _message(added), True
+
+    async def messages(
+        self, tenant_id: str, run_id: str, *, reader: KeyInfo, after: int, limit: int
+    ) -> list[RunMessage]:
+        """The run's inbox past position ``after``, oldest first, at most ``limit``, for a key
+        that may act for the run's user."""
+        row = await self._found(tenant_id, run_id)
+        require_may_message(reader, row.user_id, None)
+        rows = await self._session.scalars(
+            select(RunMessageRow)
+            .where(RunMessageRow.run_id == run_id, RunMessageRow.position > after)
+            .order_by(RunMessageRow.position)
+            .limit(limit)
+        )
+        return [_message(r) for r in rows]
+
     # ------------------------------------------------------------------ reads
     async def resolutions(
         self,
@@ -1006,6 +1102,7 @@ class RunStore:
         agent_id: str | None = None,
         thread_id: str | None = None,
         parent_run_id: str | None = None,
+        user_id: str | None = None,
         top_level: bool = False,
         limit: int = DEFAULT_PAGE,
         after: Mapping[str, Any] | None = None,
@@ -1024,6 +1121,7 @@ class RunStore:
             RunRow.agent_id: agent_id,
             RunRow.thread_id: thread_id,
             RunRow.parent_run_id: parent_run_id,
+            RunRow.user_id: user_id,
         }
         for column, value in filters.items():
             if value is not None:
