@@ -100,6 +100,14 @@ HEARTBEAT: Final[dict[str, Any]] = {
             "checkpoint": {"tools": {"call_1": {"output": "PO-17 created"}}},
         },
     },
+    "usage": {
+        "summary": "Extend the lease and save what the run has used",
+        "value": {
+            "worker_id": "w-1",
+            "lease_seconds": 60,
+            "usage": {"model_calls": 4, "tool_calls": 3, "commands": 1, "tokens": 5200},
+        },
+    },
 }
 
 RELEASE: Final[dict[str, Any]] = {
@@ -170,6 +178,22 @@ CANCEL: Final[dict[str, Any]] = {
         "value": {"reason": "the customer withdrew the request"},
     },
     "plain": {"summary": "Cancel", "value": {}},
+}
+
+MESSAGE: Final[dict[str, Any]] = {
+    "instruction": {
+        "summary": "An instruction the run takes at its next step",
+        "value": {
+            "message_id": "msg-1",
+            "kind": "INSTRUCTION",
+            "text": "Also compare against last quarter.",
+            "sender": "user:ada",
+        },
+    },
+    "pause": {
+        "summary": "Pause the run at its next step",
+        "value": {"message_id": "msg-2", "kind": "PAUSE"},
+    },
 }
 
 SCHEDULE: Final[dict[str, Any]] = {

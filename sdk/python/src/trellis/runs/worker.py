@@ -185,6 +185,14 @@ class Job:
         lease = self._renewed.lease
         return lease is not None and lease.cancel_requested
 
+    @property
+    def inbox(self) -> int:
+        """The position of the newest message in the run's inbox, as the latest lease said
+        it (0: none): past the last one the handler read, it reads the rest
+        (``RunsClient.messages``)."""
+        lease = self._renewed.lease
+        return 0 if lease is None else lease.inbox
+
     def _renew(self, lease: Lease) -> None:
         """Take in a lease agent-runs answered for the run (the worker calls it)."""
         self._renewed.lease, self._renewed.at = lease, _clock()

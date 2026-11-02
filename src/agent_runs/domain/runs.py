@@ -15,9 +15,11 @@ from trellis.contracts.runs import (
     Interrupt,
     InterruptResolution,
     RunEvent,
+    RunMessageKind,
     RunRecord,
     RunStart,
     RunStatus,
+    RunUsage,
 )
 
 from agent_runs.config.constants import (
@@ -85,6 +87,11 @@ class RunPause(BaseModel):
         description="The executor's opaque resume state (journal, framework state), at most "
         "1 MiB of compact JSON; replaces any earlier one, cleared when the run ends.",
     )
+    usage: RunUsage | None = Field(
+        default=None,
+        description="What the run has used so far (model and tool calls, commands, tokens, "
+        "cost), its executor's count: replaces the run's; absent, it is kept.",
+    )
 
     def bounded_checkpoint(self) -> dict[str, Any] | None:
         return bounded_checkpoint(self.checkpoint)
@@ -104,12 +111,52 @@ class RunFinish(BaseModel):
     error: AgentError | None = Field(
         default=None, description="Why it failed; only with ERROR, TIMEOUT or REJECTED."
     )
+    usage: RunUsage | None = Field(
+        default=None,
+        description="What the run has used so far (model and tool calls, commands, tokens, "
+        "cost), its executor's count: replaces the run's; absent, it is kept.",
+    )
 
     @model_validator(mode="after")
     def _is_an_ending(self) -> Self:
         if not self.status.final:
             raise ValueError(f"{self.status.value} is not how a run ends")
         RunRecord(run_id="-", tenant_id="-", agent_id="-", status=self.status, error=self.error)
+        return self
+
+
+class MessageSend(BaseModel):
+    """A message for a run's inbox (``RunMessage`` once kept): an instruction the run takes at
+    its next step, or a pause. ``sender`` names the person it is from, as a key that may act
+    for them may; absent, it is the key's own principal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    message_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description="The sender's id for it: sent again, nothing is added (200, the message "
+        "as kept); the same id with another message is 409.",
+    )
+    kind: RunMessageKind = Field(description="INSTRUCTION or PAUSE.")
+    text: str | None = Field(
+        default=None,
+        max_length=32_000,
+        description="The instruction: required for INSTRUCTION, none for PAUSE.",
+    )
+    sender: str | None = Field(
+        default=None,
+        max_length=256,
+        description="The person it is from (`kind:id`; a bare id is a user's): one the key may "
+        "act for. Absent: the key's own principal.",
+    )
+
+    @model_validator(mode="after")
+    def _instruction_has_text(self) -> Self:
+        if self.kind is RunMessageKind.INSTRUCTION and not (self.text or "").strip():
+            raise ValueError("an instruction carries its text")
+        if self.kind is RunMessageKind.PAUSE and self.text is not None:
+            raise ValueError("a pause carries no text")
         return self
 
 
@@ -155,6 +202,11 @@ class HeartbeatRequest(BaseModel):
         description="Progress to save: the executor's resume journal as it stands, at most "
         "1 MiB of compact JSON. Replaces the run's checkpoint; absent, it is kept.",
     )
+    usage: RunUsage | None = Field(
+        default=None,
+        description="What the run has used so far (model and tool calls, commands, tokens, "
+        "cost), its executor's count: replaces the run's; absent, it is kept.",
+    )
 
 
 class ReleaseRequest(BaseModel):
@@ -191,6 +243,11 @@ class Lease(BaseModel):
         description="Someone asked to cancel the run: stop working it and finish it CANCELLED. "
         "The lease is no longer extended; when it runs out the ticker cancels the run.",
     )
+    inbox: int = Field(
+        default=0,
+        description="The position of the newest message in the run's inbox (0: none): past "
+        "the last one the worker read, it reads the rest (GET /v1/runs/{run_id}/messages).",
+    )
 
 
 class RunSummary(BaseModel):
@@ -213,6 +270,10 @@ class RunSummary(BaseModel):
     )
     deadline: AwareDatetime | None = Field(
         default=None, description="The run's own deadline (not the interrupt's)."
+    )
+    user_id: str | None = Field(default=None, description="The user the run is for.")
+    usage: RunUsage | None = Field(
+        default=None, description="What the run has used so far, as its executor last saved it."
     )
     updated_at: AwareDatetime = Field(description="When the run last changed.")
 

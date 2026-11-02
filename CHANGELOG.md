@@ -6,6 +6,19 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A run's inbox** (**requires `trellis-contracts>=0.6.4`**). `POST /v1/runs/{id}/messages`
+  keeps an `INSTRUCTION` or a `PAUSE` (`RunMessage`) at the next position of the run's inbox,
+  and `GET /v1/runs/{id}/messages?after=` reads it; the lease says the newest position
+  (`Lease.inbox`, `Job.inbox`), so the worker holding the run, whichever it is, reads it at
+  its next step. Only keys that may act for the run's user reach it. SDK:
+  `RunsClient.send_message`, `RunsClient.messages`.
+* **What a run has used.** Heartbeat, pause and finish take `usage` (`RunUsage`: model and
+  tool calls, commands, tokens, cost), kept on the run (`RunRecord.usage`) and on its summary
+  (`RunSummary.usage`, with `user_id`); `GET /v1/runs?user_id=` lists one user's runs. The
+  webhook envelope's summary carries both too.
+  *Migration:* `alembic upgrade head` (`1b7c2d3e4f5a`: `run_messages`, two columns on
+  `agent_runs`); nothing else.
+
 * **Requires `trellis-contracts>=0.6.2`**, whose `ErrorSource` has `acp`: the harness's
   adapter for agents spoken to over the Agent Client Protocol (Kimi Code) records its failed
   runs under it, and a run stores that error as it is. `docs/openapi.json` lists the value.

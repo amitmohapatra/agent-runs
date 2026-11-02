@@ -12,8 +12,10 @@ from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import (
     InterruptDecision,
     InterruptResolution,
+    RunMessageKind,
     RunStart,
     RunStatus,
+    RunUsage,
 )
 from trellis.runs import (
     AuthorizationError,
@@ -290,3 +292,84 @@ async def test_resolutions_page_the_audit_trail(runs: RunsClient) -> None:
     assert dict(sent(route).url.params) == {"cursor": "c1", "limit": "10"}
     await runs.resolutions("run_1")
     assert dict(sent(route).url.params) == {"limit": "50"}
+
+
+# --------------------------------------------------------------------------- the inbox
+def _message(position: int = 1, **over: object) -> dict[str, object]:
+    return {
+        "message_id": "m1",
+        "tenant_id": "acme",
+        "run_id": "run_1",
+        "kind": "INSTRUCTION",
+        "text": "also check March",
+        "sender": "user:ada",
+        "position": position,
+        "created_at": "2026-11-02T10:00:00Z",
+        **over,
+    }
+
+
+async def test_send_message_puts_an_instruction_or_a_pause_in_the_inbox(
+    runs: RunsClient,
+) -> None:
+    with respx.mock:
+        route = respx.post(f"{URL}/v1/runs/run_1/messages").respond(201, json=_message())
+        sent_message = await runs.send_message(
+            "run_1",
+            RunMessageKind.INSTRUCTION,
+            message_id="m1",
+            text="also check March",
+            sender="user:ada",
+            tenant="acme",
+        )
+        assert json.loads(sent(route).content) == {
+            "message_id": "m1",
+            "kind": "INSTRUCTION",
+            "text": "also check March",
+            "sender": "user:ada",
+        }
+        assert sent(route).headers["X-Trellis-Tenant"] == "acme"
+        assert sent_message.position == 1
+        await runs.send_message("run_1", RunMessageKind.PAUSE, message_id="p1")
+        assert json.loads(sent(route).content) == {"message_id": "p1", "kind": "PAUSE"}
+
+
+async def test_messages_reads_the_inbox_past_a_position(runs: RunsClient) -> None:
+    with respx.mock:
+        route = respx.get(f"{URL}/v1/runs/run_1/messages").respond(
+            200, json=[_message(2, message_id="m2")]
+        )
+        read = await runs.messages("run_1", after=1)
+    assert dict(sent(route).url.params) == {"after": "1", "limit": "50"}
+    assert [(m.position, m.kind) for m in read] == [(2, RunMessageKind.INSTRUCTION)]
+
+
+async def test_heartbeat_pause_and_finish_carry_usage_and_the_lease_the_inbox(
+    runs: RunsClient,
+) -> None:
+    usage = RunUsage(model_calls=2, tool_calls=1, tokens=300)
+    with respx.mock:
+        beat = respx.post(f"{URL}/v1/runs/run_1/heartbeat").respond(
+            200, json={**lease(), "inbox": 3}
+        )
+        held = await runs.heartbeat("run_1", "w-1", usage=usage)
+        assert json.loads(sent(beat).content)["usage"]["model_calls"] == 2
+        assert held.inbox == 3
+        paused = respx.post(f"{URL}/v1/runs/run_1/pause").respond(
+            200, json=record(status="PAUSED", awaiting=interrupt().model_dump(mode="json"))
+        )
+        await runs.pause(interrupt(), usage=usage)
+        assert json.loads(sent(paused).content)["usage"]["tokens"] == 300
+        ended = respx.post(f"{URL}/v1/runs/run_1/finish").respond(
+            200, json=record(status="SUCCESS")
+        )
+        await runs.finish("run_1", RunStatus.SUCCESS, usage=usage)
+        assert json.loads(sent(ended).content)["usage"]["tool_calls"] == 1
+
+
+async def test_list_filters_by_user(runs: RunsClient) -> None:
+    with respx.mock:
+        route = respx.get(f"{URL}/v1/runs").respond(200, json=[summary(user_id="ada")])
+        page = await runs.list(user_id="ada")
+    assert sent(route).url.params["user_id"] == "ada"
+    assert page.items[0].user_id == "ada"
