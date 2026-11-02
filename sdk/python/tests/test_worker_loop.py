@@ -381,6 +381,70 @@ async def test_a_lost_lease_cancels_the_handler(caplog: pytest.LogCaptureFixture
     assert "lease on run_1 lost: stopping it" in caplog.text
 
 
+async def test_a_lease_that_lapsed_unrenewed_stops_the_handler(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """agent-runs cannot be reached: no heartbeat renews the lease. Once the lease's length
+    passed since the last renewal, agent-runs may give the run to another worker: the handler
+    stops as for a lost lease (writing nothing), not on, side by side with the next attempt."""
+    clock = [0.0]
+    monkeypatch.setattr(worker_module, "_clock", lambda: clock[0])
+
+    async def tick(seconds: float) -> None:
+        clock[0] += seconds
+        await asyncio.sleep(0.005)
+
+    monkeypatch.setattr(worker_module, "_sleep", tick)
+    store = Store(run())
+    store.beat_error = ConnectionError("agent-runs unreachable")
+    stopped = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stopped.set()
+            raise
+
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        assert await Worker(store, handler, ["triage"]).run_once()
+    assert stopped.is_set() and len(store.beats) == 3  # at 20, 40 and 60 s: lapsed at 60
+    assert store.writes == []  # nothing written: another worker may hold the run now
+    assert "lease on run_1 lapsed" in caplog.text
+
+
+async def test_a_run_claimed_again_while_its_earlier_attempt_works_stops_that_attempt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The earlier attempt's lease lapsed (its heartbeats did not arrive) and agent-runs gave
+    the run to this same worker again: both attempts name this worker, so agent-runs' fence
+    cannot tell them apart. The earlier one stops before the next one starts."""
+    first = run()
+    store = Store(first, first)
+    running: list[str] = []
+    overlapped: list[bool] = []
+    earlier_started = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        overlapped.append(bool(running))
+        running.append(job.record.run_id)
+        try:
+            if len(overlapped) == 1:
+                earlier_started.set()
+                await asyncio.Event().wait()
+        finally:
+            running.remove(job.record.run_id)
+
+    worker = Worker(store, handler, ["triage"], concurrency=2)
+    with caplog.at_level(logging.WARNING, logger="trellis.runs.worker"):
+        earlier = asyncio.create_task(worker.run_once())
+        await earlier_started.wait()
+        assert await worker.run_once()
+        await asyncio.wait_for(earlier, 1)
+    assert overlapped == [False, False]
+    assert "run_1 claimed again while its earlier attempt works" in caplog.text
+
+
 async def test_a_cancel_asked_for_stops_the_handler_and_ends_the_run_cancelled(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
