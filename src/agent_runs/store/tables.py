@@ -103,6 +103,9 @@ class RunRow(Base):
         UniqueConstraint("tenant_id", "idempotency_key", name="uq_runs_tenant_idempotency"),
         Index("ix_runs_tenant_created", "tenant_id", "created_at"),
         Index("ix_runs_parent", "parent_run_id"),
+        # the listings by one filter, newest first: a user's runs, a thread's runs
+        Index("ix_runs_user", "tenant_id", "user_id", "created_at"),
+        Index("ix_runs_thread", "tenant_id", "thread_id", "created_at"),
         # the inbox: this tenant's PAUSED runs for an assignee, newest first
         Index("ix_runs_inbox", "tenant_id", "status", "assignee", "created_at"),
         # the claim: the oldest QUEUED run of the worker's agents
