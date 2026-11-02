@@ -96,11 +96,6 @@ class RunRow(Base):
     #: why the run was cancelled (POST /v1/runs/{run_id}/cancel), and the principal who asked
     cancel_reason: Mapped[str | None] = mapped_column(String(1000))
     cancelled_by: Mapped[str | None] = mapped_column(String(256))
-    #: what the run has used so far (``RunUsage``), as its executor last saved it
-    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    #: the position of the newest message in its inbox (``run_messages``; 0: none), counted
-    #: under the row's lock, which the lease tells the worker holding it
-    inbox_position: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
 
@@ -323,27 +318,6 @@ class RunEventRow(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "attempt", "sequence", name="uq_run_events_sequence"),
     )
-
-
-class RunMessageRow(Base):
-    """One message of a run's inbox (``RunMessage``), at its ``position`` (1, 2, ...): counted
-    on the run's row under its lock, so positions are never committed out of order.
-    ``message_id`` is the sender's: once per run."""
-
-    __tablename__ = "run_messages"
-
-    run_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
-    )
-    position: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(128))
-    message_id: Mapped[str] = mapped_column(String(200))
-    kind: Mapped[str] = mapped_column(String(32))
-    text: Mapped[str | None] = mapped_column(Text)
-    sender: Mapped[str] = mapped_column(String(256))
-    created_at: Mapped[datetime] = _created()
-
-    __table_args__ = (UniqueConstraint("run_id", "message_id", name="uq_run_messages_id"),)
 
 
 class RateLimitRow(Base):

@@ -91,8 +91,6 @@ def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
         awaiting=run.awaiting,
         assignee=assignee,
         deadline=run.deadline,
-        user_id=run.user_id,
-        usage=run.usage,
         updated_at=run.updated_at,
     )
     return {

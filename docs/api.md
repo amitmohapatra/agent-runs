@@ -114,20 +114,18 @@ sections after the table have the bodies and the exact semantics.
 |---|---|---|---|
 | `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` (a platform key may omit `X-Trellis-Tenant`) | `200 Claimed`, `204` nothing queued that may run now | `422` |
-| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?, usage?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/release` | `{worker_id, checkpoint?}` | `200 RunRecord` (`QUEUED`; a repeat answers the run) | `404`, `409 LEASE_LOST` not the lease holder or run not `RUNNING`, `413`, `422` |
-| `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint, usage?}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
+| `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `403` the key may not answer this run ([who may](#who-may-answer-a-paused-run)), `404`, `409` not `PAUSED` or another interrupt, `422` another run |
 | `POST /v1/runs/{id}/cancel` | `{reason?}` | `200 RunRecord` (`CANCELLED`, or `RUNNING` with the cancel asked; a repeat answers the run) | `403` the key may not cancel it, `404`, `409` ended, `422` |
-| `POST /v1/runs/{id}/finish` | `{status, output, error, usage?}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
+| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
-| `POST /v1/runs/{id}/messages` | `{message_id, kind, text?, sender?}` | `201 RunMessage` (`200` repeat) | `403` the key may not act for the run's user, `404`, `409` ended, a pause of a paused run, or the id reused with another message, `422` |
-| `GET /v1/runs/{id}/messages` | `?after=&limit=` | `200 [RunMessage]` | `403` the key may not act for the run's user, `404`, `422` |
 | `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
 | `POST /v1/runs/{id}/events` | `{events: [RunEvent]}` (1–500), `?worker_id=` | `200 {appended, position}` | `404`, `409` not `RUNNING` or leased (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` an event of another run |
 | `GET /v1/runs/{id}/events` | `?after=&limit=` | `200 [RunEventEntry]` | `404`, `422` |
 | `GET /v1/runs/{id}/events/stream` | `?after=`, `Last-Event-ID` | `200 text/event-stream` | `404`, `422` |
-| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&user_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
+| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
 | `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
@@ -314,42 +312,14 @@ The answer is the `Lease`:
 
 ```json
 {"run_id": "run_…", "worker_id": "w-1", "expires_at": "…", "remaining_seconds": 412.5,
- "cancel_requested": false, "inbox": 2}
+ "cancel_requested": false}
 ```
-
-`usage` (optional, a `RunUsage`: model and tool calls, commands, tokens, cost) is what the run
-has used so far; it replaces the run's (omitted: kept), and so does a pause's or a finish's.
-`inbox` is the position of the newest message in the run's inbox (0: none): past the last one
-the worker read, it reads the rest ([below](#post-v1runsidmessages--201-runmessage)).
 
 `remaining_seconds` is the working time the run has left (`null` without a limit): stop
 before it runs out. `cancel_requested: true` means someone cancelled the run
 ([below](#post-v1runsidcancel--200-runrecord)): stop working it and finish it `CANCELLED`.
 From the cancel on, the lease runs from the cancel, not from the heartbeat, so it is no
 longer extended: when it runs out the ticker cancels the run itself.
-
-### `POST /v1/runs/{id}/messages` → `201 RunMessage`
-
-```json
-{"message_id": "msg-1", "kind": "INSTRUCTION", "text": "Also compare against last quarter.",
- "sender": "user:ada"}
-```
-
-A message for the run, kept at the next position of its inbox (1, 2, ...): an `INSTRUCTION`
-(its `text` required) the run takes at its next step, its work so far kept, or a `PAUSE` (no
-text): the run pauses at its next step on an interrupt of reason `PAUSE`, and a person resumes
-it with [`resume`](#post-v1runsidresume--200-runrecord). Whichever worker holds the run reads
-it: its heartbeats say the newest position (`Lease.inbox`) and it reads the inbox past the
-last position it took (`GET /v1/runs/{id}/messages?after=`). A queued or paused run reads it
-when it works; an ended run takes nothing (`409`), nor does a paused run take another pause.
-The same `message_id` sent again answers `200` with the message as kept (another message
-under it is `409`). `sender` is the key's principal unless the key names the person it acts
-for.
-
-**Who:** the inbox is the run's user's. An admin or platform key, or one that may act for
-anyone, reaches any run's; a key restricted to listed people only the runs of a user it may
-act for, as that user (`403 AUTHORIZATION` otherwise, for the read too). Another tenant's run
-is `404`.
 
 ### `POST /v1/runs/{id}/release` → `200 RunRecord`
 
@@ -538,7 +508,7 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 
 - `GET /v1/runs/{id}` → `RunRecord`, the full record (input, output, error, checkpoint,
   `worked_seconds` counting the stretch it is running now).
-- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&user_id=&top_level=&cursor=&limit=` →
+- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` →
   `[RunSummary]`, newest first, paged (`Link`). The inbox is
   `status=PAUSED&assignee=role:procurement`; `top_level=true` keeps only runs with no
   `parent_run_id`, so a paused sub-agent is not listed next to the parent that waits on it.
@@ -546,16 +516,12 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 ```json
 [{"run_id": "run_…", "agent_id": "triage", "status": "PAUSED",
   "awaiting": {…Interrupt…}, "assignee": "role:procurement",
-  "deadline": null, "user_id": "ada",
-  "usage": {"model_calls": 4, "tool_calls": 3, "commands": 1, "tokens": 5200,
-            "cached_tokens": 0, "cost": 0.0},
-  "updated_at": "2026-09-30T08:00:00Z"}]
+  "deadline": null, "updated_at": "2026-09-30T08:00:00Z"}]
 ```
 
 `awaiting` is the interrupt a paused run waits on (`null` otherwise; its own `deadline` is
 when the answer is due), `assignee` whose inbox it is in, `deadline` the run's own deadline
-(`RunStart.deadline`), `usage` what it has used as its executor last saved it (a status view
-of a user's runs: `?user_id=`). Nothing else is in a summary; read the run for the rest.
+(`RunStart.deadline`). Nothing else is in a summary; read the run for the rest.
 
 ### Events
 

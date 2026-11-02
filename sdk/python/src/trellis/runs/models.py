@@ -23,7 +23,6 @@ from trellis.contracts.runs import (
     RunEvent,
     RunRecord,
     RunStatus,
-    RunUsage,
     Schedule,
 )
 
@@ -42,8 +41,6 @@ class RunSummary(BaseModel):
     awaiting: Interrupt | None = None
     assignee: str | None = None
     deadline: datetime | None = None
-    user_id: str | None = None
-    usage: RunUsage | None = None
     updated_at: datetime
 
 
@@ -53,9 +50,7 @@ class Lease(BaseModel):
     ``timeout_seconds`` or the service's maximum, the lesser, less what it worked; ``None``:
     no limit): past it agent-runs ends the run ``TIMEOUT``. ``cancel_requested``: someone
     asked to cancel the run; stop and finish it ``CANCELLED`` (the lease is no longer
-    extended, and agent-runs cancels the run when it runs out). ``inbox``: the position of the
-    newest message in the run's inbox (0: none); past the last one read, read the rest
-    (``RunsClient.messages``)."""
+    extended, and agent-runs cancels the run when it runs out)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -64,7 +59,6 @@ class Lease(BaseModel):
     expires_at: datetime
     remaining_seconds: float | None = None
     cancel_requested: bool = False
-    inbox: int = 0
 
 
 class Claimed(BaseModel):
