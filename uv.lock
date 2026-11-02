@@ -1596,7 +1596,7 @@ wheels = [
 
 [[package]]
 name = "trellis-contracts"
-version = "0.6.2"
+version = "0.6.4"
 source = { editable = "../agent-contracts" }
 dependencies = [
     { name = "pydantic" },

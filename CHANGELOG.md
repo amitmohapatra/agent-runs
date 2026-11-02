@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **The run inbox and a run's usage moved to the `background-agents` branch** (#20 reverted
+  from `main`, never released): `POST`/`GET /v1/runs/{id}/messages`, `RunRecord.usage` and
+  `GET /v1/runs?user_id=` continue there with the harness's background agents.
+  **Requires `trellis-contracts>=0.6.2,<0.8`**: 0.7.0, the contracts without the run inbox, is
+  admitted. *Migration:* a database that ran `1b7c2d3e4f5a` goes back first
+  (`alembic downgrade 0a6b1c2d3e4f`, with the code of #20), then runs this release.
+
 * **Requires `trellis-contracts>=0.6.2`**, whose `ErrorSource` has `acp`: the harness's
   adapter for agents spoken to over the Agent Client Protocol (Kimi Code) records its failed
   runs under it, and a run stores that error as it is. `docs/openapi.json` lists the value.
