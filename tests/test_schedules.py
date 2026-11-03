@@ -479,6 +479,29 @@ async def test_listing_filters_by_agent_and_by_enabled(client) -> None:
     assert [s["schedule_id"] for s in paused] == [other["schedule_id"]]
 
 
+async def test_listing_filters_by_whom_the_schedule_acts_for(client) -> None:
+    ada = (await client.post("/v1/schedules", json=scheduled())).json()
+    await client.post("/v1/schedules", json=scheduled(on_behalf_of="user_bob"))
+    listed = (await client.get("/v1/schedules", params={"on_behalf_of": "user_ada"})).json()
+    assert [s["schedule_id"] for s in listed] == [ada["schedule_id"]]
+
+
+async def test_a_fired_run_is_in_the_thread_its_schedule_names(app, client) -> None:
+    # a schedule set from a chat fires into that chat: its metadata's thread_id is the run's
+    body = scheduled(metadata={"thread_id": "chat-7"})
+    sid = (await client.post("/v1/schedules", json=body)).json()["schedule_id"]
+    fired = (await client.post(f"/v1/schedules/{sid}/fire")).json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    assert run["thread_id"] == "chat-7"
+    [summary] = (await client.get("/v1/runs", params={"thread_id": "chat-7"})).json()
+    assert summary["run_id"] == fired["run_id"] and summary["thread_id"] == "chat-7"
+    # a thread that is not a string names none
+    other = scheduled(metadata={"thread_id": 7})
+    sid = (await client.post("/v1/schedules", json=other)).json()["schedule_id"]
+    fired = (await client.post(f"/v1/schedules/{sid}/fire")).json()
+    assert (await client.get(f"/v1/runs/{fired['run_id']}")).json()["thread_id"] is None
+
+
 async def test_a_repeated_create_returns_the_schedule_it_made(client) -> None:
     """The create is an upsert on (agent_id, on_behalf_of, cadence, input): a redeploy gets
     200 and the existing schedule, unchanged, never a second one firing."""

@@ -96,6 +96,9 @@ async def listing(
         bool | None, Query(description="Only schedules that fire (true) or are paused (false).")
     ] = None,
     agent_id: Annotated[str | None, Query(description="Only schedules of this agent.")] = None,
+    on_behalf_of: Annotated[
+        str | None, Query(description="Only schedules acting for this principal.")
+    ] = None,
     cursor: CursorQuery = None,
     limit: LimitQuery = DEFAULT_LIMIT,
 ) -> list[Schedule]:
@@ -104,6 +107,7 @@ async def listing(
         who.tenant_id,
         enabled=enabled,
         agent_id=agent_id,
+        on_behalf_of=on_behalf_of,
         limit=limit,
         after=decode_cursor(cursor, fields=_CURSOR),
     )

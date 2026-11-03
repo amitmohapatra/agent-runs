@@ -139,6 +139,7 @@ class ScheduleStore:
         *,
         enabled: bool | None = None,
         agent_id: str | None = None,
+        on_behalf_of: str | None = None,
         limit: int = DEFAULT_PAGE,
         after: Mapping[str, Any] | None = None,
     ) -> Page[Schedule]:
@@ -154,6 +155,8 @@ class ScheduleStore:
             query = query.where(ScheduleRow.enabled.is_(enabled))
         if agent_id is not None:
             query = query.where(ScheduleRow.agent_id == agent_id)
+        if on_behalf_of is not None:
+            query = query.where(ScheduleRow.on_behalf_of == on_behalf_of)
         newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
         rows = (await self._session.scalars(newest)).all()
         return page_of(

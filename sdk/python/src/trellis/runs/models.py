@@ -41,6 +41,7 @@ class RunSummary(BaseModel):
     awaiting: Interrupt | None = None
     assignee: str | None = None
     deadline: datetime | None = None
+    thread_id: str | None = None
     updated_at: datetime
 
 

@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A schedule set from a chat fires into that chat.** A schedule whose `metadata` names a
+  `thread_id` (a string) queues each run with that `thread_id`, so the run is a turn of the
+  conversation (its reply in the thread's history, its runs in `GET /v1/runs?thread_id=`).
+  `RunSummary.thread_id` (listings and the webhook envelope) says which conversation a run is
+  a turn of, so one listing serves many open chats. `GET /v1/schedules?on_behalf_of=` lists
+  the schedules acting for one person (SDK: `schedules.list(on_behalf_of=)`). Nothing to do.
 * **The run inbox and a run's usage moved to the `background-agents` branch** (#20 reverted
   from `main`, never released): `POST`/`GET /v1/runs/{id}/messages`, `RunRecord.usage` and
   `GET /v1/runs?user_id=` continue there with the harness's background agents.

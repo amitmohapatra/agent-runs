@@ -63,6 +63,7 @@ def test_the_envelope_carries_the_summary_and_a_stable_event_id() -> None:
         "awaiting",
         "assignee",
         "deadline",
+        "thread_id",
         "updated_at",
     }
     assert sent["event_id"] == envelope(done, WebhookEvent.FINISHED)["event_id"]
