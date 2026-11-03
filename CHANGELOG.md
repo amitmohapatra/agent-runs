@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Listing one thread's runs, or one user's, reads an index.** `GET /v1/runs?thread_id=` (a
+  conversation's turns, its scheduled runs among them) was served by `ix_runs_tenant_created`
+  filtering every newer run of the tenant, or by a scan for an old thread: at 100k runs a
+  sequential scan (9.5 ms). `ix_runs_thread` (tenant, thread, `created_at`) serves it in
+  0.15 ms; `ix_runs_user` does the same for a user's runs (0.19 ms for 22k rows filtered),
+  the listing the `background-agents` branch adds.
+  *Migration:* `alembic upgrade head` (`2c8d3e4f5a6b`: two indexes; `downgrade` drops them).
 * **The run inbox and a run's usage moved to the `background-agents` branch** (#20 reverted
   from `main`, never released): `POST`/`GET /v1/runs/{id}/messages`, `RunRecord.usage` and
   `GET /v1/runs?user_id=` continue there with the harness's background agents.
