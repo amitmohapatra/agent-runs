@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **The run inbox and a run's usage moved to the `background-agents` branch** (#20 reverted
+  from `main`, never released): `POST`/`GET /v1/runs/{id}/messages`, `RunRecord.usage` and
+  `GET /v1/runs?user_id=` continue there with the harness's background agents.
+  **Requires `trellis-contracts>=0.6.2,<0.8`**: 0.7.0, the contracts without the run inbox, is
+  admitted. *Migration:* a database that ran `1b7c2d3e4f5a` goes back first
+  (`alembic downgrade 0a6b1c2d3e4f`, with the code of #20), then runs this release.
 * **SDK `Worker`: one attempt of a run at a time, and none past its lease.** A handler whose
   lease no heartbeat could renew for the lease's length (agent-runs unreachable) is stopped as
   for a lost lease, writing nothing more: agent-runs may already have given the run to another
@@ -13,18 +19,6 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
   attempt first (both name the worker, so the service's fence cannot tell them apart). Before,
   both attempts went on side by side: with agent-runs down 75 s, a run's writes were done twice
   (14 of 25, live). Nothing to do.
-* **A run's inbox** (**requires `trellis-contracts>=0.6.4`**). `POST /v1/runs/{id}/messages`
-  keeps an `INSTRUCTION` or a `PAUSE` (`RunMessage`) at the next position of the run's inbox,
-  and `GET /v1/runs/{id}/messages?after=` reads it; the lease says the newest position
-  (`Lease.inbox`, `Job.inbox`), so the worker holding the run, whichever it is, reads it at
-  its next step. Only keys that may act for the run's user reach it. SDK:
-  `RunsClient.send_message`, `RunsClient.messages`.
-* **What a run has used.** Heartbeat, pause and finish take `usage` (`RunUsage`: model and
-  tool calls, commands, tokens, cost), kept on the run (`RunRecord.usage`) and on its summary
-  (`RunSummary.usage`, with `user_id`); `GET /v1/runs?user_id=` lists one user's runs. The
-  webhook envelope's summary carries both too.
-  *Migration:* `alembic upgrade head` (`1b7c2d3e4f5a`: `run_messages`, two columns on
-  `agent_runs`); nothing else.
 
 * **Requires `trellis-contracts>=0.6.2`**, whose `ErrorSource` has `acp`: the harness's
   adapter for agents spoken to over the Agent Client Protocol (Kimi Code) records its failed
