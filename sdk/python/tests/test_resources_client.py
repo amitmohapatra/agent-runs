@@ -71,11 +71,14 @@ async def test_create_sends_the_spec_with_its_tenant(runs: RunsClient) -> None:
 async def test_list_sends_the_filters(runs: RunsClient) -> None:
     link = '<http://runs.test/v1/schedules?cursor=c2&limit=1>; rel="next"'
     route = respx.get(f"{URL}/v1/schedules").respond(200, json=[schedule()], headers={"Link": link})
-    page = await runs.schedules.list(enabled=False, agent_id="briefing", cursor="c1", limit=1)
+    page = await runs.schedules.list(
+        enabled=False, agent_id="briefing", on_behalf_of="user_ada", cursor="c1", limit=1
+    )
     assert page.items[0].schedule_id == "sch_1" and page.next_cursor == "c2"
     assert dict(sent(route).url.params) == {
         "enabled": "false",
         "agent_id": "briefing",
+        "on_behalf_of": "user_ada",
         "cursor": "c1",
         "limit": "1",
     }

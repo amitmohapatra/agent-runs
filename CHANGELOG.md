@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A schedule set from a chat fires into that chat.** A schedule whose `metadata` names a
+  `thread_id` (a string) queues each run with that `thread_id`, so the run is a turn of the
+  conversation (its reply in the thread's history, its runs in `GET /v1/runs?thread_id=`).
+  `RunSummary.thread_id` (listings and the webhook envelope) says which conversation a run is
+  a turn of, so one listing serves many open chats. `GET /v1/schedules?on_behalf_of=` lists
+  the schedules acting for one person (SDK: `schedules.list(on_behalf_of=)`). Nothing to do.
 * **Listing one thread's runs, or one user's, reads an index.** `GET /v1/runs?thread_id=` (a
   conversation's turns, its scheduled runs among them) was served by `ix_runs_tenant_created`
   filtering every newer run of the tenant, or by a scan for an old thread: at 100k runs a

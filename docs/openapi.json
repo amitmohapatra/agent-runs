@@ -1967,6 +1967,18 @@
             "$ref": "#/components/schemas/RunStatus",
             "description": "Where the run is in its lifecycle."
           },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The conversation the run is a turn of (null: none).",
+            "title": "Thread Id"
+          },
           "updated_at": {
             "description": "When the run last changed.",
             "format": "date-time",
@@ -9234,6 +9246,24 @@
               ],
               "description": "Only schedules of this agent.",
               "title": "Agent Id"
+            }
+          },
+          {
+            "description": "Only schedules acting for this principal.",
+            "in": "query",
+            "name": "on_behalf_of",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only schedules acting for this principal.",
+              "title": "On Behalf Of"
             }
           },
           {

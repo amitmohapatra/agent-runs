@@ -214,6 +214,9 @@ class RunSummary(BaseModel):
     deadline: AwareDatetime | None = Field(
         default=None, description="The run's own deadline (not the interrupt's)."
     )
+    thread_id: str | None = Field(
+        default=None, description="The conversation the run is a turn of (null: none)."
+    )
     updated_at: AwareDatetime = Field(description="When the run last changed.")
 
 

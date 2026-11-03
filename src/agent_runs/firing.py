@@ -6,13 +6,15 @@ working-time limit, agent version, priority, concurrency key and metadata, and a
 ``on_behalf_of``), so no request can make a schedule fire as someone it was not made for, and
 a scheduled run carries everything a started one can. The schedule's metadata goes under the
 fire's own keys (``schedule_id``, ``schedule_name``, ``fire_time``, ``created_by``), which win
-on conflict: a schedule cannot pass its run off as another's fire. A repeated fire for the
-same tick finds the run the first one queued.
+on conflict: a schedule cannot pass its run off as another's fire. A schedule whose metadata
+names a ``thread_id`` fires its runs into that conversation. A repeated fire for the same tick
+finds the run the first one queued.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Final
 
 import structlog
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -70,6 +72,7 @@ class Firing:
             tenant_id=schedule.tenant_id,
             agent_id=schedule.agent_id,
             workspace_id=schedule.workspace_id,
+            thread_id=_thread(schedule),
             on_behalf_of=schedule.on_behalf_of,
             input=schedule.input,
             timeout_seconds=schedule.timeout_seconds,
@@ -114,3 +117,13 @@ class Firing:
             idempotency_key=key,
             schedule=fired,
         )
+
+
+#: The schedule metadata key naming the conversation its runs are turns of: a schedule set
+#: from a chat fires into that chat (its runs' ``thread_id``), so the reply is in its history.
+THREAD: Final = "thread_id"
+
+
+def _thread(schedule: Schedule) -> str | None:
+    thread = schedule.metadata.get(THREAD)
+    return thread if isinstance(thread, str) and thread else None

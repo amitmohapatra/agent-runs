@@ -129,7 +129,7 @@ sections after the table have the bodies and the exact semantics.
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
 | `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
-| `GET /v1/schedules` | `?enabled=&agent_id=&cursor=&limit=` | `200 [Schedule]` | `422` |
+| `GET /v1/schedules` | `?enabled=&agent_id=&on_behalf_of=&cursor=&limit=` | `200 [Schedule]` | `422` |
 | `GET /v1/schedules/{id}` | | `200 Schedule` | `404` |
 | `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` |
 | `DELETE /v1/schedules/{id}` | | `204` | `403` `on_behalf_of`, `404` |

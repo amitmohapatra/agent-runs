@@ -32,16 +32,20 @@ class SchedulesAPI:
         *,
         enabled: bool | None = None,
         agent_id: str | None = None,
+        on_behalf_of: str | None = None,
         cursor: str | None = None,
         limit: int = PAGE_LIMIT,
         tenant: str | None = None,
     ) -> Page[Schedule]:
-        """One page of the tenant's schedules, newest first."""
+        """One page of the tenant's schedules, newest first: of one agent, or acting for one
+        person (``on_behalf_of``), when named."""
         params: dict[str, Any] = {"limit": limit}
         if enabled is not None:
             params["enabled"] = "true" if enabled else "false"
         if agent_id is not None:
             params["agent_id"] = agent_id
+        if on_behalf_of is not None:
+            params["on_behalf_of"] = on_behalf_of
         if cursor is not None:
             params["cursor"] = cursor
         rows, after = await self._transport.page("/v1/schedules", tenant=tenant, params=params)
