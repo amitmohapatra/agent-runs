@@ -10,6 +10,7 @@ transition or a schedule created at 23:59 is a test rather than a wait.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from zoneinfo import ZoneInfo
@@ -31,6 +32,10 @@ BUCKETS: dict[str, str | None] = {
 
 #: The floor: one run per hour.
 MIN_INTERVAL = timedelta(hours=1)
+
+#: A schedule fires this much after its tick at most (:func:`jitter`): a tenth of the one-hour
+#: floor would allow six minutes, a minute keeps "daily at 9" at 9:00.
+JITTER_MAX = timedelta(seconds=60)
 
 #: Validation measures real occurrences from a fixed instant, so whether a cadence is
 #: accepted never depends on when the check runs.
@@ -77,3 +82,11 @@ def next_fire_at(cadence: str, *, after: datetime, timezone: str) -> datetime | 
         return None
     local = after.astimezone(ZoneInfo(timezone))
     return croniter(expression, local).get_next(datetime).astimezone(UTC)
+
+
+def jitter(schedule_id: str) -> timedelta:
+    """The schedule's own delay after each tick, in ``[0, JITTER_MAX)``: a hash of its id, so
+    it is the same on every replica and restart while a thousand "daily at 9" schedules
+    spread over the minute (systemd's ``RandomizedDelaySec``, Jenkins' ``H``)."""
+    digest = hashlib.sha256(schedule_id.encode()).digest()
+    return timedelta(seconds=int.from_bytes(digest[:4]) % int(JITTER_MAX.total_seconds()))

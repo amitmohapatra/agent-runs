@@ -117,6 +117,17 @@ class FireTimeOutOfRange(Unprocessable):
         )
 
 
+class FireSkipped(Exception):
+    """A due tick was skipped because the schedule's last run has not ended (Kubernetes'
+    ``concurrencyPolicy: Forbid``, Temporal's overlap policy ``SKIP``); the schedule was armed
+    for its next occurrence."""
+
+    def __init__(self, schedule: Schedule, active_run_id: str) -> None:
+        super().__init__(f"schedule {schedule.schedule_id} skipped: {active_run_id} has not ended")
+        self.schedule = schedule
+        self.active_run_id = active_run_id
+
+
 class FireFailed(Unavailable):
     """The run could not be queued. The failure is recorded on the schedule (which may have
     paused itself); the caller commits that before answering."""

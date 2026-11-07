@@ -6,6 +6,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **One run of a schedule at a time, spread over the minute.** A tick while the schedule's
+  last run is queued, running or paused is skipped (the schedule waits for its next
+  occurrence), so workers down across several ticks run it once on recovery. Each schedule
+  fires a stable 0 to 59 s after its tick (a hash of its id), so `next_fire_at` carries those
+  seconds. Nothing to do.
 * **A schedule set from a chat fires into that chat.** A schedule whose `metadata` names a
   `thread_id` (a string) queues each run with that `thread_id`, so the run is a turn of the
   conversation (its reply in the thread's history, its runs in `GET /v1/runs?thread_id=`).

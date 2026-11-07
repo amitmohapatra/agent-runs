@@ -493,6 +493,13 @@ Two tickers on one tick both see the schedule; `SKIP LOCKED` gives it to one, an
 idempotency key would make a repeat find the same run anyway
 (`tests/test_ticker.py::test_two_tickers_on_one_tick_queue_one_run`). `next_fire_at` only
 moves forward past now, so a long outage fires each schedule once, not once per missed tick.
+A tick whose schedule's last run has not ended (queued, running or paused) is skipped and the
+schedule armed for its next occurrence (Kubernetes `concurrencyPolicy: Forbid`, Temporal's
+overlap `SKIP`), so workers down for a day run each schedule once on recovery
+(`test_a_tick_while_the_last_run_is_still_active_is_skipped`). Each schedule fires a stable
+0 to 59 seconds after its tick, a hash of its id (`cadence.jitter`, like systemd's
+`RandomizedDelaySec` and Jenkins' `H`), so a thousand "daily at 9" schedules spread over the
+minute and still fire at 9:00.
 
 ## Webhook delivery and dead letters
 

@@ -52,7 +52,7 @@ from agent_runs.config.constants import (
     WEBHOOK_DEAD_RETENTION,
 )
 from agent_runs.config.settings import get_settings
-from agent_runs.domain.schedules import FireFailed
+from agent_runs.domain.schedules import FireFailed, FireSkipped
 from agent_runs.domain.webhooks import WebhookEvent
 from agent_runs.firing import Firing
 from agent_runs.observability import metrics
@@ -151,8 +151,9 @@ class Ticker:
             async with self._sessions() as db:
                 try:
                     result = await Firing(db).fire_due(now=now)
-                except FireFailed:
-                    # recorded on the schedule, which now backs off or is paused
+                except (FireFailed, FireSkipped):
+                    # recorded on the schedule, which now backs off, is paused or waits for
+                    # its next occurrence
                     await db.commit()
                     continue
                 await db.commit()

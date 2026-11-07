@@ -12,7 +12,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent_runs.domain.cadence import InvalidCadence, next_fire_at, validate_cadence
+from agent_runs.domain.cadence import (
+    MIN_INTERVAL,
+    InvalidCadence,
+    jitter,
+    next_fire_at,
+    validate_cadence,
+)
 from agent_runs.domain.schedules import idempotency_key
 
 NY = "America/New_York"
@@ -134,3 +140,28 @@ def test_one_instant_spelled_two_ways_is_one_idempotency_key() -> None:
     utc = datetime(2026, 9, 21, 9, tzinfo=UTC)
     berlin = utc.astimezone(ZoneInfo("Europe/Berlin"))
     assert idempotency_key("sch_1", utc) == idempotency_key("sch_1", berlin)
+
+
+@pytest.mark.parametrize(
+    "after", [datetime(2026, 3, 7, 12, tzinfo=UTC), datetime(2026, 10, 31, 12, tzinfo=UTC)]
+)
+def test_daily_at_nine_stays_nine_across_both_dst_transitions(after: datetime) -> None:
+    """``0 9 * * *`` in New York, jitter included: 9:00 local before and after the change."""
+    shift = jitter("sch_dst")
+    fires = [next_fire_at("0 9 * * *", after=after, timezone=NY)]
+    for _ in range(2):
+        previous = fires[-1]
+        assert previous is not None
+        fires.append(next_fire_at("0 9 * * *", after=previous + shift, timezone=NY))
+    local = [(f + shift).astimezone(ZoneInfo(NY)) for f in fires if f is not None]
+    assert [(t.hour, t.minute) for t in local] == [(9, 0)] * 3
+    assert len({t.date() for t in local}) == 3
+
+
+def test_jitter_is_stable_bounded_and_spread() -> None:
+    """Under a minute, a tenth of the one-hour floor at most, and the same for a schedule on
+    every replica and restart; different schedules land on different seconds."""
+    shifts = [jitter(f"sch_{n}") for n in range(200)]
+    assert all(timedelta(0) <= s < timedelta(seconds=60) <= MIN_INTERVAL / 10 for s in shifts)
+    assert jitter("sch_1") == jitter("sch_1")
+    assert len(set(shifts)) > 40

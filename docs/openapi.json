@@ -961,7 +961,7 @@
       },
       "Option": {
         "additionalProperties": false,
-        "description": "One choice an interrupt offers. ``value`` is what an answer that picks it carries;\n``label`` and ``description`` are what a person sees. A plain string among\n``Interrupt.options`` is an option whose value is that string, shown as it is.",
+        "description": "One choice an interrupt offers. ``value`` is what an answer that picks it carries;\n``label`` and ``description`` are what a person sees; ``recommended`` marks the one the\nasker recommends, its ``description`` saying why. A plain string among\n``Interrupt.options`` is an option whose value is that string, shown as it is.",
         "properties": {
           "description": {
             "anyOf": [
@@ -989,6 +989,18 @@
               "Europe (Frankfurt)"
             ],
             "title": "Label"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "True on the option the asker recommends (its description says why); None (left out on the wire) on the others.",
+            "title": "Recommended"
           },
           "value": {
             "description": "What an answer that picks this option carries; not blank.",
