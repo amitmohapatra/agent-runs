@@ -35,7 +35,7 @@ from agent_runs.config.constants import (
     FIRE_RETRY_CAP,
     MAX_CONSECUTIVE_FAILURES,
 )
-from agent_runs.domain.cadence import next_fire_at, validate_cadence
+from agent_runs.domain.cadence import jitter, next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
 from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
 from agent_runs.retry import backoff
@@ -74,7 +74,8 @@ def _apply(row: ScheduleRow, spec: ScheduleSpec) -> None:
 
 
 def _arm(row: ScheduleRow, *, after: datetime) -> None:
-    row.next_fire_at = next_fire_at(row.cadence, after=after, timezone=row.timezone)
+    tick = next_fire_at(row.cadence, after=after, timezone=row.timezone)
+    row.next_fire_at = None if tick is None else tick + jitter(row.schedule_id)
 
 
 def _rearm(row: ScheduleRow, *, at: datetime) -> None:
@@ -237,6 +238,13 @@ class ScheduleStore:
         row.consecutive_failures = 0
         row.last_error = row.retry_after = None
         _arm(row, after=max(fire_time, now))
+        row.updated_at = now
+        return await self._flushed(row)
+
+    async def record_skip(self, schedule_id: str, *, now: datetime) -> Schedule:
+        """A tick skipped while the last run goes on: arm the next occurrence after ``now``."""
+        row = await self._claimed(schedule_id)
+        _arm(row, after=now)
         row.updated_at = now
         return await self._flushed(row)
 

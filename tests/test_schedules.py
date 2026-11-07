@@ -16,6 +16,7 @@ from trellis.contracts.errors import AgentError
 from trellis.contracts.ids import now
 from trellis.contracts.runs import ScheduleSpec
 
+from agent_runs.domain.cadence import jitter
 from agent_runs.domain.errors import NotFound
 from agent_runs.domain.schedules import DuplicateSchedule
 from agent_runs.store.schedules import ScheduleStore
@@ -334,7 +335,8 @@ async def test_a_successful_fire_advances_the_schedule(client) -> None:
     fired = (await client.post(f"/v1/schedules/{sid}/fire", json={"at": at.isoformat()})).json()
     assert datetime.fromisoformat(fired["schedule"]["last_fired_at"]) == at
     assert fired["schedule"]["last_run_id"] == fired["run_id"]
-    assert datetime.fromisoformat(fired["schedule"]["next_fire_at"]) == at + timedelta(hours=1)
+    next_at = datetime.fromisoformat(fired["schedule"]["next_fire_at"])
+    assert next_at == at + timedelta(hours=1) + jitter(sid)
 
 
 async def test_a_per_minute_cadence_is_refused_at_creation_and_on_update(client) -> None:
@@ -725,3 +727,39 @@ async def test_bookkeeping_for_a_schedule_that_is_gone_is_not_found(app) -> None
             await store.record_success("sch_gone", fire_time=now(), run_id="run_x", now=now())
         with pytest.raises(NotFound):
             await store.record_failure("sch_gone", error=AgentError(code="x"), now=now())
+
+
+async def test_a_tick_while_the_last_run_is_still_active_is_skipped(app, client, ticker) -> None:
+    """Overlap SKIP (Kubernetes ``concurrencyPolicy: Forbid``): with the workers down, ticks
+    that keep coming fire nothing more, so recovery runs the schedule once."""
+    sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+        "schedule_id"
+    ]
+    for hours in (3, 2, 1):  # three ticks, each its own instant
+        await arm(app, sid, _last_tick() - timedelta(hours=hours))
+        await ticker.tick()
+    [run] = await queued_runs(app)
+    after = (await client.get(f"/v1/schedules/{sid}")).json()
+    assert datetime.fromisoformat(after["next_fire_at"]) > datetime.now(UTC)
+    assert after["last_run_id"] == run["run_id"]
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE agent_runs SET status = 'SUCCESS' WHERE run_id = :r"), {"r": run["run_id"]}
+        )
+    await arm(app, sid, _last_tick())
+    assert (await ticker.tick()).fired == 1
+    assert len(await queued_runs(app)) == 1
+
+
+async def test_a_schedule_fires_at_its_own_stable_second_of_the_minute(client) -> None:
+    """Jitter against a thundering herd at the top of the hour, as systemd's
+    ``RandomizedDelaySec`` and Jenkins' hashed ``H``: stable per schedule, under a minute."""
+    sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+        "schedule_id"
+    ]
+    first = (await client.get(f"/v1/schedules/{sid}")).json()["next_fire_at"]
+    due = datetime.fromisoformat(first)
+    assert due - due.replace(second=0, microsecond=0) == jitter(sid)
+    retimed = await client.patch(f"/v1/schedules/{sid}", json={"cadence": "daily"})
+    again = datetime.fromisoformat(retimed.json()["next_fire_at"])
+    assert (again.hour, again.minute, again.second) == (0, 0, jitter(sid).seconds)

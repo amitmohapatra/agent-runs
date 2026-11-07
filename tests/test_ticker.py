@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from agent_runs.blob.filesystem import FilesystemBlobStore
@@ -160,9 +161,16 @@ async def test_a_fire_repeated_for_the_same_tick_finds_the_same_run(app, client,
     tick = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     await arm(app, sid, tick)
     assert (await ticker.tick()).fired == 1
+    [run] = await queued_runs(app)
+    async with app.state.engine.begin() as conn:  # ended, so the rewound tick is not skipped
+        await conn.execute(
+            text("UPDATE agent_runs SET status = 'SUCCESS' WHERE run_id = :r"), {"r": run["run_id"]}
+        )
     await arm(app, sid, tick)
     assert (await ticker.tick()).fired == 1
-    assert len(await queued_runs(app)) == 1
+    async with app.state.engine.connect() as conn:
+        runs = await conn.scalar(text("SELECT count(*) FROM agent_runs"))
+    assert runs == 1
 
 
 async def test_one_tick_requeues_lapsed_leases_and_escalates_with_webhooks(

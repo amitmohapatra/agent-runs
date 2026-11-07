@@ -17,21 +17,24 @@ from datetime import datetime
 from typing import Final
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
-from trellis.contracts.runs import RunStart, Schedule
+from trellis.contracts.runs import RunStart, RunStatus, Schedule
 
 from agent_runs.config.constants import MAX_FIRE_SKEW
 from agent_runs.domain.schedules import (
     FireFailed,
     FireResult,
+    FireSkipped,
     FireTimeOutOfRange,
     ScheduleNotFiring,
     idempotency_key,
 )
 from agent_runs.store.runs import RunStore
 from agent_runs.store.schedules import ScheduleStore
+from agent_runs.store.tables import RunRow
 
 log = structlog.get_logger(__name__)
 
@@ -60,11 +63,26 @@ class Firing:
         return await self._fire(schedule, fire_time=fire_time, now=now)
 
     async def fire_due(self, *, now: datetime) -> FireResult | None:
-        """The ticker's step: fire the most overdue schedule for its own tick, or ``None``."""
+        """The ticker's step: fire the most overdue schedule for its own tick, or ``None``.
+        While the schedule's last run has not ended, the tick is skipped (:class:`FireSkipped`):
+        one run of a schedule at a time, so workers down for a day run it once on recovery."""
         schedule = await self._schedules.claim_due(now=now)
         if schedule is None or schedule.next_fire_at is None:
             return None
+        if (active := await self._active(schedule)) is not None:
+            skipped = await self._schedules.record_skip(schedule.schedule_id, now=now)
+            log.info("schedule.skipped", schedule_id=schedule.schedule_id, active_run_id=active)
+            raise FireSkipped(skipped, active)
         return await self._fire(schedule, fire_time=schedule.next_fire_at, now=now)
+
+    async def _active(self, schedule: Schedule) -> str | None:
+        """The schedule's last run when it has not ended (queued, running or paused)."""
+        if schedule.last_run_id is None:
+            return None
+        status = await self._session.scalar(
+            select(RunRow.status).where(RunRow.run_id == schedule.last_run_id)
+        )
+        return schedule.last_run_id if status and not RunStatus(status).final else None
 
     async def _fire(self, schedule: Schedule, *, fire_time: datetime, now: datetime) -> FireResult:
         key = idempotency_key(schedule.schedule_id, fire_time)
