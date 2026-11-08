@@ -36,7 +36,8 @@ async def upload(client, run_id: str, data: bytes = TABLE_BYTES, headers=JSON, *
 
 
 def blob_files(blobs) -> list:
-    return [p for p in blobs._root.rglob("*") if p.is_file()]
+    """The artifacts' files (the run's payload objects live beside them, under the tenant)."""
+    return [p for p in (blobs._root / "artifacts").rglob("*") if p.is_file()]
 
 
 async def expiry(app, artifact_id: str):

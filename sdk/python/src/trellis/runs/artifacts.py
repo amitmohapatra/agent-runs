@@ -10,13 +10,15 @@ from typing import Final
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.runs._transport import Transport, worker_params
 from trellis.runs.errors import NotFoundError
+from trellis.runs.payloads import MEDIA_TYPE, PayloadRef
 
 #: What an artifact is sent as when the caller names nothing else.
 JSON_MIME: Final = "application/json"
 
 
 class ArtifactsAPI:
-    """``runs.artifacts``: ``upload`` and ``download``."""
+    """``runs.artifacts``: ``upload`` and ``download``; ``put_payload`` and ``get_payload``
+    for payload objects (``trellis.runs.payloads``: a checkpoint's segments)."""
 
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
@@ -58,3 +60,33 @@ class ArtifactsAPI:
         except NotFoundError:
             return None
         return response.content
+
+    async def put_payload(
+        self,
+        run_id: str,
+        data: bytes,
+        *,
+        worker_id: str | None = None,
+        tenant: str | None = None,
+    ) -> PayloadRef:
+        """Store a payload object (``payloads.encode``'s bytes) for the run's tenant; its
+        reference, for a checkpoint's ``SEGMENTS``. The same bytes are stored once. Who may
+        write is who may ``upload`` an artifact."""
+        body = await self._transport.json(
+            "POST",
+            f"/v1/runs/{run_id}/payloads",
+            tenant=tenant,
+            content=data,
+            params=worker_params(worker_id),
+            headers={"Content-Type": MEDIA_TYPE},
+        )
+        return PayloadRef.model_validate(body)
+
+    async def get_payload(self, ref: PayloadRef, *, tenant: str | None = None) -> bytes:
+        """The bytes of a payload object, checked here too against the reference's size
+        and SHA-256 (``ValueError`` when they differ)."""
+        response = await self._transport.send("GET", f"/v1/payloads/{ref.sha256}", tenant=tenant)
+        data = response.content
+        if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256:
+            raise ValueError(f"payload {ref.sha256} did not arrive whole")
+        return data

@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, adecode, aencode, ref_of
 
 from agent_runs.blob.port import BlobCorrupt, BlobExists, BlobNotFound, BlobStore, read
+from agent_runs.config.constants import ARTIFACT_RETENTION
 from agent_runs.domain.errors import ServiceError, Unavailable
 from agent_runs.store.tables import PayloadBlobRow, RunPayloadRow, WebhookDeliveryRow
 
@@ -51,9 +52,13 @@ class PayloadLost(ServiceError):
 class PayloadStore:
     """The blob store's payload objects, and their registry."""
 
-    def __init__(self, blobs: BlobStore, sessions: Sessions) -> None:
+    def __init__(
+        self, blobs: BlobStore, sessions: Sessions, *, retention: timedelta = ARTIFACT_RETENTION
+    ) -> None:
         self._blobs = blobs
         self._sessions = sessions
+        #: how long an ended run's artifacts are kept (``RUNS__BLOB__RETENTION_DAYS``)
+        self.retention = retention
 
     # ------------------------------------------------------------------ writes
     async def put(self, tenant_id: str, value: Any) -> PayloadRef:
@@ -90,7 +95,10 @@ class PayloadStore:
     # ------------------------------------------------------------------ reads
     async def get(self, ref: PayloadRef | dict[str, Any]) -> Any:
         """The JSON value ``ref`` names, verified."""
-        ref = PayloadRef.model_validate(ref)
+        return await adecode(await self.get_encoded(PayloadRef.model_validate(ref)))
+
+    async def get_encoded(self, ref: PayloadRef) -> bytes:
+        """The stored bytes ``ref`` names, verified."""
         chunks: list[bytes] = []
         try:
             async for chunk in read(self._blobs, ref.ref, sha256=ref.sha256, size=ref.size):
@@ -99,7 +107,7 @@ class PayloadStore:
             raise PayloadLost(f"payload {ref.ref} is missing or corrupt") from exc
         except _UNREACHABLE as exc:
             raise Unavailable("the payload store is unavailable") from exc
-        return await adecode(b"".join(chunks))
+        return b"".join(chunks)
 
     async def get_many(self, refs: Iterable[PayloadRef | dict[str, Any]]) -> list[Any]:
         """The values of ``refs``, in their order, read :data:`PARALLEL_READS` at a time."""
@@ -147,9 +155,11 @@ class PayloadStore:
         return len(gone)
 
 
-def bind(sessions: Sessions, blobs: BlobStore) -> PayloadStore:
+def bind(
+    sessions: Sessions, blobs: BlobStore, *, retention: timedelta = ARTIFACT_RETENTION
+) -> PayloadStore:
     """The payload store over ``blobs``, carried by every session ``sessions`` opens."""
-    store = PayloadStore(blobs, sessions)
+    store = PayloadStore(blobs, sessions, retention=retention)
     sessions.configure(info={_PAYLOADS: store})
     return store
 

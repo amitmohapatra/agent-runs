@@ -29,12 +29,11 @@ from trellis.contracts.runs import (
     RunStatus,
 )
 from trellis.runs.answers import answer_problem, schema_problem
-from trellis.runs.payloads import SEGMENTS
+from trellis.runs.payloads import SEGMENTS, PayloadRef, owned_by
 
 from agent_runs.answering import require_may_answer, require_may_cancel
 from agent_runs.blob.payloads import PayloadStore, payloads_of
 from agent_runs.config.constants import (
-    ARTIFACT_RETENTION,
     CONCURRENCY_PER_KEY,
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
@@ -66,7 +65,14 @@ from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
 from agent_runs.store.artifacts import ArtifactStore
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import ArtifactRow, ResolutionRow, RunEventRow, RunRow
+from agent_runs.store.tables import (
+    ArtifactRow,
+    PayloadBlobRow,
+    ResolutionRow,
+    RunEventRow,
+    RunPayloadRow,
+    RunRow,
+)
 
 _RECORD_FIELDS = (
     "run_id",
@@ -174,6 +180,27 @@ async def _records(
     return [RunRecord.model_validate(fields) for fields in records]
 
 
+#: What a payload object is to a run (``run_payloads.kind``).
+_INPUT, _OUTPUT, _AWAITING, _ANSWER, _CHECKPOINT, _EVENTS = (
+    "input",
+    "output",
+    "awaiting",
+    "answer",
+    "checkpoint",
+    "events",
+)
+
+
+def _dumped(ref: PayloadRef | None) -> dict[str, Any] | None:
+    return None if ref is None else ref.model_dump()
+
+
+def _asked_without_payload(interrupt: Interrupt) -> tuple[dict[str, Any], Any]:
+    """The interrupt as the row keeps it (``awaiting``), and its payload, kept by reference."""
+    awaiting = interrupt.awaiting()
+    return awaiting, awaiting.pop("payload", None)
+
+
 def _json(model: Any) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True) if model is not None else None
 
@@ -203,9 +230,9 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     if to is not RunStatus.RUNNING:
         row.lease_owner = row.lease_expires_at = row.cancel_requested_at = None
     if to is not RunStatus.PAUSED:
-        row.awaiting = row.assignee = row.awaiting_deadline = None
+        row.awaiting = row.awaiting_ref = row.assignee = row.awaiting_deadline = None
     if to.final:
-        row.checkpoint = None
+        row.checkpoint = row.checkpoint_ref = row.checkpoint_segments = None
 
 
 def _fence(row: RunRow, worker_id: str | None) -> None:
@@ -322,6 +349,7 @@ class RunStore:
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
         record = RunRecord.from_start(start, status=status)
+        input_ref = await self._put(record.tenant_id, record.input)
         row = await self._session.scalar(
             insert(RunRow)
             .values(
@@ -334,7 +362,8 @@ class RunStore:
                 user_id=record.user_id,
                 workspace_id=record.workspace_id,
                 on_behalf_of=record.on_behalf_of,
-                input=record.input,
+                input=None,
+                input_ref=_dumped(input_ref),
                 deadline=record.deadline,
                 timeout_seconds=record.timeout_seconds,
                 running_since=None if queue else now,
@@ -352,6 +381,7 @@ class RunStore:
             .returning(RunRow)
         )
         if row is not None:
+            await self._link(row.run_id, _INPUT, input_ref)
             return await self._record(row, now), True
         if start.idempotency_key:
             keyed = await self._one(
@@ -396,7 +426,9 @@ class RunStore:
             raise Unprocessable("the interrupt belongs to another run")
         if problem := schema_problem(interrupt.expects):
             raise Unprocessable(problem)
-        checkpoint = pause.bounded_checkpoint()
+        checkpoint = await self._checkpoint(tenant_id, pause.bounded_checkpoint())
+        awaiting, payload = _asked_without_payload(interrupt)
+        payload_ref = await self._put(tenant_id, payload)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         waiting_on = (row.awaiting or {}).get("interrupt_id")
         if _settled(row, RunStatus.PAUSED, worker_id) and waiting_on == interrupt.interrupt_id:
@@ -407,8 +439,9 @@ class RunStore:
             await self._ended([row], now)
             return await self._flushed(row, now), True
         _move(row, RunStatus.PAUSED, now)
-        row.checkpoint = checkpoint
-        row.awaiting = interrupt.awaiting()
+        await self._keep_checkpoint(row, checkpoint)
+        row.awaiting, row.awaiting_ref = awaiting, _dumped(payload_ref)
+        await self._link(run_id, _AWAITING, payload_ref)
         row.assignee = interrupt.assignee
         row.awaiting_deadline = interrupt.deadline
         row.settled_by = worker_id
@@ -446,11 +479,14 @@ class RunStore:
             if row.status != RunStatus.PAUSED:
                 raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
             raise Conflict(f"run {run_id} is waiting on another interrupt")
-        asked = Interrupt.model_validate(row.awaiting)
+        asked = await self._asked(row)
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
         if problem := answer_problem(asked, resolution):
             raise Unprocessable(problem)
-        row.last_resolution = _json(resolution)
+        answer = await self._payloads.put(tenant_id, _json(resolution))
+        question = await self._payloads.put(tenant_id, _json(asked))
+        await self._link(run_id, _ANSWER, answer, question)
+        row.last_resolution, row.last_resolution_ref = None, answer.model_dump()
         self._session.add(
             ResolutionRow(
                 resolution_id=_resolution_id(resolution),
@@ -459,8 +495,8 @@ class RunStore:
                 interrupt_id=resolution.interrupt_id,
                 decision=resolution.decision.value,
                 reviewer=resolution.reviewer,
-                interrupt=_json(asked) or {},
-                resolution=_json(resolution) or {},
+                interrupt_ref=question.model_dump(),
+                resolution_ref=answer.model_dump(),
                 attempt=row.attempt,
                 resolved_at=resolution.resolved_at,
                 recorded_at=now,
@@ -480,13 +516,18 @@ class RunStore:
         """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
         when the answer is made, so a retried resume sends the same JSON and a second
         answer (another click, another person) never does."""
-        kept = await self._session.scalar(
-            select(ResolutionRow.resolution).where(
-                ResolutionRow.tenant_id == tenant_id,
-                ResolutionRow.resolution_id == _resolution_id(resolution),
+        kept = (
+            await self._session.execute(
+                select(ResolutionRow.resolution, ResolutionRow.resolution_ref).where(
+                    ResolutionRow.tenant_id == tenant_id,
+                    ResolutionRow.resolution_id == _resolution_id(resolution),
+                )
             )
-        )
-        return kept == _json(resolution)
+        ).first()
+        if kept is None:
+            return False
+        inline, ref = kept
+        return (inline if ref is None else await self._payloads.get(ref)) == _json(resolution)
 
     async def cancel(
         self,
@@ -540,6 +581,7 @@ class RunStore:
         instead (``_retried``), as the next attempt after a jittered backoff; its
         ``MAX_ERROR_RETRIES``-th such error stands, saying how often the run was retried. A
         worker's repeat of that finish answers the requeued run."""
+        output_ref = await self._put(tenant_id, ending.output)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         requeued = (
             ending.status is RunStatus.ERROR
@@ -556,7 +598,8 @@ class RunStore:
             row.settled_by = worker_id
             return await self._flushed(row, now), True
         _move(row, ending.status, now)
-        row.output = ending.output
+        row.output, row.output_ref = None, _dumped(output_ref)
+        await self._link(run_id, _OUTPUT, output_ref)
         row.error = _json(_counted(ending.error, row.error_retries))
         row.settled_by = worker_id
         await self._ended([row], now)
@@ -676,12 +719,12 @@ class RunStore:
         """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
         means the lease is gone (it lapsed and the run was re-queued, or the run was
         cancelled or finished): the worker must stop, and nothing is saved."""
-        checkpoint = bounded_checkpoint(request.checkpoint)
+        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
         row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
         if checkpoint is not None:
-            row.checkpoint = checkpoint
+            await self._keep_checkpoint(row, checkpoint)
             row.updated_at = now
         lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
@@ -695,7 +738,7 @@ class RunStore:
         progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
         asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
         answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
-        checkpoint = bounded_checkpoint(request.checkpoint)
+        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False
@@ -705,7 +748,7 @@ class RunStore:
         else:
             _requeue(row, now)
             if checkpoint is not None:
-                row.checkpoint = checkpoint
+                await self._keep_checkpoint(row, checkpoint)
         row.settled_by = request.worker_id
         return await self._flushed(row, now), True
 
@@ -1006,9 +1049,17 @@ class RunStore:
         ][:limit]
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
-        """Runs that just ended start their artifacts' retention."""
+        """Runs that just ended start their artifacts' retention, and let go of their
+        checkpoints (the sweep deletes what nothing else refers to)."""
         ended = [row.run_id for row in rows if RunStatus(row.status).final]
-        await ArtifactStore(self._session).expire_with(ended, at=now + ARTIFACT_RETENTION)
+        retention = self._payloads.retention
+        await ArtifactStore(self._session).expire_with(ended, at=now + retention)
+        if ended:
+            await self._session.execute(
+                delete(RunPayloadRow).where(
+                    RunPayloadRow.run_id.in_(ended), RunPayloadRow.kind == _CHECKPOINT
+                )
+            )
 
     # ------------------------------------------------------------------ reads
     async def resolutions(
@@ -1135,8 +1186,125 @@ class RunStore:
         return row
 
     async def _flushed(self, row: RunRow, now: datetime) -> RunRecord:
+        if row.awaiting_ref is None:  # not paused (any more): its question's payload let go
+            await self._session.execute(
+                delete(RunPayloadRow).where(
+                    RunPayloadRow.run_id == row.run_id, RunPayloadRow.kind == _AWAITING
+                )
+            )
         await self._session.flush()
         return await self._record(row, now)
 
     async def _record(self, row: RunRow, now: datetime) -> RunRecord:
         return (await _records(self._payloads, [row], now))[0]
+
+    # ------------------------------------------------------------------ payloads
+    async def _put(self, tenant_id: str, value: Any) -> PayloadRef | None:
+        """``value`` in the blob store, durable before any row refers to it; ``None`` stays
+        ``None``."""
+        return None if value is None else await self._payloads.put(tenant_id, value)
+
+    async def _link(self, run_id: str, kind: str, *refs: PayloadRef | None) -> None:
+        """The run refers to these objects as ``kind``: they are kept while it does."""
+        keys = {ref.ref for ref in refs if ref is not None}
+        if keys:
+            await self._session.execute(
+                insert(RunPayloadRow)
+                .values([{"run_id": run_id, "key": key, "kind": kind} for key in keys])
+                .on_conflict_do_nothing()
+            )
+
+    async def _checkpoint(
+        self, tenant_id: str, checkpoint: dict[str, Any] | None
+    ) -> list[PayloadRef] | PayloadRef | None:
+        """What a checkpoint is kept as: its segments (``{SEGMENTS: [ref, ...]}``, objects
+        the worker uploaded, each this tenant's and stored), or the whole checkpoint, stored
+        as one object."""
+        if checkpoint is None:
+            return None
+        if set(checkpoint) != {SEGMENTS}:
+            return await self._payloads.put(tenant_id, checkpoint)
+        try:
+            segments = [PayloadRef.model_validate(ref) for ref in checkpoint[SEGMENTS]]
+        except (TypeError, ValueError) as exc:
+            raise Unprocessable(f"{SEGMENTS} lists payload references: {exc}") from exc
+        if not all(owned_by(ref, tenant_id) for ref in segments):
+            raise Unprocessable(f"{SEGMENTS} names objects that are not this tenant's")
+        keys = {ref.ref for ref in segments}
+        stored = await self._session.scalar(
+            select(func.count()).where(PayloadBlobRow.key.in_(keys))
+        )
+        if stored != len(keys):
+            raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
+        return segments
+
+    async def _keep_checkpoint(
+        self, row: RunRow, checkpoint: list[PayloadRef] | PayloadRef | None
+    ) -> None:
+        """The run's checkpoint is now ``checkpoint`` (none: it has none): the objects it
+        names are linked, the ones the last checkpoint named and this one does not let go."""
+        refs = (
+            []
+            if checkpoint is None
+            else checkpoint
+            if isinstance(checkpoint, list)
+            else [checkpoint]
+        )
+        row.checkpoint = None
+        if checkpoint is None:
+            row.checkpoint_ref = row.checkpoint_segments = None
+        elif isinstance(checkpoint, list):
+            row.checkpoint_ref, row.checkpoint_segments = None, [r.model_dump() for r in refs]
+        else:
+            row.checkpoint_ref, row.checkpoint_segments = checkpoint.model_dump(), None
+        await self._session.execute(
+            delete(RunPayloadRow).where(
+                RunPayloadRow.run_id == row.run_id,
+                RunPayloadRow.kind == _CHECKPOINT,
+                RunPayloadRow.key.not_in({r.ref for r in refs}),
+            )
+        )
+        await self._link(row.run_id, _CHECKPOINT, *refs)
+
+    async def _asked(self, row: RunRow) -> Interrupt:
+        """The interrupt the run waits on, its payload read in when kept by reference."""
+        awaiting = dict(row.awaiting or {})
+        if row.awaiting_ref is not None:
+            awaiting["payload"] = await self._payloads.get(row.awaiting_ref)
+        return Interrupt.model_validate(awaiting)
+
+    # ------------------------------------------------------------------ event compaction
+    async def ended_uncompacted(self, *, limit: int) -> list[tuple[str, str]]:
+        """Ended runs whose event log is still rows: ``(tenant_id, run_id)``, oldest first."""
+        rows = await self._session.execute(
+            select(RunRow.tenant_id, RunRow.run_id)
+            .where(RunRow.status.in_(_ENDED), RunRow.events_ref.is_(None))
+            .order_by(RunRow.updated_at)
+            .limit(limit)
+        )
+        return [(tenant, run) for tenant, run in rows.all()]
+
+    async def compact_events(self, tenant_id: str, run_id: str) -> bool:
+        """Move an ended run's event log, every event at its position, into one object and
+        delete its rows. Nothing appends to an ended run, so the log read first is the whole
+        log; the run's row is locked only to swap the rows for the reference. Returns
+        whether this call compacted it (another ticker may have)."""
+        logged = (
+            await self._session.execute(
+                select(RunEventRow.position, RunEventRow.event)
+                .where(RunEventRow.run_id == run_id)
+                .order_by(RunEventRow.position)
+            )
+        ).all()
+        ref = await self._payloads.put(tenant_id, [[p, e] for p, e in logged])
+        row = await self._session.scalar(
+            select(RunRow)
+            .where(RunRow.run_id == run_id, RunRow.events_ref.is_(None))
+            .with_for_update(skip_locked=True)
+        )
+        if row is None:
+            return False
+        row.events_ref = ref.model_dump()
+        await self._link(run_id, _EVENTS, ref)
+        await self._session.execute(delete(RunEventRow).where(RunEventRow.run_id == run_id))
+        return True

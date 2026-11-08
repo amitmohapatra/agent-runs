@@ -9,8 +9,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.contracts.ids import new_id, now
+from trellis.runs.payloads import MEDIA_TYPE, SEGMENTS, PayloadRef, adecode, key_of
 
 from agent_runs.api.deps import Session, Who
 from agent_runs.api.openapi import conflict
@@ -26,6 +28,7 @@ from agent_runs.store.artifacts import (
     sha256_of,
 )
 from agent_runs.store.runs import RunStore
+from agent_runs.store.tables import PayloadBlobRow
 
 router = APIRouter(tags=["artifacts"])
 
@@ -247,3 +250,84 @@ def _matches(if_none_match: str | None, etag: str) -> bool:
         return False
     tags = [tag.strip().removeprefix("W/") for tag in if_none_match.split(",")]
     return "*" in tags or etag in tags
+
+
+# ------------------------------------------------------------------ payload objects
+Sha256 = Annotated[
+    str, Path(pattern=r"^[0-9a-f]{64}$", description="The object's SHA-256 (its address).")
+]
+
+
+@router.post(
+    "/v1/runs/{run_id}/payloads",
+    status_code=_CREATED,
+    summary="Store a payload object of a run (a checkpoint segment)",
+    response_description=f"Created: the object's reference, for a checkpoint's `{SEGMENTS}`.",
+    responses={
+        **conflict(
+            "LEASE_LOST: a `worker_id` that does not hold the run's lease. CONFLICT: a leased "
+            "run without `worker_id`, or a run that is no longer running or paused."
+        ),
+        422: {"description": "VALIDATION: the body is not a payload object (zstd JSON)."},
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "description": f"A payload object: compact JSON compressed with zstd "
+            f"(`trellis.runs.payloads.encode`), `{MEDIA_TYPE}`.",
+            "content": {
+                MEDIA_TYPE: {
+                    "schema": {"type": "string", "format": "binary"},
+                    "examples": {
+                        "segment": {
+                            "summary": "A journal segment (shown decoded; sent zstd-compressed)",
+                            "value": {"$d": {"calls": {"$d": {"c1": {"$a": [{"rows": 3}]}}}}},
+                        }
+                    },
+                }
+            },
+        }
+    },
+)
+async def put_payload(
+    run_id: RunId, request: Request, db: Session, who: Who, worker_id: WorkerId = None
+) -> PayloadRef:
+    """Store the body, a payload object, for the run's tenant and return its reference: a
+    checkpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may
+    write is who may add an artifact; the object is checked to decode before it is stored, and
+    stored once however often it is sent (its key is its SHA-256). At most 50 MiB (413). An
+    object no checkpoint names is deleted a day later."""
+    await RunStore(db).check_artifact_writer(
+        who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
+    )
+    await db.close()  # no connection held while the body arrives
+    data = b"".join([chunk async for chunk in await _nonempty(request)])
+    try:
+        await adecode(data)
+    except ValueError as exc:
+        raise Unprocessable(f"the body is not a payload object: {exc}") from exc
+    return await request.app.state.payloads.put_encoded(who.tenant_id, data)
+
+
+@router.get(
+    "/v1/payloads/{sha256}",
+    summary="Read a payload object",
+    responses={
+        _OK: {
+            "content": {MEDIA_TYPE: {"schema": {"type": "string", "format": "binary"}}},
+            "description": "The object's bytes, verified, immutable.",
+        },
+        500: {"description": "INTERNAL: the object no longer matches its checksum."},
+    },
+)
+async def get_payload(sha256: Sha256, request: Request, db: Session, who: Who) -> Response:
+    """The tenant's payload object with this SHA-256 (a checkpoint's segment), verified
+    against it. 404 for an object this tenant never stored, whoever else did."""
+    key = key_of(who.tenant_id, sha256)
+    size = await db.scalar(select(PayloadBlobRow.size).where(PayloadBlobRow.key == key))
+    await db.close()
+    if size is None:
+        raise NotFound(f"no payload object {sha256}")
+    ref = PayloadRef(ref=key, size=size, sha256=sha256)
+    data = await request.app.state.payloads.get_encoded(ref)
+    return Response(data, media_type=MEDIA_TYPE, headers={"Cache-Control": CACHE_CONTROL})

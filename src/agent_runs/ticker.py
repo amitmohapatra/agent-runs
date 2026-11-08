@@ -90,6 +90,7 @@ class TickReport:
     purged: int = 0
     runs_purged: int = 0
     orphans: int = 0
+    compacted: int = 0
 
 
 class Ticker:
@@ -133,6 +134,7 @@ class Ticker:
                 dropped=await self._drop_dead(now),
                 purged=await self._purge_artifacts(now),
                 runs_purged=await self._purge_runs(now),
+                compacted=await self._compact_events(),
                 orphans=await self._sweep_orphans(now),
             )
         except (DBAPIError, OSError) as exc:
@@ -238,6 +240,18 @@ class Ticker:
             await db.commit()
         return purged
 
+    async def _compact_events(self) -> int:
+        """Move ended runs' event logs from rows to one object each
+        (``RunStore.compact_events``), a batch per tick."""
+        async with self._sessions() as db:
+            ended = await RunStore(db).ended_uncompacted(limit=SWEEP_BATCH)
+        compacted = 0
+        for tenant_id, run_id in ended:
+            async with self._sessions() as db:
+                compacted += await RunStore(db).compact_events(tenant_id, run_id)
+                await db.commit()
+        return compacted
+
     async def _sweep_orphans(self, now: datetime) -> int:
         """Delete payload objects no row refers to any more (``PayloadStore.sweep``)."""
         async with self._sessions() as db:
@@ -287,7 +301,7 @@ async def run() -> None:
         beat = heartbeat.path_for(settings.ticker.heartbeat_file)
         log.info("ticker.heartbeat", path=str(beat))
         sessions = async_sessionmaker(engine, expire_on_commit=False)
-        bind(sessions, blobs)
+        bind(sessions, blobs, retention=settings.blob.retention)
         ticker = Ticker(
             sessions,
             webhooks,
