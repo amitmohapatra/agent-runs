@@ -17,9 +17,7 @@ from typing import IO, Final
 
 from google.api_core import exceptions as gexc
 from google.cloud import storage
-
-from agent_runs.blob.port import BlobExists, BlobNotFound, StoredBlob, one_chunk
-from agent_runs.config.constants import BLOB_CHUNK_BYTES
+from trellis.runs.blob import BLOB_CHUNK_BYTES, BlobExists, BlobNotFound, StoredBlob, one_chunk
 
 #: An upload is spooled before it is sent (the SHA-256 goes in the object's metadata, which
 #: is written with the object): in memory up to this, on local disk past it.

@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
-from agent_runs.blob.filesystem import FilesystemBlobStore
-from agent_runs.blob.gcs import GCSBlobStore
-from agent_runs.blob.port import (
+from trellis.runs.blob import (
     BlobCorrupt,
     BlobExists,
     BlobNotFound,
     BlobStore,
+    FilesystemBlobStore,
     StoredBlob,
     read,
 )
+
+from agent_runs.blob.gcs import GCSBlobStore
 from agent_runs.config.settings import BlobSettings
 
 

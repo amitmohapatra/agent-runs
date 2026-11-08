@@ -23,9 +23,9 @@ from google.api_core import exceptions as gexc
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from trellis.runs.blob import BlobCorrupt, BlobExists, BlobNotFound, BlobStore, read
 from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, adecode, aencode, ref_of
 
-from agent_runs.blob.port import BlobCorrupt, BlobExists, BlobNotFound, BlobStore, read
 from agent_runs.config.constants import ARTIFACT_RETENTION
 from agent_runs.domain.errors import ServiceError, Unavailable
 from agent_runs.store.tables import PayloadBlobRow, RunPayloadRow, WebhookDeliveryRow

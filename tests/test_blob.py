@@ -18,6 +18,7 @@ import httpx
 import pytest
 from google.api_core import exceptions as gexc
 from trellis.contracts.ids import now
+from trellis.runs.blob import FilesystemBlobStore
 
 from agent_runs.blob import (
     BlobCorrupt,
@@ -27,7 +28,6 @@ from agent_runs.blob import (
     open_blob_store,
     read,
 )
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.blob.gcs import GCSBlobStore
 from agent_runs.config.constants import ARTIFACT_RETENTION
 from agent_runs.config.settings import BlobSettings
@@ -169,7 +169,7 @@ def _key() -> str:
 
 
 async def test_a_put_is_read_back_verified_in_chunks(store, monkeypatch) -> None:
-    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 7)
+    monkeypatch.setattr("trellis.runs.blob.BLOB_CHUNK_BYTES", 7)
     monkeypatch.setattr("agent_runs.blob.gcs.BLOB_CHUNK_BYTES", 7)
     data = b"the quick brown fox jumps over the lazy dog" * 3
     key = _key()
@@ -199,7 +199,7 @@ async def test_a_delete_is_idempotent_and_a_missing_key_is_not_found(store) -> N
 async def test_bytes_that_do_not_match_never_arrive_whole(store, monkeypatch) -> None:
     """The last chunk is held back until the hash checks, so a reader that gets every byte
     of a corrupted object does not exist."""
-    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 4)
+    monkeypatch.setattr("trellis.runs.blob.BLOB_CHUNK_BYTES", 4)
     monkeypatch.setattr("agent_runs.blob.gcs.BLOB_CHUNK_BYTES", 4)
     data = b"0123456789abcdef"
     key = _key()
@@ -211,23 +211,6 @@ async def test_bytes_that_do_not_match_never_arrive_whole(store, monkeypatch) ->
     assert b"".join(got) == data[:-4]
     with pytest.raises(BlobCorrupt):
         await _all(read(store, key, sha256=hashlib.sha256(data).hexdigest(), size=17))
-
-
-async def test_read_skips_empty_chunks_and_an_empty_object_reads_as_nothing() -> None:
-    class Chunks:
-        def __init__(self, *parts: bytes) -> None:
-            self._parts = parts
-
-        async def chunks(self, key: str) -> AsyncIterator[bytes]:
-            for part in self._parts:
-                yield part
-
-    data = b"abcdef"
-    sha = hashlib.sha256(data).hexdigest()
-    store = Chunks(b"", b"abc", b"", b"def", b"")
-    assert await _all(read(store, "k", sha256=sha, size=6)) == data  # pyright: ignore[reportArgumentType]
-    empty = hashlib.sha256(b"").hexdigest()
-    assert await _all(read(Chunks(), "k", sha256=empty, size=0)) == b""  # pyright: ignore[reportArgumentType]
 
 
 async def test_the_gcs_adapter_writes_create_only_with_the_sha256_in_metadata() -> None:
@@ -249,13 +232,6 @@ async def test_a_gcs_object_deleted_mid_read_is_not_found(monkeypatch) -> None:
     del client.buckets[BUCKET].objects["artifacts/a"]
     with pytest.raises(BlobNotFound):
         await anext(chunks)
-
-
-def test_the_filesystem_store_refuses_keys_that_leave_its_root(tmp_path) -> None:
-    store = FilesystemBlobStore(tmp_path)
-    for key in ("../escape", "a//b", "", "a/./b"):
-        with pytest.raises(ValueError, match="invalid blob key"):
-            store._path(key)
 
 
 # ------------------------------------------------------------------ settings

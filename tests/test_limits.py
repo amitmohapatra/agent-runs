@@ -12,9 +12,9 @@ import pytest
 from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import text
 from trellis.contracts.ids import now
+from trellis.runs.blob import FilesystemBlobStore
 
 from agent_runs.api.ratelimit import TenantRateLimiter
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
 from agent_runs.observability import metrics
 from tests.conftest import SETTINGS, client_of, serving, started

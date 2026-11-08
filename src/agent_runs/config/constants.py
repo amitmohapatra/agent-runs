@@ -88,8 +88,6 @@ ARTIFACT_RETENTION: Final = timedelta(days=7)
 #: The role of the key (the Memory Service's registry) that may add an artifact to a paused
 #: run: the tenant's service principal (a harness or its UI backend), not a user or admin.
 PAUSED_ARTIFACT_ROLE: Final = "service"
-#: The unit a blob is read and streamed in.
-BLOB_CHUNK_BYTES: Final = 1024 * 1024
 
 # --------------------------------------------------------------------------- the queue
 

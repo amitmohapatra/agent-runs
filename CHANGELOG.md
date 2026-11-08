@@ -6,6 +6,14 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Run payloads are written by reference.** A run's input, output, the payload its pause
+  waits on, its answers and its checkpoint go to the blob store before any row refers to
+  them; reads answer the same JSON (a webhook's body the same bytes). A checkpoint may be a
+  list of segments the worker uploads (`POST /v1/runs/{run_id}/payloads`, read back with
+  `GET /v1/payloads/{sha256}`; SDK `artifacts.put_payload` / `get_payload`), so a save sends
+  only what changed. An ended run's events become one object (the ticker). Artifact retention
+  is a setting, `RUNS__BLOB__RETENTION_DAYS` (7, as before). Old rows keep working; nothing
+  to do. Set `RUNS__RUNS__RETENTION_DAYS` to bound what is kept.
 * **Run payloads can be read by reference (expand step).** Every payload column gets a
   nullable `*_ref` (a `PayloadRef` to a zstd-compressed JSON object in the blob store, keyed by its
   SHA-256 under the tenant, hash-sharded as the Memory Service's archive is), and every reader (a run, the listing, resolutions, events, a

@@ -18,9 +18,9 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import DataError, OperationalError
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
+from trellis.runs.blob import FilesystemBlobStore
 
 from agent_runs.api.app import create_app
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.blob.payloads import bind, payloads_of
 from agent_runs.config.settings import DatabaseSettings, Settings, reset_settings_cache
 from agent_runs.keys import KeyRegistry

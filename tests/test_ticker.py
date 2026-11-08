@@ -11,8 +11,8 @@ from pathlib import Path
 
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
+from trellis.runs.blob import FilesystemBlobStore
 
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.config.constants import BREAKER_COOLDOWN, BREAKER_THRESHOLD
 from agent_runs.heartbeat import alive
 from agent_runs.retry import Breaker, backoff

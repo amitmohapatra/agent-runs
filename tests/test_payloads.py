@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from sqlalchemy import delete, select, text, update
 from trellis.contracts.ids import now
+from trellis.runs.blob import FilesystemBlobStore
 from trellis.runs.payloads import (
     SEGMENTS,
     PayloadRef,
@@ -24,7 +25,6 @@ from trellis.runs.payloads import (
 )
 
 from agent_runs.blob import BlobStore
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.blob.payloads import (
     ORPHAN_AGE,
     PARALLEL_READS,
