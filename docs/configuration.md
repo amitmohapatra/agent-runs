@@ -21,8 +21,8 @@ RUNS__DATABASE__URL=postgresql+psycopg://runs:${DB_PASSWORD}@db.internal:5432/ag
 RUNS__MEMORY__URL=https://memory.internal
 RUNS__BLOB__BUCKET=acme-agent-runs-artifacts
 RUNS__TICKER__HEARTBEAT_FILE=/run/agent-runs/ticker.beat
-RUNS__RUNS__MAX_RUN_SECONDS=3600
-RUNS__RUNS__RETENTION_DAYS=90
+RUNS__LIMITS__MAX_RUN_SECONDS=3600
+RUNS__LIMITS__RETENTION_DAYS=90
 ```
 
 `Settings` refuses to start outside `dev` and `test` without `RUNS__BLOB__BUCKET`: the
@@ -79,14 +79,18 @@ previous release: every release since the readers reads both forms.
 | `RUNS__BLOB__RETENTION_DAYS` | `7` | yes | API, ticker | days an ended run's artifacts are kept before the ticker deletes them | `30` |
 | `RUNS__BLOB__ROOT` | `.blob` | yes (dev) | API, ticker | without a bucket, the filesystem store's directory, shared by both processes | `/var/lib/agent-runs/blobs` |
 
-## Runs (`RUNS__RUNS__*`)
+## Limits (`RUNS__LIMITS__*`)
+
+Renamed from `RUNS__RUNS__*`. For one release, an old name still works and logs one warning at
+startup naming its new name; the new name wins when both are set. The next release drops the
+old names.
 
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
-| `RUNS__RUNS__MAX_RUN_SECONDS` | unset: no platform maximum | yes | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter | `3600` |
-| `RUNS__RUNS__CONCURRENCY_PER_KEY` | `1` | yes | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once | `2` |
-| `RUNS__RUNS__MAX_RUNNING_PER_TENANT` | unset: no cap | yes | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Fair share between tenants needs no setting | `50` |
-| `RUNS__RUNS__RETENTION_DAYS` | unset: kept forever | **set it** in production | ticker | days an ended run is kept, with its resolutions, events and payload objects (unset, the store grows with every run) | `90` |
+| `RUNS__LIMITS__MAX_RUN_SECONDS` | unset: no platform maximum | yes | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter | `3600` |
+| `RUNS__LIMITS__CONCURRENCY_PER_KEY` | `1` | yes | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once | `2` |
+| `RUNS__LIMITS__MAX_RUNNING_PER_TENANT` | unset: no cap | yes | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Fair share between tenants needs no setting | `50` |
+| `RUNS__LIMITS__RETENTION_DAYS` | unset: kept forever | **set it** in production | ticker | days an ended run is kept, with its resolutions, events and payload objects (unset, the store grows with every run) | `90` |
 
 ## Webhooks (`RUNS__WEBHOOKS__*`)
 

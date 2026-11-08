@@ -8,7 +8,7 @@ from typing import Any
 
 from trellis.contracts.ids import now
 
-from agent_runs.config.settings import RunsSettings
+from agent_runs.config.settings import LimitsSettings
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore
 from tests.conftest import SETTINGS, client_of, serving, started
@@ -34,7 +34,7 @@ async def _finished(client, run_id: str) -> None:
 
 
 def _limited(**limits: Any) -> Any:
-    return SETTINGS.model_copy(update={"runs": RunsSettings(**limits)})
+    return SETTINGS.model_copy(update={"limits": LimitsSettings(**limits)})
 
 
 async def test_the_highest_priority_is_claimed_first_then_the_oldest(client) -> None:

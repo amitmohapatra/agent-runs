@@ -113,7 +113,7 @@ ERROR_RETRY_BASE: Final = timedelta(seconds=10)
 ERROR_RETRY_CAP: Final = timedelta(minutes=10)
 
 #: Runs of one tenant sharing a ``concurrency_key`` that may be RUNNING at once, unless the
-#: deployment says otherwise (``RUNS__RUNS__CONCURRENCY_PER_KEY``): one, so a thread's second
+#: deployment says otherwise (``RUNS__LIMITS__CONCURRENCY_PER_KEY``): one, so a thread's second
 #: message waits for its first run.
 CONCURRENCY_PER_KEY: Final = 1
 

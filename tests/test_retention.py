@@ -1,4 +1,4 @@
-"""Retention: with RUNS__RUNS__RETENTION_DAYS set, the ticker deletes the runs that ended
+"""Retention: with RUNS__LIMITS__RETENTION_DAYS set, the ticker deletes the runs that ended
 before it, with their resolutions and events, after their artifacts; unset, nothing goes."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from trellis.contracts.ids import now
 from trellis.contracts.runs import RunEvent, RunEventType
 
 from agent_runs.config.constants import ARTIFACT_RETENTION
-from agent_runs.config.settings import RunsSettings
+from agent_runs.config.settings import LimitsSettings
 from agent_runs.ticker import Ticker
 from tests.conftest import pause, resolution, sender, started
 
@@ -85,5 +85,5 @@ async def test_a_run_waits_for_its_artifacts_to_go_first(app, client, receiver, 
 
 
 def test_the_retention_is_off_unless_the_deployment_sets_it() -> None:
-    assert RunsSettings().retention is None
-    assert RunsSettings(retention_days=90).retention == timedelta(days=90)
+    assert LimitsSettings().retention is None
+    assert LimitsSettings(retention_days=90).retention == timedelta(days=90)

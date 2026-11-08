@@ -68,7 +68,7 @@ def _leasing(request: Request, db: AsyncSession) -> RunStore:
     """The store for a route that hands out a lease, which tells the worker the working time
     the run has left under the service's maximum too, and claims within the deployment's
     limits."""
-    limits = request.app.state.settings.runs
+    limits = request.app.state.settings.limits
     return RunStore(
         db,
         max_run_seconds=limits.max_run_seconds,
@@ -158,9 +158,9 @@ async def claim(
     ``lease.expires_at``; ``lease.remaining_seconds`` is the working time it has left.
 
     The next run is the one with the highest ``priority``, then the oldest, among those
-    with room: fewer than ``RUNS__RUNS__CONCURRENCY_PER_KEY`` (1) runs of the tenant
+    with room: fewer than ``RUNS__LIMITS__CONCURRENCY_PER_KEY`` (1) runs of the tenant
     sharing its ``concurrency_key`` are ``RUNNING``, and the tenant's workers hold fewer
-    than ``RUNS__RUNS__MAX_RUNNING_PER_TENANT`` runs (no cap unless set). A platform key
+    than ``RUNS__LIMITS__MAX_RUNNING_PER_TENANT`` runs (no cap unless set). A platform key
     that sends no ``X-Trellis-Tenant`` claims from every tenant's queue, the tenant whose
     workers hold the fewest runs of these agents first: a fair share of the fleet, with
     nothing to set. The claimed run names its tenant (``run.tenant_id``), which the
