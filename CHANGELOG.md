@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **The inline payload columns are dropped (contract step).** `agent_runs.input`, `output`,
+  `last_resolution`, `checkpoint` and `run_resolutions.interrupt`, `resolution` go; every
+  payload is read from the blob store by its reference, and `agent-runs-payloads` is removed.
+  **Run `agent-runs-payloads clear` (the previous release) before upgrading**: migration
+  `b9e3f4a5c6d7` refuses while any payload is still inline. Rolling back: redeploy the previous
+  release after `alembic downgrade` (the columns come back empty; it reads the references).
 * **`agent-runs-payloads copy|verify|clear` moves old inline payloads to the blob store.**
   Run it once after deploying the release that writes references: `copy` stores what earlier
   releases kept inline and sets the references (readers use them at once), `verify` reads

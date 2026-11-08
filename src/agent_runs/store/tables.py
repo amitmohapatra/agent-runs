@@ -48,19 +48,13 @@ class RunRow(Base):
     user_id: Mapped[str | None] = mapped_column(String(128))
     workspace_id: Mapped[str | None] = mapped_column(String(128))
     on_behalf_of: Mapped[str | None] = mapped_column(String(128))
-    input: Mapped[Any] = mapped_column(JSONB, nullable=True)
-    output: Mapped[Any] = mapped_column(JSONB, nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the Interrupt a PAUSED run waits on
     awaiting: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    #: the InterruptResolution the last resume carried
-    last_resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    #: the executor's opaque resume state, written at pause and cleared when the run finishes
-    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    #: references to the payloads in the blob store (``PayloadRef``s,
-    #: ``agent_runs.blob.payloads``), each read in place of its inline twin when set; the
-    #: interrupt's ``payload`` (``awaiting_ref``), a whole checkpoint or its segments, and an
-    #: ended run's compacted event log (``events_ref``)
+    #: the run's payloads, by reference to the blob store (``PayloadRef``s,
+    #: ``agent_runs.blob.payloads``): its input, output, last answer, the interrupt's
+    #: ``payload`` (``awaiting_ref``), a whole checkpoint or its segments (cleared when the run
+    #: ends), and an ended run's compacted event log (``events_ref``)
     input_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     output_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
@@ -322,12 +316,10 @@ class ResolutionRow(Base):
     interrupt_id: Mapped[str] = mapped_column(String(64))
     decision: Mapped[str] = mapped_column(String(16))
     reviewer: Mapped[str | None] = mapped_column(String(256))
-    #: the Interrupt as it was asked (question, tool call) and the InterruptResolution
-    interrupt: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    #: the same, by reference (``PayloadRef``), read in place of the inline twins when set
-    interrupt_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
-    resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    #: the Interrupt as it was asked (question, tool call) and the InterruptResolution, by
+    #: reference (``PayloadRef``)
+    interrupt_ref: Mapped[dict[str, Any]] = mapped_column(_REF)
+    resolution_ref: Mapped[dict[str, Any]] = mapped_column(_REF)
     #: the attempt that paused on it
     attempt: Mapped[int] = mapped_column(Integer)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

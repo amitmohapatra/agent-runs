@@ -2,7 +2,7 @@
 what they answered inline, a checkpoint may be a list of segments the worker uploaded, an
 unchanged save stores nothing new, a write that never commits leaves only an orphan the sweep
 deletes, an ended run's events become one object, and a run written before the change-over
-goes on (resumes, finishes) beside the ones written after."""
+goes on."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from trellis.contracts.ids import now
 from trellis.runs.payloads import SEGMENTS, encode, ref_of
 
@@ -20,7 +20,6 @@ from agent_runs.config.settings import BlobSettings
 from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import (
     PayloadBlobRow,
-    ResolutionRow,
     RunEventRow,
     RunPayloadRow,
     RunRow,
@@ -80,11 +79,7 @@ async def test_a_run_keeps_no_payload_in_its_rows(app: Any, client: Any) -> None
     )
     assert done.status_code == 200, done.text
     row = await _row(app, run_id)
-    assert (row.input, row.output, row.last_resolution, row.checkpoint) == (None,) * 4
     assert row.input_ref and row.output_ref and row.last_resolution_ref
-    async with app.state.sessions() as db:
-        kept = (await db.scalars(select(ResolutionRow).where(ResolutionRow.run_id == run_id))).one()
-    assert (kept.interrupt, kept.resolution) == (None, None)
     got = (await client.get(f"/v1/runs/{run_id}")).json()
     assert got["input"] == BIG and got["output"] == {"answer": BIG}
     assert got["last_resolution"]["payload"] == BIG
@@ -220,56 +215,6 @@ async def test_a_store_that_does_not_answer_refuses_the_save_and_keeps_the_last(
 
 
 # ------------------------------------------------------------------ before and after
-async def test_a_run_written_before_the_change_over_resumes_and_finishes(
-    app: Any, client: Any
-) -> None:
-    """A paused run whose row holds its payloads inline (written by the last release) is
-    answered, claimed, resumed from its inline checkpoint and finished by this one."""
-    run = (await client.post("/v1/runs", json={**started(input={"q": 1}), "queue": True})).json()
-    run_id = run["run_id"]
-    await client.post("/v1/runs/claim", json={"worker_id": "w1", "agent_ids": [run["agent_id"]]})
-    waiting = (
-        await client.post(
-            f"/v1/runs/{run_id}/pause",
-            params={"worker_id": "w1"},
-            json=pause(run_id, {"journal": "old"}, payload={"p": 1}),
-        )
-    ).json()
-    async with app.state.sessions() as db:  # the row as the last release wrote it
-        row = await db.get(RunRow, run_id)
-        assert row is not None
-        await db.execute(
-            update(RunRow)
-            .where(RunRow.run_id == run_id)
-            .values(
-                input={"q": 1},
-                input_ref=None,
-                checkpoint={"journal": "old"},
-                checkpoint_ref=None,
-                awaiting={**(row.awaiting or {}), "payload": {"p": 1}},
-                awaiting_ref=None,
-            )
-        )
-        await db.commit()
-    resumed = await client.post(f"/v1/runs/{run_id}/resume", json=resolution(waiting, "APPROVE"))
-    assert resumed.status_code == 200, resumed.text
-    claim = (
-        await client.post(
-            "/v1/runs/claim", json={"worker_id": "w2", "agent_ids": [run["agent_id"]]}
-        )
-    ).json()
-    assert claim["run"]["checkpoint"] == {"journal": "old"} and claim["run"]["input"] == {"q": 1}
-    history = (await client.get(f"/v1/runs/{run_id}/resolutions")).json()
-    assert history[0]["interrupt"]["payload"] == {"p": 1}
-    done = await client.post(
-        f"/v1/runs/{run_id}/finish",
-        params={"worker_id": "w2"},
-        json={"status": "SUCCESS", "output": 2},
-    )
-    got = done.json()
-    assert (got["input"], got["output"]) == ({"q": 1}, 2), "old inline and new reference, one run"
-
-
 async def test_a_webhook_body_is_sent_as_it_was_announced(
     app: Any, client: Any, ticker: Any, receiver: Any
 ) -> None:

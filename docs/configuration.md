@@ -67,11 +67,7 @@ are zstd-compressed JSON keyed by their SHA-256 under the tenant
 (`tenant-shard=<n>/tenant=<t>/blobs/sha256=<hex>.json.zst`), so the same content is stored once.
 The ticker deletes objects nothing refers to once they are a day old.
 
-Rows written by a release before payload references keep their payloads inline until they are
-moved: run `agent-runs-payloads copy`, then `agent-runs-payloads verify`, then
-`agent-runs-payloads clear` (same settings as the API; batched, resumable, nothing cleared unless
-every copy reads back equal; exit 1 otherwise). Roll back at any point by redeploying the
-previous release: every release since the readers reads both forms.
+Every run payload is in the blob store; the database holds references only.
 
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
