@@ -40,6 +40,17 @@ async def test_a_put_reads_back_once_and_is_never_overwritten(tmp_path: Path) ->
     await store.aclose()
 
 
+async def test_a_stream_is_written_as_it_arrives(tmp_path: Path) -> None:
+    async def parts() -> AsyncIterator[bytes]:
+        yield b"one "
+        yield b"two"
+
+    store = FilesystemBlobStore(tmp_path)
+    stored = await store.put_stream("t/s", parts(), content_type="text/plain")
+    assert (stored.size, stored.sha256) == (7, sha256_hex(b"one two"))
+    assert await _all(store.chunks("t/s")) == b"one two"
+
+
 async def test_a_stream_that_fails_leaves_nothing_behind(tmp_path: Path) -> None:
     async def broken() -> AsyncIterator[bytes]:
         yield b"half"

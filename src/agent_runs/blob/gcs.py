@@ -17,11 +17,16 @@ from typing import IO, Final
 
 from google.api_core import exceptions as gexc
 from google.cloud import storage
-from trellis.runs.blob import BLOB_CHUNK_BYTES, BlobExists, BlobNotFound, StoredBlob, one_chunk
+from trellis.runs.blob import BLOB_CHUNK_BYTES, BlobExists, BlobNotFound, StoredBlob
 
 #: An upload is spooled before it is sent (the SHA-256 goes in the object's metadata, which
 #: is written with the object): in memory up to this, on local disk past it.
 SPOOL_MEMORY_BYTES: Final = 8 * BLOB_CHUNK_BYTES
+
+
+async def one_chunk(data: bytes) -> AsyncIterator[bytes]:
+    """``data`` as a stream, so ``put`` is ``put_stream`` of one chunk."""
+    yield data
 
 
 class GCSBlobStore:

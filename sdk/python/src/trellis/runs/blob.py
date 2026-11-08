@@ -52,11 +52,6 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-async def one_chunk(data: bytes) -> AsyncIterator[bytes]:
-    """``data`` as a stream, so ``put`` is ``put_stream`` of one chunk."""
-    yield data
-
-
 class BlobStore(Protocol):
     async def put(self, key: str, data: bytes, *, content_type: str) -> StoredBlob:
         """Create ``key`` holding ``data``; ``BlobExists`` when it already exists."""
@@ -118,7 +113,22 @@ class FilesystemBlobStore:
         return self._root.joinpath(*parts)
 
     async def put(self, key: str, data: bytes, *, content_type: str) -> StoredBlob:
-        return await self.put_stream(key, one_chunk(data), content_type=content_type)
+        """Bytes already in hand: written in one thread (one hop off the event loop, not one
+        per step), as ``put_stream`` writes them."""
+        path = self._path(key)
+        await asyncio.to_thread(self._write, path, data)
+        return StoredBlob(key=key, size=len(data), sha256=sha256_hex(data))
+
+    def _write(self, path: Path, data: bytes) -> None:
+        fh, tmp = self._temporary(path)
+        try:
+            try:
+                fh.write(data)
+            finally:
+                self._close(fh)
+            self._link(tmp, path)
+        finally:
+            self._discard(tmp)
 
     async def put_stream(
         self, key: str, chunks: AsyncIterator[bytes], *, content_type: str
