@@ -5,14 +5,22 @@ table, a diff) go to blob storage, and the run carries an ``ArtifactRef`` to the
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, Header, Path, Query, Request, Response
+from fastapi import APIRouter, Body, Header, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy import select
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.contracts.ids import new_id, now
-from trellis.runs.payloads import MEDIA_TYPE, SEGMENTS, PayloadRef, adecode, key_of
+from trellis.runs.payloads import (
+    FRAMED_MEDIA_TYPE,
+    MEDIA_TYPE,
+    SEGMENTS,
+    PayloadRef,
+    adecode,
+    key_of,
+)
 
 from agent_runs.api.deps import Session, Who
 from agent_runs.api.openapi import conflict
@@ -331,3 +339,69 @@ async def get_payload(sha256: Sha256, request: Request, db: Session, who: Who) -
     ref = PayloadRef(ref=key, size=size, sha256=sha256)
     data = await request.app.state.payloads.get_encoded(ref)
     return Response(data, media_type=MEDIA_TYPE, headers={"Cache-Control": CACHE_CONTROL})
+
+
+#: Objects one read may ask for: a resume's segments (a journal keeps at most 64).
+MAX_READ_OBJECTS: Final = 256
+
+
+class PayloadsAsked(BaseModel):
+    """Payload objects to read at once, by SHA-256: a checkpoint's segments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sha256: list[Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]] = Field(
+        min_length=1,
+        max_length=MAX_READ_OBJECTS,
+        description="The objects' SHA-256s, in the order their bytes are answered.",
+    )
+
+
+_SEGMENTS_ASKED: Final[dict[str, Any]] = {
+    "segments": {
+        "summary": "A checkpoint's segments, in order",
+        "value": {"sha256": ["6f1ed002ab5595859014ebf0951522d9" * 2]},
+    }
+}
+
+
+@router.post(
+    "/v1/payloads/read",
+    summary="Read several payload objects at once",
+    responses={
+        _OK: {
+            "content": {FRAMED_MEDIA_TYPE: {"schema": {"type": "string", "format": "binary"}}},
+            "description": "Each object's bytes in the order asked, each after its length "
+            "(8 bytes, big-endian), verified.",
+        },
+        500: {"description": "INTERNAL: an object no longer matches its checksum."},
+    },
+)
+async def get_payloads(
+    body: Annotated[PayloadsAsked, Body(openapi_examples=_SEGMENTS_ASKED)],
+    request: Request,
+    db: Session,
+    who: Who,
+) -> Response:
+    """The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one
+    answer, read from the store in parallel: a resume is one round trip, not one per
+    segment. 404 when any is not this tenant's."""
+    keys = [key_of(who.tenant_id, sha) for sha in body.sha256]
+    sizes = dict(
+        (
+            await db.execute(
+                select(PayloadBlobRow.key, PayloadBlobRow.size).where(PayloadBlobRow.key.in_(keys))
+            )
+        )
+        .tuples()
+        .all()
+    )
+    await db.close()
+    if missing := [sha for sha, key in zip(body.sha256, keys, strict=True) if key not in sizes]:
+        raise NotFound(f"no payload object {missing[0]}")
+    refs = [
+        PayloadRef(ref=k, size=sizes[k], sha256=s) for k, s in zip(keys, body.sha256, strict=True)
+    ]
+    stored = await request.app.state.payloads.get_many_encoded(refs)
+    framed = b"".join(len(data).to_bytes(8, "big") + data for data in stored)
+    return Response(framed, media_type=FRAMED_MEDIA_TYPE)

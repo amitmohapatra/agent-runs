@@ -27,6 +27,8 @@ from pydantic import BaseModel, ConfigDict
 
 #: What a payload object is: JSON, zstd-compressed.
 MEDIA_TYPE: Final = "application/vnd.trellis.payload+json+zstd"
+#: Several payload objects in one answer: each after its length, 8 bytes big-endian.
+FRAMED_MEDIA_TYPE: Final = "application/vnd.trellis.payloads"
 #: zstd's default level: measured on resume journals of 0.1-12 MiB it stores 4-9 % of the
 #: JSON at ~10x gzip's speed (benchmark/payloads.md).
 ZSTD_LEVEL: Final = 3
@@ -133,3 +135,17 @@ def ref_of(tenant_id: str, data: bytes) -> PayloadRef:
 def owned_by(ref: PayloadRef, tenant_id: str) -> bool:
     """Is ``ref`` one of ``tenant_id``'s payload objects (its well-formed key)?"""
     return ref.ref == key_of(tenant_id, ref.sha256) and len(ref.sha256) == SHA256_HEX
+
+
+def frames(data: bytes) -> list[bytes]:
+    """The objects of a :data:`FRAMED_MEDIA_TYPE` answer, in order (``ValueError`` when it
+    is cut short)."""
+    found, at = [], 0
+    while at < len(data):
+        size = int.from_bytes(data[at : at + 8], "big")
+        at += 8
+        if at + size > len(data):
+            raise ValueError("payload objects cut short")
+        found.append(data[at : at + size])
+        at += size
+    return found

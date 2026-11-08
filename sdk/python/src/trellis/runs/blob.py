@@ -70,6 +70,11 @@ class BlobStore(Protocol):
         ``BlobNotFound`` when there is none."""
         ...
 
+    async def get(self, key: str) -> bytes:
+        """A small object's bytes whole, in one call, unverified (``read_whole`` verifies);
+        ``BlobNotFound`` when there is none."""
+        ...
+
     async def delete(self, key: str) -> None:
         """Remove ``key``; a key that is already gone is not an error."""
         ...
@@ -96,6 +101,15 @@ async def read(store: BlobStore, key: str, *, sha256: str, size: int) -> AsyncIt
         raise BlobCorrupt(f"{key}: {seen} bytes, sha256 {digest.hexdigest()}; expected {size}")
     if held is not None:
         yield held
+
+
+async def read_whole(store: BlobStore, key: str, *, sha256: str, size: int) -> bytes:
+    """A small object's bytes, read in one call and verified against ``sha256`` and
+    ``size`` (``BlobCorrupt`` otherwise)."""
+    data = await store.get(key)
+    if len(data) != size or sha256_hex(data) != sha256:
+        raise BlobCorrupt(f"{key}: {len(data)} bytes, sha256 {sha256_hex(data)}; expected {size}")
+    return data
 
 
 class FilesystemBlobStore:
@@ -188,6 +202,12 @@ class FilesystemBlobStore:
                 yield chunk
         finally:
             await asyncio.to_thread(fh.close)
+
+    async def get(self, key: str) -> bytes:
+        try:
+            return await asyncio.to_thread(self._path(key).read_bytes)
+        except FileNotFoundError as exc:
+            raise BlobNotFound(key) from exc
 
     async def delete(self, key: str) -> None:
         with contextlib.suppress(FileNotFoundError):

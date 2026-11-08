@@ -5,12 +5,13 @@ diff, a report) is uploaded beside the run, and the run carries the ``ArtifactRe
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from typing import Final
 
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.runs._transport import Transport, worker_params
 from trellis.runs.errors import NotFoundError
-from trellis.runs.payloads import MEDIA_TYPE, PayloadRef
+from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, frames
 
 #: What an artifact is sent as when the caller names nothing else.
 JSON_MIME: Final = "application/json"
@@ -86,7 +87,23 @@ class ArtifactsAPI:
         """The bytes of a payload object, checked here too against the reference's size
         and SHA-256 (``ValueError`` when they differ)."""
         response = await self._transport.send("GET", f"/v1/payloads/{ref.sha256}", tenant=tenant)
-        data = response.content
-        if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256:
-            raise ValueError(f"payload {ref.sha256} did not arrive whole")
-        return data
+        return _whole(ref, response.content)
+
+    async def get_payloads(
+        self, refs: Sequence[PayloadRef], *, tenant: str | None = None
+    ) -> list[bytes]:
+        """The bytes of several payload objects (a checkpoint's segments) in one request,
+        in their order, each checked as ``get_payload`` checks it."""
+        response = await self._transport.send(
+            "POST",
+            "/v1/payloads/read",
+            tenant=tenant,
+            json={"sha256": [ref.sha256 for ref in refs]},
+        )
+        return [_whole(ref, data) for ref, data in zip(refs, frames(response.content), strict=True)]
+
+
+def _whole(ref: PayloadRef, data: bytes) -> bytes:
+    if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256:
+        raise ValueError(f"payload {ref.sha256} did not arrive whole")
+    return data

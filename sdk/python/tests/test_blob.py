@@ -16,6 +16,7 @@ from trellis.runs.blob import (
     BlobNotFound,
     FilesystemBlobStore,
     read,
+    read_whole,
     sha256_hex,
 )
 
@@ -29,6 +30,9 @@ async def test_a_put_reads_back_once_and_is_never_overwritten(tmp_path: Path) ->
     stored = await store.put("t/blobs/a", b"bytes", content_type="text/plain")
     assert (stored.size, stored.sha256) == (5, sha256_hex(b"bytes"))
     assert await _all(read(store, "t/blobs/a", sha256=stored.sha256, size=5)) == b"bytes"
+    assert await read_whole(store, "t/blobs/a", sha256=stored.sha256, size=5) == b"bytes"
+    with pytest.raises(BlobCorrupt):
+        await read_whole(store, "t/blobs/a", sha256=stored.sha256, size=4)
     with pytest.raises(BlobExists):
         await store.put("t/blobs/a", b"other", content_type="text/plain")
     with pytest.raises(BlobCorrupt):
@@ -37,6 +41,8 @@ async def test_a_put_reads_back_once_and_is_never_overwritten(tmp_path: Path) ->
     await store.delete("t/blobs/a")
     with pytest.raises(BlobNotFound):
         await _all(store.chunks("t/blobs/a"))
+    with pytest.raises(BlobNotFound):
+        await store.get("t/blobs/a")
     await store.aclose()
 
 

@@ -12,6 +12,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
   **Run `agent-runs-payloads clear` (the previous release) before upgrading**: migration
   `b9e3f4a5c6d7` refuses while any payload is still inline. Rolling back: redeploy the previous
   release after `alembic downgrade` (the columns come back empty; it reads the references).
+* **A checkpoint's segments read back in one request.** `POST /v1/payloads/read` answers
+  several payload objects at once (read from the store in parallel, each verified; SDK
+  `artifacts.get_payloads`), so a resume is one round trip. A save that adds a segment checks
+  and links only the new one, its cost independent of the run's length. Small objects are
+  read in one call (`BlobStore.get`, `read_whole`). Nothing to do.
 * **`agent-runs-payloads copy|verify|clear` moves old inline payloads to the blob store.**
   Run it once after deploying the release that writes references: `copy` stores what earlier
   releases kept inline and sets the references (readers use them at once), `verify` reads

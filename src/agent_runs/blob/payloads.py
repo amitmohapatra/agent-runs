@@ -23,7 +23,7 @@ from google.api_core import exceptions as gexc
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from trellis.runs.blob import BlobCorrupt, BlobExists, BlobNotFound, BlobStore, read
+from trellis.runs.blob import BlobCorrupt, BlobExists, BlobNotFound, BlobStore, read_whole
 from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, adecode, aencode, ref_of
 
 from agent_runs.config.constants import ARTIFACT_RETENTION
@@ -99,23 +99,26 @@ class PayloadStore:
 
     async def get_encoded(self, ref: PayloadRef) -> bytes:
         """The stored bytes ``ref`` names, verified."""
-        chunks: list[bytes] = []
         try:
-            async for chunk in read(self._blobs, ref.ref, sha256=ref.sha256, size=ref.size):
-                chunks.append(chunk)
+            return await read_whole(self._blobs, ref.ref, sha256=ref.sha256, size=ref.size)
         except (BlobNotFound, BlobCorrupt) as exc:
             raise PayloadLost(f"payload {ref.ref} is missing or corrupt") from exc
         except _UNREACHABLE as exc:
             raise Unavailable("the payload store is unavailable") from exc
-        return b"".join(chunks)
 
     async def get_many(self, refs: Iterable[PayloadRef | dict[str, Any]]) -> list[Any]:
         """The values of ``refs``, in their order, read :data:`PARALLEL_READS` at a time."""
+        stored = await self.get_many_encoded([PayloadRef.model_validate(r) for r in refs])
+        return [await adecode(data) for data in stored]
+
+    async def get_many_encoded(self, refs: Sequence[PayloadRef]) -> list[bytes]:
+        """The stored bytes of ``refs``, verified, in their order, read
+        :data:`PARALLEL_READS` at a time."""
         gate = asyncio.Semaphore(PARALLEL_READS)
 
-        async def one(ref: PayloadRef | dict[str, Any]) -> Any:
+        async def one(ref: PayloadRef) -> bytes:
             async with gate:
-                return await self.get(ref)
+                return await self.get_encoded(ref)
 
         return list(await asyncio.gather(*(one(ref) for ref in refs)))
 
