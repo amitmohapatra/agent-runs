@@ -20,7 +20,9 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import new_id, stable_id
 from trellis.contracts.runs import RunRecord
+from trellis.runs.payloads import jsonb_order
 
+from agent_runs.blob.payloads import payloads_of
 from agent_runs.config.constants import (
     DEFAULT_PAGE,
     MAX_WEBHOOKS_PER_TENANT,
@@ -101,6 +103,15 @@ def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
         "occurred_at": run.updated_at.isoformat(),
         "data": {"run": summary.model_dump(mode="json")},
     }
+
+
+def _with_payload(body: dict[str, Any], payload: Any) -> dict[str, Any]:
+    """The body as it was announced: the run's interrupt payload, kept by reference, back in
+    its place, the interrupt's keys in the order ``jsonb`` keeps them (as an inline body
+    reads back)."""
+    run = body["data"]["run"]
+    awaiting = jsonb_order({**run["awaiting"], "payload": payload})
+    return {**body, "data": {**body["data"], "run": {**run, "awaiting": awaiting}}}
 
 
 @dataclass(frozen=True)
@@ -253,6 +264,11 @@ class WebhookStore:
                 .with_for_update(of=WebhookDeliveryRow, skip_locked=True)
             )
         ).all()
+        referred = [row for row, _ in rows if row.payload_ref is not None]
+        payloads = await payloads_of(self._session).get_many(r.payload_ref for r in referred)
+        bodies = {row.delivery_id: row.payload for row, _ in rows}
+        for row, payload in zip(referred, payloads, strict=True):
+            bodies[row.delivery_id] = _with_payload(row.payload, payload)
         held: list[Delivery] = []
         for row, hook in rows:
             row.attempts += 1
@@ -261,7 +277,12 @@ class WebhookStore:
             previous = hook.previous_secret if overlapping else None
             held.append(
                 Delivery(
-                    row.delivery_id, hook.url, hook.secret, row.payload, row.attempts, previous
+                    row.delivery_id,
+                    hook.url,
+                    hook.secret,
+                    bodies[row.delivery_id],
+                    row.attempts,
+                    previous,
                 )
             )
         await self._session.flush()

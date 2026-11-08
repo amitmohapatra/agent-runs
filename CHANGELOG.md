@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Run payloads can be read by reference (expand step).** Every payload column gets a
+  nullable `*_ref` (a `PayloadRef` to a zstd-compressed JSON object in the blob store, keyed by its
+  SHA-256 under the tenant, hash-sharded as the Memory Service's archive is), and every reader (a run, the listing, resolutions, events, a
+  webhook's body) takes either, answering the same JSON. Nothing writes references yet. A
+  ticker sweep deletes payload objects no row refers to once a day old. Migration
+  `a7c1d2e3f4b5` (adds columns and two tables). SDK: `trellis.runs.payloads` (the format).
+  Nothing to do; roll back by redeploying the previous release.
 * **One run of a schedule at a time, spread over the minute.** A tick while the schedule's
   last run is queued, running or paused is skipped (the schedule waits for its next
   occurrence), so workers down across several ticks run it once on recovery. Each schedule

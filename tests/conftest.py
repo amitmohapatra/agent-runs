@@ -21,6 +21,7 @@ from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolu
 
 from agent_runs.api.app import create_app
 from agent_runs.blob.filesystem import FilesystemBlobStore
+from agent_runs.blob.payloads import bind
 from agent_runs.config.settings import DatabaseSettings, Settings, reset_settings_cache
 from agent_runs.keys import KeyRegistry
 from agent_runs.store.database import ALEMBIC_INI
@@ -33,7 +34,10 @@ ADMIN_URL = os.environ.get(
     "RUNS_TEST_ADMIN_URL", "postgresql://memory:memory@localhost:5432/postgres"
 )
 DB_NAME = os.environ.get("RUNS_TEST_DB", "agent_runs_tests")
-DB_URL = f"postgresql+psycopg://memory:memory@localhost:5432/{DB_NAME}"
+#: the test database, on the admin URL's server (a private server on its own port works)
+DB_URL = (
+    ADMIN_URL.replace("postgresql://", "postgresql+psycopg://").rsplit("/", 1)[0] + f"/{DB_NAME}"
+)
 
 #: What the fake key registry knows, as ``GET /v1/keys/self`` answers it. Each a different
 #: shape: a tenant service key that may act as anyone in acme, the same for globex (a
@@ -205,11 +209,13 @@ async def serving(
         await application.state.keys.aclose()
         application.state.keys = memory.registry()
         application.state.blobs = blobs
+        application.state.payloads = bind(application.state.sessions, blobs)
         async with application.state.engine.begin() as conn:
             await conn.execute(
                 text(
                     "TRUNCATE run_resolutions, run_artifacts, agent_runs, agent_schedules, "
-                    "webhooks, webhook_deliveries, rate_limit_buckets, run_events"
+                    "webhooks, webhook_deliveries, rate_limit_buckets, run_events, run_payloads, "
+                    "payload_blobs"
                 )
             )
         yield application

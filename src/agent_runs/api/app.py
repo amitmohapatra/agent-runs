@@ -21,6 +21,7 @@ from agent_runs.api.openapi import TITLE, custom_openapi, operation_id
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.api.routers import artifacts, ops, runs, schedules, webhooks
 from agent_runs.blob import open_blob_store
+from agent_runs.blob.payloads import bind
 from agent_runs.config.settings import Settings, get_settings
 from agent_runs.keys import KeyRegistry
 from agent_runs.observability.logging import configure_logging
@@ -43,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.limiter = TenantRateLimiter(settings.rate_limit, engine)
         app.state.keys = KeyRegistry(settings.memory.url)
         app.state.blobs = open_blob_store(settings.blob)
+        app.state.payloads = bind(app.state.sessions, app.state.blobs)
         log.info("agent_runs.started", environment=settings.service.environment)
         try:
             yield

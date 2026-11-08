@@ -53,6 +53,17 @@ class RunRow(Base):
     last_resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the executor's opaque resume state, written at pause and cleared when the run finishes
     checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: references to the payloads in the blob store (``PayloadRef``s,
+    #: ``agent_runs.blob.payloads``), each read in place of its inline twin when set; the
+    #: interrupt's ``payload`` (``awaiting_ref``), a whole checkpoint or its segments, and an
+    #: ended run's compacted event log (``events_ref``)
+    input_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    output_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    last_resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    checkpoint_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    checkpoint_segments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    events_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: denormalised from ``awaiting`` for the inbox and the escalation sweep
     assignee: Mapped[str | None] = mapped_column(String(256))
     awaiting_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -149,6 +160,15 @@ class RunRow(Base):
             "updated_at",
             postgresql_where=text(
                 "status IN ('SUCCESS', 'PARTIAL', 'ERROR', 'TIMEOUT', 'CANCELLED', 'REJECTED')"
+            ),
+        ),
+        # the ticker: ended runs whose event log is not compacted yet
+        Index(
+            "ix_runs_events_uncompacted",
+            "updated_at",
+            postgresql_where=text(
+                "events_ref IS NULL AND status IN "
+                "('SUCCESS', 'PARTIAL', 'ERROR', 'TIMEOUT', 'CANCELLED', 'REJECTED')"
             ),
         ),
         # the claim: RUNNING runs sharing a concurrency key
@@ -249,6 +269,9 @@ class WebhookDeliveryRow(Base):
         String(64), ForeignKey("webhooks.webhook_id", ondelete="CASCADE")
     )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    #: the run's interrupt payload the body carries (``data.run.awaiting.payload``), by
+    #: reference: put back in when the delivery is sent
+    payload_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     attempts: Mapped[int] = mapped_column(Integer)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     #: why the last attempt failed (a status, an unreachable host, a refused address)
@@ -271,6 +294,12 @@ class WebhookDeliveryRow(Base):
             "dead_at",
             postgresql_where=text("dead_at IS NOT NULL"),
         ),
+        # the orphan sweep: is a payload object still in a delivery's body
+        Index(
+            "ix_webhook_deliveries_payload_ref",
+            text("(payload_ref ->> 'ref')"),
+            postgresql_where=text("payload_ref IS NOT NULL"),
+        ),
     )
 
 
@@ -290,8 +319,11 @@ class ResolutionRow(Base):
     decision: Mapped[str] = mapped_column(String(16))
     reviewer: Mapped[str | None] = mapped_column(String(256))
     #: the Interrupt as it was asked (question, tool call) and the InterruptResolution
-    interrupt: Mapped[dict[str, Any]] = mapped_column(JSONB)
-    resolution: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    interrupt: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: the same, by reference (``PayloadRef``), read in place of the inline twins when set
+    interrupt_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the attempt that paused on it
     attempt: Mapped[int] = mapped_column(Integer)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -361,3 +393,35 @@ class ArtifactRow(Base):
             postgresql_where=text("expires_at IS NOT NULL"),
         ),
     )
+
+
+class PayloadBlobRow(Base):
+    """A payload object in the blob store (``agent_runs.blob.payloads``), by key. Registered
+    (``touched_at`` now) before every write of it, so the orphan sweep, which deletes objects
+    no row refers to once ``touched_at`` is a day old, never races a write."""
+
+    __tablename__ = "payload_blobs"
+
+    key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128))
+    size: Mapped[int] = mapped_column(BigInteger)
+    touched_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_payload_blobs_touched", "touched_at"),)
+
+
+class RunPayloadRow(Base):
+    """A run refers to a payload object as its input, a checkpoint segment, an answer...: the
+    object is kept while any run does. Deleted with the run, or when the run lets go of it
+    (an ended run's checkpoint)."""
+
+    __tablename__ = "run_payloads"
+
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    #: what the object is to the run (``PayloadKind``)
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+
+    __table_args__ = (Index("ix_run_payloads_key", "key"),)
