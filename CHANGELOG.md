@@ -6,6 +6,9 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A segment's save is four statements.** The new segment is checked stored and linked in one
+  statement, and the run's row is written once (the links before it, no autoflush between).
+  Nothing to do.
 * **A checkpoint's segments read back in one request.** `POST /v1/payloads/read` answers
   several payload objects at once (read from the store in parallel, each verified; SDK
   `artifacts.get_payloads`), so a resume is one round trip. A save that adds a segment checks
