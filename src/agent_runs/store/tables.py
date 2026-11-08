@@ -28,6 +28,10 @@ class Base(DeclarativeBase):
     pass
 
 
+#: A reference column (``PayloadRef``): ``None`` is SQL ``NULL``, never JSON ``null``.
+_REF = JSONB(none_as_null=True)
+
+
 def _created() -> Mapped[datetime]:
     return mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -57,13 +61,13 @@ class RunRow(Base):
     #: ``agent_runs.blob.payloads``), each read in place of its inline twin when set; the
     #: interrupt's ``payload`` (``awaiting_ref``), a whole checkpoint or its segments, and an
     #: ended run's compacted event log (``events_ref``)
-    input_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    output_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    last_resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    checkpoint_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    checkpoint_segments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
-    events_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    input_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    output_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    last_resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    checkpoint_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    checkpoint_segments: Mapped[list[dict[str, Any]] | None] = mapped_column(_REF)
+    events_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     #: denormalised from ``awaiting`` for the inbox and the escalation sweep
     assignee: Mapped[str | None] = mapped_column(String(256))
     awaiting_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -271,7 +275,7 @@ class WebhookDeliveryRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     #: the run's interrupt payload the body carries (``data.run.awaiting.payload``), by
     #: reference: put back in when the delivery is sent
-    payload_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    payload_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     attempts: Mapped[int] = mapped_column(Integer)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     #: why the last attempt failed (a status, an unreachable host, a refused address)
@@ -322,8 +326,8 @@ class ResolutionRow(Base):
     interrupt: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the same, by reference (``PayloadRef``), read in place of the inline twins when set
-    interrupt_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    interrupt_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
+    resolution_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     #: the attempt that paused on it
     attempt: Mapped[int] = mapped_column(Integer)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

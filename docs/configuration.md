@@ -67,6 +67,12 @@ are zstd-compressed JSON keyed by their SHA-256 under the tenant
 (`tenant-shard=<n>/tenant=<t>/blobs/sha256=<hex>.json.zst`), so the same content is stored once.
 The ticker deletes objects nothing refers to once they are a day old.
 
+Rows written by a release before payload references keep their payloads inline until they are
+moved: run `agent-runs-payloads copy`, then `agent-runs-payloads verify`, then
+`agent-runs-payloads clear` (same settings as the API; batched, resumable, nothing cleared unless
+every copy reads back equal; exit 1 otherwise). Roll back at any point by redeploying the
+previous release: every release since the readers reads both forms.
+
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
 | `RUNS__BLOB__BUCKET` | unset: the filesystem store (dev and test only) | **set it** | API, ticker | artifacts go to this GCS bucket exactly when it is set (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) | `acme-agent-runs-artifacts` |
