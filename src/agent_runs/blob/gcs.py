@@ -80,6 +80,15 @@ class GCSBlobStore:
             except gexc.NotFound as exc:
                 raise BlobNotFound(key) from exc
 
+    async def get(self, key: str) -> bytes:
+        def download() -> bytes:
+            try:
+                return self._bucket.blob(key).download_as_bytes()
+            except gexc.NotFound as exc:
+                raise BlobNotFound(key) from exc
+
+        return await asyncio.to_thread(download)
+
     async def delete(self, key: str) -> None:
         def remove() -> None:
             with contextlib.suppress(gexc.NotFound):

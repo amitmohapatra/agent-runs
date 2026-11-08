@@ -18,7 +18,7 @@ import httpx
 import pytest
 from google.api_core import exceptions as gexc
 from trellis.contracts.ids import now
-from trellis.runs.blob import FilesystemBlobStore
+from trellis.runs.blob import FilesystemBlobStore, read_whole, sha256_hex
 
 from agent_runs.blob import (
     BlobCorrupt,
@@ -107,10 +107,11 @@ class FakeGCSBlob:
             raise gexc.PreconditionFailed("the object exists")
         self._bucket.objects[self._key] = (data, content_type, self.metadata)
 
-    def download_as_bytes(self, *, start: int, end: int) -> bytes:
+    def download_as_bytes(self, *, start: int = 0, end: int | None = None) -> bytes:
         if self._key not in self._bucket.objects:
             raise gexc.NotFound("the object is gone")
-        return self._bucket.objects[self._key][0][start : end + 1]
+        data = self._bucket.objects[self._key][0]
+        return data[start : len(data) if end is None else end + 1]
 
     def delete(self) -> None:
         if self._bucket.objects.pop(self._key, None) is None:
@@ -190,10 +191,16 @@ async def test_an_object_is_never_overwritten(store) -> None:
 async def test_a_delete_is_idempotent_and_a_missing_key_is_not_found(store) -> None:
     key = _key()
     await store.put(key, b"bytes", content_type="text/plain")
+    assert await store.get(key) == b"bytes"
+    assert await read_whole(store, key, sha256=sha256_hex(b"bytes"), size=5) == b"bytes"
+    with pytest.raises(BlobCorrupt):
+        await read_whole(store, key, sha256=sha256_hex(b"other"), size=5)
     await store.delete(key)
     await store.delete(key)
     with pytest.raises(BlobNotFound):
         await _all(store.chunks(key))
+    with pytest.raises(BlobNotFound):
+        await store.get(key)
 
 
 async def test_bytes_that_do_not_match_never_arrive_whole(store, monkeypatch) -> None:

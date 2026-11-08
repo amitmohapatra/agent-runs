@@ -11,10 +11,11 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from trellis.contracts.ids import now
-from trellis.runs.payloads import SEGMENTS, encode, ref_of
+from trellis.runs.payloads import FRAMED_MEDIA_TYPE, SEGMENTS, decode, encode, frames, ref_of
 
+from agent_runs.api.routers.artifacts import MAX_READ_OBJECTS
 from agent_runs.blob.payloads import ORPHAN_AGE, payloads_of
 from agent_runs.config.settings import BlobSettings
 from agent_runs.store.runs import RunStore
@@ -350,3 +351,56 @@ def test_artifact_retention_is_a_setting_of_seven_days_by_default(
 ) -> None:
     assert BlobSettings().retention == timedelta(days=7)
     assert BlobSettings(retention_days=30).retention == timedelta(days=30)
+
+
+# ------------------------------------------------------------------ reading and saving at scale
+async def test_a_checkpoints_segments_read_back_in_one_request_in_order(
+    app: Any, client: Any
+) -> None:
+    run_id, worker = await _claimed(client)
+    refs = []
+    for n in range(20):
+        put = await client.post(
+            f"/v1/runs/{run_id}/payloads", params={"worker_id": worker}, content=encode([n])
+        )
+        refs.append(put.json())
+    read = await client.post("/v1/payloads/read", json={"sha256": [r["sha256"] for r in refs]})
+    assert read.status_code == 200 and read.headers["content-type"] == FRAMED_MEDIA_TYPE
+    assert [decode(f) for f in frames(read.content)] == [[n] for n in range(20)]
+    async with client_of(app, "other-key") as other:
+        refused = await other.post("/v1/payloads/read", json={"sha256": [refs[0]["sha256"]]})
+        assert refused.status_code == 404, "another tenant's objects are not read"
+    too_many = {"sha256": [refs[0]["sha256"]] * (MAX_READ_OBJECTS + 1)}
+    assert (await client.post("/v1/payloads/read", json=too_many)).status_code == 422
+
+
+async def test_a_save_that_adds_a_segment_costs_the_same_however_many_there_are(
+    app: Any, client: Any
+) -> None:
+    run_id, worker = await _claimed(client)
+    statements = 0
+
+    def count(*_: Any) -> None:
+        nonlocal statements
+        statements += 1
+
+    refs: list[dict[str, Any]] = []
+    costs = []
+    event.listen(app.state.engine.sync_engine, "before_cursor_execute", count)
+    try:
+        for n in range(30):
+            put = await client.post(
+                f"/v1/runs/{run_id}/payloads", params={"worker_id": worker}, content=encode([n])
+            )
+            refs.append(put.json())
+            before = statements
+            beat = await client.post(
+                f"/v1/runs/{run_id}/heartbeat",
+                json={"worker_id": worker, "checkpoint": {SEGMENTS: refs}},
+            )
+            assert beat.status_code == 200, beat.text
+            costs.append(statements - before)
+    finally:
+        event.remove(app.state.engine.sync_engine, "before_cursor_execute", count)
+    assert len(set(costs[1:])) == 1, costs
+    assert await _links(app, run_id) == {"checkpoint": 30}

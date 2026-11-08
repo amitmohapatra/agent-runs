@@ -1230,26 +1230,27 @@ class RunStore:
             raise Unprocessable(f"{SEGMENTS} lists payload references: {exc}") from exc
         if not all(owned_by(ref, tenant_id) for ref in segments):
             raise Unprocessable(f"{SEGMENTS} names objects that are not this tenant's")
-        keys = {ref.ref for ref in segments}
-        stored = await self._session.scalar(
-            select(func.count()).where(PayloadBlobRow.key.in_(keys))
-        )
-        if stored != len(keys):
-            raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
         return segments
 
     async def _keep_checkpoint(
         self, row: RunRow, checkpoint: list[PayloadRef] | PayloadRef | None
     ) -> None:
-        """The run's checkpoint is now ``checkpoint`` (none: it has none): the objects it
-        names are linked, the ones the last checkpoint named and this one does not let go."""
-        refs = (
-            []
-            if checkpoint is None
-            else checkpoint
-            if isinstance(checkpoint, list)
-            else [checkpoint]
-        )
+        """The run's checkpoint is now ``checkpoint`` (none: it has none). Only what changed
+        since the last one is written: the objects it names anew are checked to be stored
+        (422 otherwise) and linked, the ones it no longer names let go. A save that appends a
+        segment is one lookup and one link, however many segments the run has."""
+        before = {r["ref"] for r in row.checkpoint_segments or ()}
+        if row.checkpoint_ref is not None:
+            before.add(row.checkpoint_ref["ref"])
+        refs = checkpoint if isinstance(checkpoint, list) else [checkpoint] if checkpoint else []
+        keys = {r.ref for r in refs}
+        added = keys - before
+        if isinstance(checkpoint, list) and added:
+            stored = await self._session.scalar(
+                select(func.count()).where(PayloadBlobRow.key.in_(added))
+            )
+            if stored != len(added):
+                raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
         row.checkpoint = None
         if checkpoint is None:
             row.checkpoint_ref = row.checkpoint_segments = None
@@ -1257,14 +1258,15 @@ class RunStore:
             row.checkpoint_ref, row.checkpoint_segments = None, [r.model_dump() for r in refs]
         else:
             row.checkpoint_ref, row.checkpoint_segments = checkpoint.model_dump(), None
-        await self._session.execute(
-            delete(RunPayloadRow).where(
-                RunPayloadRow.run_id == row.run_id,
-                RunPayloadRow.kind == _CHECKPOINT,
-                RunPayloadRow.key.not_in({r.ref for r in refs}),
+        if gone := before - keys:
+            await self._session.execute(
+                delete(RunPayloadRow).where(
+                    RunPayloadRow.run_id == row.run_id,
+                    RunPayloadRow.kind == _CHECKPOINT,
+                    RunPayloadRow.key.in_(gone),
+                )
             )
-        )
-        await self._link(row.run_id, _CHECKPOINT, *refs)
+        await self._link(row.run_id, _CHECKPOINT, *(r for r in refs if r.ref in added))
 
     async def _asked(self, row: RunRow) -> Interrupt:
         """The interrupt the run waits on, its payload read in when kept by reference."""
