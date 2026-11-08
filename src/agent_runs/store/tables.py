@@ -411,8 +411,9 @@ class PayloadBlobRow(Base):
 
 
 class RunPayloadRow(Base):
-    """A run refers to a payload object (its input, a checkpoint segment, an answer...): the
-    object is kept while any run does. Deleted with the run."""
+    """A run refers to a payload object as its input, a checkpoint segment, an answer...: the
+    object is kept while any run does. Deleted with the run, or when the run lets go of it
+    (an ended run's checkpoint)."""
 
     __tablename__ = "run_payloads"
 
@@ -420,5 +421,7 @@ class RunPayloadRow(Base):
         String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
     )
     key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    #: what the object is to the run (``PayloadKind``)
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
 
     __table_args__ = (Index("ix_run_payloads_key", "key"),)

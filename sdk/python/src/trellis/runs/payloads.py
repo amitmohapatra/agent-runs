@@ -5,8 +5,10 @@ content-addressed objects, and the run's row holds only a :class:`PayloadRef` to
 One format for every store (the service's blob store, on GCS or disk, and a local runner's
 folder): compact JSON, its object keys in PostgreSQL ``jsonb`` order (what an inline ``jsonb``
 column hands back, so a value reads the same either way), compressed with zstd at level 3.
-The key is ``{tenant}/blobs/{sha256}`` of the stored bytes: the same content is stored once,
-and a put of a key that exists is skipped.
+The key is the stored bytes' SHA-256 under the tenant, sharded by the tenant's hash so no one
+prefix is hot, as the Memory Service lays out its archive
+(``tenant-shard=<n>/tenant=<t>/blobs/sha256=<hex>.json.zst``): the same content is stored
+once, and a put of a key that exists is skipped.
 
 A checkpoint may be a list of segments instead of one object: ``{SEGMENTS: [ref, ...]}``,
 oldest first, each segment holding what changed since the one before (a resume journal saved
@@ -35,8 +37,12 @@ OFFLOAD_BYTES: Final = 256 * 1024
 SEGMENTS: Final = "trellis_segments"
 #: The length of a SHA-256 in hex.
 SHA256_HEX: Final = 64
-#: The key prefix under a tenant that payload objects live at.
-BLOBS: Final = "blobs"
+#: Key prefixes a tenant's objects are spread over (the Memory Service's ``tenant_shards``).
+TENANT_SHARDS: Final = 64
+#: A payload object's file name ends in this.
+SUFFIX: Final = ".json.zst"
+#: The most a payload may decompress to: a frame claiming more is refused, not allocated.
+MAX_DECODED_BYTES: Final = 512 * 1024 * 1024
 
 
 class PayloadRef(BaseModel):
@@ -83,6 +89,9 @@ def encode(value: Any) -> bytes:
 def decode(data: bytes) -> Any:
     """The JSON value of stored bytes (``ValueError`` when they are not a payload)."""
     try:
+        size = zstandard.frame_content_size(data)
+        if not 0 <= size <= MAX_DECODED_BYTES:
+            raise ValueError(f"a payload object decodes to at most {MAX_DECODED_BYTES} bytes")
         return json.loads(zstandard.ZstdDecompressor().decompress(data))
     except zstandard.ZstdError as exc:
         raise ValueError(f"not a payload object: {exc}") from exc
@@ -101,18 +110,21 @@ async def adecode(data: bytes) -> Any:
     )
 
 
-def payload_key(tenant_id: str, data: bytes) -> str:
-    """The key ``data`` is stored at for ``tenant_id``: its content's address."""
-    return f"{tenant_id}/{BLOBS}/{hashlib.sha256(data).hexdigest()}"
+def tenant_shard(tenant_id: str) -> int:
+    """The shard a tenant's keys start with (the Memory Service's ``tenant_shard``)."""
+    return int(hashlib.sha256(tenant_id.encode()).hexdigest()[:8], 16) % TENANT_SHARDS
+
+
+def _prefix(tenant_id: str) -> str:
+    return f"tenant-shard={tenant_shard(tenant_id):03d}/tenant={tenant_id}/blobs/sha256="
 
 
 def ref_of(tenant_id: str, data: bytes) -> PayloadRef:
-    """The reference ``data`` is stored under for ``tenant_id``."""
-    key = payload_key(tenant_id, data)
-    return PayloadRef(ref=key, size=len(data), sha256=key.rsplit("/", 1)[1])
+    """The reference ``data`` is stored under for ``tenant_id``: its content's address."""
+    digest = hashlib.sha256(data).hexdigest()
+    return PayloadRef(ref=f"{_prefix(tenant_id)}{digest}{SUFFIX}", size=len(data), sha256=digest)
 
 
 def owned_by(ref: PayloadRef, tenant_id: str) -> bool:
-    """Is ``ref`` one of ``tenant_id``'s payload objects (a well-formed key under it)?"""
-    head, _, digest = ref.ref.rpartition("/")
-    return head == f"{tenant_id}/{BLOBS}" and digest == ref.sha256 and len(digest) == SHA256_HEX
+    """Is ``ref`` one of ``tenant_id``'s payload objects (its well-formed key)?"""
+    return ref.ref == f"{_prefix(tenant_id)}{ref.sha256}{SUFFIX}" and len(ref.sha256) == SHA256_HEX

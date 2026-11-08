@@ -6,9 +6,11 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from trellis.runs import payloads
 from trellis.runs.payloads import (
     MEDIA_TYPE,
     OFFLOAD_BYTES,
+    TENANT_SHARDS,
     adecode,
     aencode,
     decode,
@@ -16,6 +18,7 @@ from trellis.runs.payloads import (
     jsonb_order,
     owned_by,
     ref_of,
+    tenant_shard,
 )
 
 TENANT = "acme"
@@ -45,12 +48,22 @@ def test_what_json_cannot_hold_is_refused_and_garbage_is_not_a_payload() -> None
         decode(b"not zstd")
 
 
+def test_a_frame_declaring_more_than_the_bound_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = encode("more than eight bytes")
+    monkeypatch.setattr(payloads, "MAX_DECODED_BYTES", 8)
+    with pytest.raises(ValueError, match="at most 8 bytes"):
+        decode(data)
+
+
 def test_a_reference_names_its_content_under_its_tenant() -> None:
     data = encode({"a": 1})
     ref = ref_of(TENANT, data)
     assert ref == ref_of(TENANT, encode({"a": 1})), "the same content, the same key"
-    assert ref.ref == f"{TENANT}/blobs/{ref.sha256}" and ref.size == len(data)
+    shard = f"tenant-shard={tenant_shard(TENANT):03d}"
+    assert ref.ref == f"{shard}/tenant={TENANT}/blobs/sha256={ref.sha256}.json.zst"
+    assert ref.size == len(data) and 0 <= tenant_shard(TENANT) < TENANT_SHARDS
     assert ref.media_type == MEDIA_TYPE
     assert owned_by(ref, TENANT)
     assert not owned_by(ref, "globex"), "another tenant's reference is not its own"
-    assert not owned_by(ref.model_copy(update={"ref": f"{TENANT}/blobs/../x"}), TENANT)
+    assert not owned_by(ref.model_copy(update={"ref": ref.ref.replace("blobs", "..")}), TENANT)
+    assert not owned_by(ref.model_copy(update={"sha256": "ab"}), TENANT)

@@ -11,7 +11,7 @@ either; the inline columns stay until every old row is moved (``agent-runs-paylo
   nullable);
 - ``webhook_deliveries``: ``payload_ref``, the run's interrupt payload the body carries;
 - ``payload_blobs``: every payload object written, by key (what the orphan sweep reads,
-  instead of listing the bucket), and ``run_payloads``: which runs refer to which objects.
+  instead of listing the bucket), and ``run_payloads``: which runs refer to which objects, as what.
 
 Revision ID: a7c1d2e3f4b5
 Revises: 2c8d3e4f5a6b
@@ -81,6 +81,9 @@ def upgrade() -> None:
             primary_key=True,
         ),
         sa.Column("key", sa.String(length=512), primary_key=True),
+        # what the object is to the run (input, checkpoint, ...): a checkpoint's references
+        # go when the run ends, its input's stay
+        sa.Column("kind", sa.String(length=16), primary_key=True),
     )
     op.create_index("ix_run_payloads_key", "run_payloads", ["key"])
 

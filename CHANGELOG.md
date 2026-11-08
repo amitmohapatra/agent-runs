@@ -7,8 +7,8 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 ## Unreleased
 
 * **Run payloads can be read by reference (expand step).** Every payload column gets a
-  nullable `*_ref` (a `PayloadRef` to a zstd-compressed JSON object in the blob store, keyed
-  `{tenant}/blobs/{sha256}`), and every reader (a run, the listing, resolutions, events, a
+  nullable `*_ref` (a `PayloadRef` to a zstd-compressed JSON object in the blob store, keyed by its
+  SHA-256 under the tenant, hash-sharded as the Memory Service's archive is), and every reader (a run, the listing, resolutions, events, a
   webhook's body) takes either, answering the same JSON. Nothing writes references yet. A
   ticker sweep deletes payload objects no row refers to once a day old. Migration
   `a7c1d2e3f4b5` (adds columns and two tables). SDK: `trellis.runs.payloads` (the format).

@@ -90,7 +90,7 @@ async def test_a_missing_or_corrupt_payload_is_an_error_never_wrong_data(
     with pytest.raises(PayloadLost):
         await payloads.get(wrong)
     with pytest.raises(PayloadLost):
-        await payloads.get(ref.model_copy(update={"ref": f"{TENANT}/blobs/{'1' * 64}"}))
+        await payloads.get(ref.model_copy(update={"ref": ref.ref.replace(ref.sha256, "1" * 64)}))
 
 
 class Unreachable(FilesystemBlobStore):
@@ -138,7 +138,7 @@ class Slow(FilesystemBlobStore):
     async def chunks(self, key: str) -> AsyncIterator[bytes]:
         self.running += 1
         self.most = max(self.most, self.running)
-        await asyncio.sleep(0.001 * (64 - int(key[-2:], 16) % 64))
+        await asyncio.sleep(0.001 * (64 - int(key.removesuffix(".json.zst")[-2:], 16) % 64))
         self.running -= 1
         async for chunk in super().chunks(key):
             yield chunk
@@ -170,7 +170,7 @@ async def test_the_sweep_deletes_only_old_objects_nothing_refers_to(
     linked = await payloads.put(TENANT, {"n": 2})
     run = (await client.post("/v1/runs", json=started())).json()
     async with app.state.sessions() as db:
-        db.add(RunPayloadRow(run_id=run["run_id"], key=linked.ref))
+        db.add(RunPayloadRow(run_id=run["run_id"], key=linked.ref, kind="input"))
         await db.commit()
     for ref in (old, linked):
         await _age(app, ref.ref, ORPHAN_AGE + timedelta(minutes=1))
