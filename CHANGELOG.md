@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **`agent-runs-payloads copy|verify|clear` moves old inline payloads to the blob store.**
+  Run it once after deploying the release that writes references: `copy` stores what earlier
+  releases kept inline and sets the references (readers use them at once), `verify` reads
+  every copy back and compares, `clear` clears the inline values only when every copy matches.
+  Batched and resumable; it exits 1 on any mismatch. The next release drops the inline
+  columns, so run `clear` before deploying it.
 * **Run payloads are written by reference.** A run's input, output, the payload its pause
   waits on, its answers and its checkpoint go to the blob store before any row refers to
   them; reads answer the same JSON (a webhook's body the same bytes). A checkpoint may be a
