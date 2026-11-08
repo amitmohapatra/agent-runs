@@ -36,7 +36,8 @@ async def upload(client, run_id: str, data: bytes = TABLE_BYTES, headers=JSON, *
 
 
 def blob_files(blobs) -> list:
-    return [p for p in blobs._root.rglob("*") if p.is_file()]
+    """The artifacts' files (the run's payload objects live beside them, under the tenant)."""
+    return [p for p in (blobs._root / "artifacts").rglob("*") if p.is_file()]
 
 
 async def expiry(app, artifact_id: str):
@@ -263,7 +264,7 @@ async def test_a_run_that_ends_while_its_artifact_uploads_keeps_no_bytes(
 
 
 async def test_a_large_artifact_streams_back_whole_in_chunks(client, monkeypatch) -> None:
-    monkeypatch.setattr("agent_runs.blob.filesystem.BLOB_CHUNK_BYTES", 8)
+    monkeypatch.setattr("trellis.runs.blob.BLOB_CHUNK_BYTES", 8)
     run = await running(client)
     data = bytes(range(256)) * 3
     ref = (await upload(client, run["run_id"], data, {"Content-Type": "image/png"})).json()

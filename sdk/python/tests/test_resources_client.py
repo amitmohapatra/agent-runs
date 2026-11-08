@@ -12,6 +12,7 @@ import respx
 from conftest import URL, artifact, record, schedule, webhook
 from trellis.contracts.runs import ScheduleSpec
 from trellis.runs import NotFoundError, RunsClient, ScheduleUpdate, WebhookEvent
+from trellis.runs.payloads import MEDIA_TYPE, encode, ref_of
 
 
 @pytest.fixture
@@ -50,6 +51,24 @@ async def test_a_download_answers_the_bytes_or_none(runs: RunsClient) -> None:
     assert await runs.artifacts.download("art_1", tenant="acme") == b"\x00\x01"
     assert sent(route).headers["X-Trellis-Tenant"] == "acme"
     assert await runs.artifacts.download("art_1") is None
+
+
+@respx.mock
+async def test_a_payload_object_goes_up_as_zstd_json_and_comes_back_checked(
+    runs: RunsClient,
+) -> None:
+    data = encode({"segment": 1})
+    ref = ref_of("acme", data)
+    route = respx.post(f"{URL}/v1/runs/run_1/payloads").respond(201, json=ref.model_dump())
+    assert await runs.artifacts.put_payload("run_1", data, worker_id="w-1", tenant="acme") == ref
+    request = sent(route)
+    assert request.content == data and request.headers["Content-Type"] == MEDIA_TYPE
+    assert request.url.params["worker_id"] == "w-1"
+    got = respx.get(f"{URL}/v1/payloads/{ref.sha256}")
+    got.side_effect = [httpx.Response(200, content=data), httpx.Response(200, content=b"cut")]
+    assert await runs.artifacts.get_payload(ref, tenant="acme") == data
+    with pytest.raises(ValueError, match="did not arrive whole"):
+        await runs.artifacts.get_payload(ref)
 
 
 # --------------------------------------------------------------------------- schedules

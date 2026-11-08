@@ -119,12 +119,17 @@ def _prefix(tenant_id: str) -> str:
     return f"tenant-shard={tenant_shard(tenant_id):03d}/tenant={tenant_id}/blobs/sha256="
 
 
+def key_of(tenant_id: str, sha256: str) -> str:
+    """The key of ``tenant_id``'s object whose bytes have this SHA-256."""
+    return f"{_prefix(tenant_id)}{sha256}{SUFFIX}"
+
+
 def ref_of(tenant_id: str, data: bytes) -> PayloadRef:
     """The reference ``data`` is stored under for ``tenant_id``: its content's address."""
     digest = hashlib.sha256(data).hexdigest()
-    return PayloadRef(ref=f"{_prefix(tenant_id)}{digest}{SUFFIX}", size=len(data), sha256=digest)
+    return PayloadRef(ref=key_of(tenant_id, digest), size=len(data), sha256=digest)
 
 
 def owned_by(ref: PayloadRef, tenant_id: str) -> bool:
     """Is ``ref`` one of ``tenant_id``'s payload objects (its well-formed key)?"""
-    return ref.ref == f"{_prefix(tenant_id)}{ref.sha256}{SUFFIX}" and len(ref.sha256) == SHA256_HEX
+    return ref.ref == key_of(tenant_id, ref.sha256) and len(ref.sha256) == SHA256_HEX

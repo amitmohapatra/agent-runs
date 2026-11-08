@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from sqlalchemy import delete, select, text, update
 from trellis.contracts.ids import now
+from trellis.runs.blob import FilesystemBlobStore
 from trellis.runs.payloads import (
     SEGMENTS,
     PayloadRef,
@@ -24,7 +25,6 @@ from trellis.runs.payloads import (
 )
 
 from agent_runs.blob import BlobStore
-from agent_runs.blob.filesystem import FilesystemBlobStore
 from agent_runs.blob.payloads import (
     ORPHAN_AGE,
     PARALLEL_READS,
@@ -215,9 +215,10 @@ async def _by_reference(app: Any, run_id: str) -> None:
             awaiting = dict(row.awaiting)
             row.awaiting_ref = (await payloads.put(tenant, awaiting.pop("payload"))).model_dump()
             row.awaiting = awaiting
-        for res in (
-            await db.scalars(select(ResolutionRow).where(ResolutionRow.run_id == run_id))
-        ).all():
+        inline = select(ResolutionRow).where(
+            ResolutionRow.run_id == run_id, ResolutionRow.interrupt.is_not(None)
+        )
+        for res in (await db.scalars(inline)).all():
             res.interrupt_ref = (await payloads.put(tenant, res.interrupt)).model_dump()
             res.resolution_ref = (await payloads.put(tenant, res.resolution)).model_dump()
             res.interrupt = res.resolution = None

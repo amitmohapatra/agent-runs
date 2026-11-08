@@ -18,10 +18,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import DataError, OperationalError
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
+from trellis.runs.blob import FilesystemBlobStore
 
 from agent_runs.api.app import create_app
-from agent_runs.blob.filesystem import FilesystemBlobStore
-from agent_runs.blob.payloads import bind
+from agent_runs.blob.payloads import bind, payloads_of
 from agent_runs.config.settings import DatabaseSettings, Settings, reset_settings_cache
 from agent_runs.keys import KeyRegistry
 from agent_runs.store.database import ALEMBIC_INI
@@ -352,7 +352,12 @@ async def queued_runs(app: Any) -> list[dict[str, Any]]:
         rows = await conn.execute(
             text("SELECT * FROM agent_runs WHERE status = 'QUEUED' ORDER BY created_at")
         )
-        return [dict(row._mapping) for row in rows]
+        queued = [dict(row._mapping) for row in rows]
+    async with app.state.sessions() as db:  # the input, kept by reference
+        for run in queued:
+            if run["input_ref"] is not None:
+                run["input"] = await payloads_of(db).get(run["input_ref"])
+    return queued
 
 
 class BrokenQueue:

@@ -46,7 +46,7 @@ from agent_runs.domain.webhooks import (
 )
 from agent_runs.retry import backoff
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import WebhookDeliveryRow, WebhookRow
+from agent_runs.store.tables import RunRow, WebhookDeliveryRow, WebhookRow
 
 
 def _webhook(row: WebhookRow) -> Webhook:
@@ -229,6 +229,13 @@ class WebhookStore:
         hooks = (await self._session.scalars(wanting)).all()
         if not hooks:
             return
+        # the interrupt's payload is the run's, by reference: the body keeps the reference
+        payload_ref = await self._session.scalar(
+            select(RunRow.awaiting_ref).where(RunRow.run_id == run.run_id)
+        )
+        awaiting = payload["data"]["run"]["awaiting"]
+        if payload_ref is not None and awaiting is not None:
+            awaiting.pop("payload", None)
         await self._session.execute(
             insert(WebhookDeliveryRow)
             .values(
@@ -237,6 +244,7 @@ class WebhookStore:
                         "delivery_id": stable_id(payload["event_id"], hook, prefix="dlv_"),
                         "webhook_id": hook,
                         "payload": payload,
+                        "payload_ref": payload_ref if awaiting is not None else None,
                         "attempts": 0,
                         "next_attempt_at": now,
                         "created_at": now,

@@ -58,11 +58,19 @@ dead one is replaced, not handed to a request) and replaced after 300 s, a reque
 most 5 s for one (then `503`), opening one times out after 5 s, and PostgreSQL cancels a
 statement past 15 s (`503`). They are the `DB_*` constants.
 
-## Blob storage, for artifacts (`RUNS__BLOB__*`)
+## Blob storage, for artifacts and run payloads (`RUNS__BLOB__*`)
+
+The one blob store holds run artifacts and every run's payloads (input, output, the payload a
+pause waits on, answers, checkpoints and an ended run's events): the database keeps only a
+reference to each (`PayloadRef`), so it stays small however large runs get. Payload objects
+are zstd-compressed JSON keyed by their SHA-256 under the tenant
+(`tenant-shard=<n>/tenant=<t>/blobs/sha256=<hex>.json.zst`), so the same content is stored once.
+The ticker deletes objects nothing refers to once they are a day old.
 
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
 | `RUNS__BLOB__BUCKET` | unset: the filesystem store (dev and test only) | **set it** | API, ticker | artifacts go to this GCS bucket exactly when it is set (Application Default Credentials; `STORAGE_EMULATOR_HOST` points the client at an emulator) | `acme-agent-runs-artifacts` |
+| `RUNS__BLOB__RETENTION_DAYS` | `7` | yes | API, ticker | days an ended run's artifacts are kept before the ticker deletes them | `30` |
 | `RUNS__BLOB__ROOT` | `.blob` | yes (dev) | API, ticker | without a bucket, the filesystem store's directory, shared by both processes | `/var/lib/agent-runs/blobs` |
 
 ## Runs (`RUNS__RUNS__*`)
@@ -72,7 +80,7 @@ statement past 15 s (`503`). They are the `DB_*` constants.
 | `RUNS__RUNS__MAX_RUN_SECONDS` | unset: no platform maximum | yes | API, ticker | the most working time any run may take (time `RUNNING`, across attempts); a run's own `timeout_seconds` may only be shorter | `3600` |
 | `RUNS__RUNS__CONCURRENCY_PER_KEY` | `1` | yes | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once | `2` |
 | `RUNS__RUNS__MAX_RUNNING_PER_TENANT` | unset: no cap | yes | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Fair share between tenants needs no setting | `50` |
-| `RUNS__RUNS__RETENTION_DAYS` | unset: kept forever | yes | ticker | days an ended run is kept, with its resolutions and events | `90` |
+| `RUNS__RUNS__RETENTION_DAYS` | unset: kept forever | **set it** in production | ticker | days an ended run is kept, with its resolutions, events and payload objects (unset, the store grows with every run) | `90` |
 
 ## Webhooks (`RUNS__WEBHOOKS__*`)
 

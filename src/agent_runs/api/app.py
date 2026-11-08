@@ -44,7 +44,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.limiter = TenantRateLimiter(settings.rate_limit, engine)
         app.state.keys = KeyRegistry(settings.memory.url)
         app.state.blobs = open_blob_store(settings.blob)
-        app.state.payloads = bind(app.state.sessions, app.state.blobs)
+        app.state.payloads = bind(
+            app.state.sessions, app.state.blobs, retention=settings.blob.retention
+        )
         log.info("agent_runs.started", environment=settings.service.environment)
         try:
             yield

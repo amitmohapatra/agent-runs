@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agent_runs.config.constants import (
+    ARTIFACT_RETENTION,
     CONCURRENCY_PER_KEY,
     DB_CONNECTIONS_PER_PROCESS,
     WEBHOOK_DEAD_RETENTION,
@@ -129,6 +130,12 @@ class BlobSettings(BaseModel):
 
     root: Path = Path(".blob")
     bucket: str | None = None
+    #: Days an ended run's artifacts are kept before the ticker deletes them.
+    retention_days: int = Field(default=ARTIFACT_RETENTION.days, ge=1)
+
+    @property
+    def retention(self) -> timedelta:
+        return timedelta(days=self.retention_days)
 
 
 class TickerSettings(BaseModel):
