@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, delete, func, or_, select, tuple_
+from sqlalchemy import Select, delete, func, literal, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -1208,11 +1208,12 @@ class RunStore:
         """The run refers to these objects as ``kind``: they are kept while it does."""
         keys = {ref.ref for ref in refs if ref is not None}
         if keys:
-            await self._session.execute(
-                insert(RunPayloadRow)
-                .values([{"run_id": run_id, "key": key, "kind": kind} for key in keys])
-                .on_conflict_do_nothing()
-            )
+            with self._session.no_autoflush:  # the run's row is written once, at the flush
+                await self._session.execute(
+                    insert(RunPayloadRow)
+                    .values([{"run_id": run_id, "key": key, "kind": kind} for key in keys])
+                    .on_conflict_do_nothing()
+                )
 
     async def _checkpoint(
         self, tenant_id: str, checkpoint: dict[str, Any] | None
@@ -1238,19 +1239,41 @@ class RunStore:
         """The run's checkpoint is now ``checkpoint`` (none: it has none). Only what changed
         since the last one is written: the objects it names anew are checked to be stored
         (422 otherwise) and linked, the ones it no longer names let go. A save that appends a
-        segment is one lookup and one link, however many segments the run has."""
+        segment is one statement for its link, however many segments the run has."""
         before = {r["ref"] for r in row.checkpoint_segments or ()}
         if row.checkpoint_ref is not None:
             before.add(row.checkpoint_ref["ref"])
         refs = checkpoint if isinstance(checkpoint, list) else [checkpoint] if checkpoint else []
         keys = {r.ref for r in refs}
         added = keys - before
-        if isinstance(checkpoint, list) and added:
-            stored = await self._session.scalar(
-                select(func.count()).where(PayloadBlobRow.key.in_(added))
-            )
-            if stored != len(added):
-                raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
+        # the links first, the row after: the row is written once, with the lease, at the flush
+        with self._session.no_autoflush:
+            if gone := before - keys:
+                await self._session.execute(
+                    delete(RunPayloadRow).where(
+                        RunPayloadRow.run_id == row.run_id,
+                        RunPayloadRow.kind == _CHECKPOINT,
+                        RunPayloadRow.key.in_(gone),
+                    )
+                )
+            if added:
+                # one statement: link the new objects that are stored; one not stored is
+                # not linked, and a segment never uploaded is refused
+                linked = await self._session.scalars(
+                    insert(RunPayloadRow)
+                    .from_select(
+                        ["run_id", "key", "kind"],
+                        select(literal(row.run_id), PayloadBlobRow.key, literal(_CHECKPOINT)).where(
+                            PayloadBlobRow.key.in_(added)
+                        ),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["run_id", "key", "kind"], set_={"kind": _CHECKPOINT}
+                    )
+                    .returning(RunPayloadRow.key)
+                )
+                if len(linked.all()) != len(added):
+                    raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
         row.checkpoint = None
         if checkpoint is None:
             row.checkpoint_ref = row.checkpoint_segments = None
@@ -1258,15 +1281,6 @@ class RunStore:
             row.checkpoint_ref, row.checkpoint_segments = None, [r.model_dump() for r in refs]
         else:
             row.checkpoint_ref, row.checkpoint_segments = checkpoint.model_dump(), None
-        if gone := before - keys:
-            await self._session.execute(
-                delete(RunPayloadRow).where(
-                    RunPayloadRow.run_id == row.run_id,
-                    RunPayloadRow.kind == _CHECKPOINT,
-                    RunPayloadRow.key.in_(gone),
-                )
-            )
-        await self._link(row.run_id, _CHECKPOINT, *(r for r in refs if r.ref in added))
 
     async def _asked(self, row: RunRow) -> Interrupt:
         """The interrupt the run waits on, its payload read in when kept by reference."""

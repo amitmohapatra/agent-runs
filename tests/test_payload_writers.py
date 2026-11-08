@@ -403,4 +403,7 @@ async def test_a_save_that_adds_a_segment_costs_the_same_however_many_there_are(
     finally:
         event.remove(app.state.engine.sync_engine, "before_cursor_execute", count)
     assert len(set(costs[1:])) == 1, costs
+    # the rate limit, the run's row locked, the new segment linked (checked stored), the row
+    # written once: as many as a whole checkpoint's save took before references, plus the link
+    assert costs[-1] == 4, costs
     assert await _links(app, run_id) == {"checkpoint": 30}
