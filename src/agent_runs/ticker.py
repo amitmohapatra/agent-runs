@@ -44,6 +44,7 @@ from trellis.contracts.runs import RunRecord, RunStatus
 
 from agent_runs import heartbeat
 from agent_runs.blob import BlobStore, open_blob_store
+from agent_runs.blob.payloads import bind, payloads_of
 from agent_runs.config.constants import (
     BREAKER_COOLDOWN,
     BREAKER_THRESHOLD,
@@ -88,6 +89,7 @@ class TickReport:
     dropped: int = 0
     purged: int = 0
     runs_purged: int = 0
+    orphans: int = 0
 
 
 class Ticker:
@@ -131,6 +133,7 @@ class Ticker:
                 dropped=await self._drop_dead(now),
                 purged=await self._purge_artifacts(now),
                 runs_purged=await self._purge_runs(now),
+                orphans=await self._sweep_orphans(now),
             )
         except (DBAPIError, OSError) as exc:
             self.breaker.record_failure(now)
@@ -235,6 +238,12 @@ class Ticker:
             await db.commit()
         return purged
 
+    async def _sweep_orphans(self, now: datetime) -> int:
+        """Delete payload objects no row refers to any more (``PayloadStore.sweep``)."""
+        async with self._sessions() as db:
+            payloads = payloads_of(db)
+        return await payloads.sweep(now=now, limit=SWEEP_BATCH)
+
     def beat(self) -> None:
         """Record that the loop came round. Never raises: a full disk on the liveness file
         must not stop work that is still going through."""
@@ -277,8 +286,10 @@ async def run() -> None:
     try:
         beat = heartbeat.path_for(settings.ticker.heartbeat_file)
         log.info("ticker.heartbeat", path=str(beat))
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        bind(sessions, blobs)
         ticker = Ticker(
-            async_sessionmaker(engine, expire_on_commit=False),
+            sessions,
             webhooks,
             blobs,
             heartbeat_path=beat,

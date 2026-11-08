@@ -29,8 +29,10 @@ from trellis.contracts.runs import (
     RunStatus,
 )
 from trellis.runs.answers import answer_problem, schema_problem
+from trellis.runs.payloads import SEGMENTS
 
 from agent_runs.answering import require_may_answer, require_may_cancel
+from agent_runs.blob.payloads import PayloadStore, payloads_of
 from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     CONCURRENCY_PER_KEY,
@@ -137,11 +139,39 @@ def _worked(row: RunRow, now: datetime) -> float:
     return row.worked_seconds + max(0.0, (now - row.running_since).total_seconds())
 
 
-def _record(row: RunRow, now: datetime) -> RunRecord:
-    fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
-    return RunRecord.model_validate(
-        {**fields, "metadata": row.run_metadata or {}, "worked_seconds": _worked(row, now)}
-    )
+#: A run's payload references, by the record field each stands for.
+_REFS = {
+    "input": "input_ref",
+    "output": "output_ref",
+    "last_resolution": "last_resolution_ref",
+    "checkpoint": "checkpoint_ref",
+}
+
+
+async def _records(
+    payloads: PayloadStore, rows: Sequence[RunRow], now: datetime
+) -> list[RunRecord]:
+    """The runs' records, every payload a row holds by reference read in (all at once): a
+    record reads the same whether its payloads are inline or in the blob store."""
+    wanted: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
+        fields["metadata"] = row.run_metadata or {}
+        fields["worked_seconds"] = _worked(row, now)
+        for name, column in _REFS.items():
+            if (ref := getattr(row, column)) is not None:
+                wanted.append((fields, name, ref))
+        if row.checkpoint_segments is not None:
+            fields["checkpoint"] = {SEGMENTS: row.checkpoint_segments}
+        if row.awaiting_ref is not None and row.awaiting is not None:
+            fields["awaiting"] = dict(row.awaiting)
+            wanted.append((fields["awaiting"], "payload", row.awaiting_ref))
+        records.append(fields)
+    values = await payloads.get_many(ref for _, _, ref in wanted)
+    for (into, name, _), value in zip(wanted, values, strict=True):
+        into[name] = value
+    return [RunRecord.model_validate(fields) for fields in records]
 
 
 def _json(model: Any) -> dict[str, Any] | None:
@@ -263,6 +293,7 @@ class RunStore:
         max_running_per_tenant: int | None = None,
     ) -> None:
         self._session = session
+        self._payloads = payloads_of(session)
         self._max_run_seconds = max_run_seconds
         self._per_key = concurrency_per_key
         self._per_tenant = max_running_per_tenant
@@ -321,14 +352,14 @@ class RunStore:
             .returning(RunRow)
         )
         if row is not None:
-            return _record(row, now), True
+            return await self._record(row, now), True
         if start.idempotency_key:
             keyed = await self._one(
                 RunRow.tenant_id == start.tenant_id,
                 RunRow.idempotency_key == start.idempotency_key,
             )
             if keyed is not None:
-                found = _record(keyed, now)
+                found = await self._record(keyed, now)
                 queued = keyed.queued_at is not None
                 differing = _differing(found, start, queue=queue, queued=queued)
                 if strict and differing:
@@ -343,7 +374,7 @@ class RunStore:
         )
         if existing is None:
             raise Conflict("this run_id cannot be used: send another, or none and one is minted")
-        return _record(existing, now), False
+        return await self._record(existing, now), False
 
     # ------------------------------------------------------------------ transitions
     async def pause(
@@ -369,7 +400,7 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         waiting_on = (row.awaiting or {}).get("interrupt_id")
         if _settled(row, RunStatus.PAUSED, worker_id) and waiting_on == interrupt.interrupt_id:
-            return _record(row, now), False
+            return await self._record(row, now), False
         _fence(row, worker_id)
         if _cancelled_instead(row, now):
             row.settled_by = worker_id
@@ -411,7 +442,7 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if (row.awaiting or {}).get("interrupt_id") != resolution.interrupt_id:
             if await self._answered_by(tenant_id, resolution):
-                return _record(row, now), False
+                return await self._record(row, now), False
             if row.status != RunStatus.PAUSED:
                 raise Conflict(f"run {run_id} is {row.status}, not waiting on an answer")
             raise Conflict(f"run {run_id} is waiting on another interrupt")
@@ -483,7 +514,7 @@ class RunStore:
         require_may_cancel(canceller, row.assignee)
         asked = (row.cancelled_by, row.cancel_reason) == (canceller.principal, cancel.reason)
         if row.cancel_requested_at is not None or (row.status == RunStatus.CANCELLED and asked):
-            return _record(row, now), False
+            return await self._record(row, now), False
         if row.status == RunStatus.RUNNING and row.lease_owner is not None:
             row.cancel_requested_at = row.updated_at = now
         else:
@@ -516,7 +547,7 @@ class RunStore:
             and _settled(row, RunStatus.QUEUED, worker_id)
         )
         if _settled(row, ending.status, worker_id) or requeued:
-            return _record(row, now), False
+            return await self._record(row, now), False
         _fence(row, worker_id)
         if _retried(row, ending):
             row.error_retries += 1
@@ -667,7 +698,7 @@ class RunStore:
         checkpoint = bounded_checkpoint(request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
-            return _record(row, now), False
+            return await self._record(row, now), False
         _fence(row, request.worker_id)
         if _cancelled_instead(row, now):
             await self._ended([row], now)
@@ -723,7 +754,7 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row, now) for row in rows]
+        return await _records(self._payloads, rows, now)
 
     async def time_out_overworked(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Running runs whose working time passed their limit (``_limit``: their own
@@ -757,7 +788,7 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row, now) for row in rows]
+        return await _records(self._payloads, rows, now)
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
@@ -791,7 +822,7 @@ class RunStore:
                 _requeue(row, now, wait=jittered(wait))
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row, now) for row in rows]
+        return await _records(self._payloads, rows, now)
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
@@ -828,7 +859,7 @@ class RunStore:
                 )
         await self._ended(rows, now)
         await self._session.flush()
-        return [_record(row, now) for row in rows]
+        return await _records(self._payloads, rows, now)
 
     async def purge_ended(self, *, before: datetime, limit: int) -> int:
         """Delete the runs that ended before ``before``, with their resolutions and their
@@ -955,7 +986,24 @@ class RunStore:
         entries = [
             RunEventEntry(position=r.position, event=RunEvent.model_validate(r.event)) for r in rows
         ]
+        if not entries and status.final:
+            entries = await self._compacted_events(run_id, after=after, limit=limit)
         return entries, status
+
+    async def _compacted_events(
+        self, run_id: str, *, after: int, limit: int
+    ) -> list[RunEventEntry]:
+        """An ended run's events from its compacted log (``[[position, event], ...]``), read
+        after the rows came back empty: a compaction that committed in between is seen."""
+        ref = await self._session.scalar(select(RunRow.events_ref).where(RunRow.run_id == run_id))
+        if ref is None:
+            return []
+        logged = await self._payloads.get(ref)
+        return [
+            RunEventEntry(position=position, event=RunEvent.model_validate(event))
+            for position, event in logged
+            if position > after
+        ][:limit]
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
         """Runs that just ended start their artifacts' retention."""
@@ -981,12 +1029,21 @@ class RunStore:
         if after is not None:
             query = query.where(tuple_(*order) > (after["recorded_at"], after["resolution_id"]))
         rows = (await self._session.scalars(query.order_by(*order).limit(limit + 1))).all()
+        refs = [ref for r in rows for ref in (r.interrupt_ref, r.resolution_ref) if ref]
+        read = iter(await self._payloads.get_many(refs))
+        kept = {
+            r.resolution_id: (
+                next(read) if r.interrupt_ref else r.interrupt,
+                next(read) if r.resolution_ref else r.resolution,
+            )
+            for r in rows
+        }
         return page_of(
             rows,
             limit=limit,
             item=lambda r: ResolutionEntry(
-                interrupt=Interrupt.model_validate(r.interrupt),
-                resolution=InterruptResolution.model_validate(r.resolution),
+                interrupt=Interrupt.model_validate(kept[r.resolution_id][0]),
+                resolution=InterruptResolution.model_validate(kept[r.resolution_id][1]),
                 attempt=r.attempt,
                 recorded_at=r.recorded_at,
             ),
@@ -995,7 +1052,7 @@ class RunStore:
 
     async def get(self, tenant_id: str, run_id: str, *, now: datetime) -> RunRecord:
         """The run as it is at ``now`` (its working time counts the stretch going on)."""
-        return _record(await self._found(tenant_id, run_id), now)
+        return await self._record(await self._found(tenant_id, run_id), now)
 
     async def list(
         self,
@@ -1015,7 +1072,9 @@ class RunStore:
         ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served by
         ``ix_runs_inbox``; ``top_level`` keeps only the runs no other run started."""
         order = (RunRow.created_at, RunRow.run_id)
-        query = select(*_SUMMARY_COLUMNS, RunRow.created_at).where(RunRow.tenant_id == tenant_id)
+        query = select(*_SUMMARY_COLUMNS, RunRow.created_at, RunRow.awaiting_ref).where(
+            RunRow.tenant_id == tenant_id
+        )
         if after is not None:
             query = query.where(tuple_(*order) < (after["created_at"], after["run_id"]))
         filters: dict[Any, Any] = {
@@ -1032,10 +1091,22 @@ class RunStore:
             query = query.where(RunRow.parent_run_id.is_(None))
         newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
         rows = (await self._session.execute(newest)).all()
+        waiting = [row for row in rows if row.awaiting_ref is not None and row.awaiting]
+        payloads = await self._payloads.get_many(row.awaiting_ref for row in waiting)
+        asked = {
+            row.run_id: {**row.awaiting, "payload": payload}
+            for row, payload in zip(waiting, payloads, strict=True)
+        }
+
+        def summary(row: Any) -> RunSummary:
+            fields = dict(row._mapping)
+            fields["awaiting"] = asked.get(row.run_id, row.awaiting)
+            return RunSummary.model_validate(fields)
+
         return page_of(
             rows,
             limit=limit,
-            item=lambda row: RunSummary.model_validate(dict(row._mapping)),
+            item=summary,
             position=lambda row: {"created_at": row.created_at, "run_id": row.run_id},
         )
 
@@ -1065,4 +1136,7 @@ class RunStore:
 
     async def _flushed(self, row: RunRow, now: datetime) -> RunRecord:
         await self._session.flush()
-        return _record(row, now)
+        return await self._record(row, now)
+
+    async def _record(self, row: RunRow, now: datetime) -> RunRecord:
+        return (await _records(self._payloads, [row], now))[0]
