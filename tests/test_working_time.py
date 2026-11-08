@@ -1,5 +1,5 @@
 """A run's working time (``RunRecord.worked_seconds``) and its limit
-(``RunStart.timeout_seconds``, or the service's ``RUNS__RUNS__MAX_RUN_SECONDS``, the lesser):
+(``RunStart.timeout_seconds``, or the service's ``RUNS__LIMITS__MAX_RUN_SECONDS``, the lesser):
 only time ``RUNNING`` counts, across attempts and crashes; the ticker ends a run past its
 limit as ``TIMEOUT``, and every lease tells the worker the time it has left."""
 
@@ -175,7 +175,7 @@ async def test_every_lease_says_the_working_time_left(app, client) -> None:
     assert free["run"]["run_id"] == unlimited and free["lease"]["remaining_seconds"] is None
     settings = app.state.settings
     app.state.settings = settings.model_copy(
-        update={"runs": settings.runs.model_copy(update={"max_run_seconds": 300})}
+        update={"limits": settings.limits.model_copy(update={"max_run_seconds": 300})}
     )
     capped = await client.post(f"/v1/runs/{unlimited}/heartbeat", json={"worker_id": "w1"})
     assert 299 < capped.json()["remaining_seconds"] <= 300

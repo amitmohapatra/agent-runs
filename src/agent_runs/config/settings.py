@@ -5,12 +5,13 @@ decisions are constants in ``constants.py``.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Final, Self
+from typing import Any, Final, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,8 @@ MIN_WORKERS: Final = 1
 MAX_WORKERS: Final = 8
 #: The smallest pool a process may have: one connection kept, one for a burst.
 MIN_CONNECTIONS_PER_PROCESS: Final = 2
+
+log = logging.getLogger(__name__)
 
 
 def default_workers(cpus: int | None = None) -> int:
@@ -146,7 +149,7 @@ class TickerSettings(BaseModel):
     metrics_port: int | None = Field(default=None, ge=1, le=65535)
 
 
-class RunsSettings(BaseModel):
+class LimitsSettings(BaseModel):
     #: The most working time any run may take, in seconds (time RUNNING, across attempts): a
     #: run's own ``timeout_seconds`` may only be shorter. Unset: no platform maximum.
     max_run_seconds: float | None = Field(default=None, gt=0)
@@ -210,10 +213,37 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     blob: BlobSettings = Field(default_factory=BlobSettings)
     ticker: TickerSettings = Field(default_factory=TickerSettings)
-    runs: RunsSettings = Field(default_factory=RunsSettings)
+    limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    #: The old name of ``limits`` (``RUNS__RUNS__*``), still read for one release, with a
+    #: warning (:meth:`_old_limits`); removed in the next.
+    runs: LimitsSettings | None = Field(default=None, exclude=True)
     webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+
+    @model_validator(mode="after")
+    def _old_limits(self) -> Self:
+        """``RUNS__RUNS__*`` set: each value moved into ``limits`` unless its new name is set
+        too (the new wins), and one warning line each naming the new one."""
+        if self.runs is None:
+            return self
+        moved: dict[str, Any] = {}
+        for field in LimitsSettings.model_fields:
+            if field not in self.runs.model_fields_set:
+                continue
+            new = field in self.limits.model_fields_set
+            if not new:
+                moved[field] = getattr(self.runs, field)
+            log.warning(
+                "RUNS__RUNS__%s is renamed RUNS__LIMITS__%s%s; the old name stops working in "
+                "the next release",
+                field.upper(),
+                field.upper(),
+                " (set too: the new name wins)" if new else "",
+            )
+        self.limits = self.limits.model_copy(update=moved)
+        self.runs = None
+        return self
 
     @model_validator(mode="after")
     def _filesystem_blobs_are_local(self) -> Self:

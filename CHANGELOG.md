@@ -6,6 +6,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **The `runs` settings group is now `limits`.** `RUNS__LIMITS__MAX_RUN_SECONDS`,
+  `CONCURRENCY_PER_KEY`, `MAX_RUNNING_PER_TENANT` and `RETENTION_DAYS` replace the
+  `RUNS__RUNS__*` names (`Settings.limits`). For this release the old names still work, each
+  with a one-line warning at startup naming its new name, and the new name wins if both are set.
+  The next release removes the old names.
 * **A segment's save is four statements.** The new segment is checked stored and linked in one
   statement, and the run's row is written once (the links before it, no autoflush between).
   Nothing to do.

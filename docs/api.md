@@ -231,7 +231,7 @@ counted on every read), so a worker crash does not reset the clock. Within a tic
 run working past its limit, the ticker ends it `TIMEOUT` with
 `{"code": "run_timeout", "category": "TIMEOUT", "retryable": false}`, announced as
 `run.finished`, and its worker is fenced off as for a deadline. The limit is
-`timeout_seconds` or the operator's `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; with neither
+`timeout_seconds` or the operator's `RUNS__LIMITS__MAX_RUN_SECONDS`, the lesser; with neither
 there is none. Both a deadline and a limit may be set. Every lease answers the working time
 left (`remaining_seconds`), so a worker stops in time (the SDK's `Worker` stops a handler
 still running a second later, its `WORKING_TIME_GRACE_SECONDS`, and finishes the run
@@ -240,7 +240,7 @@ still running a second later, its `WORKING_TIME_GRACE_SECONDS`, and finishes the
 
 `priority` (`-1000` to `1000`, default `0`) and `concurrency_key` (optional, 1–200
 characters) say how a queued run waits its turn ([the claim](#post-v1runsclaim--200-claimed-or-204)):
-higher priority first, and at most `RUNS__RUNS__CONCURRENCY_PER_KEY` (default 1) of the
+higher priority first, and at most `RUNS__LIMITS__CONCURRENCY_PER_KEY` (default 1) of the
 tenant's runs sharing a key `RUNNING` at once, the others waiting `QUEUED`. A run recorded
 `RUNNING` in its caller's process takes its key's place too (it runs), but is never held
 back: only a claim waits.
@@ -256,9 +256,9 @@ back: only a claim waits.
 in the tenant, sets it `RUNNING` and leases it. The next run is, among the available ones
 (no retry's backoff holding it back) **with room**, the one with the highest `priority`,
 then the oldest (`queued_at`). A run has room when fewer than
-`RUNS__RUNS__CONCURRENCY_PER_KEY` (default 1) runs of its tenant sharing its
+`RUNS__LIMITS__CONCURRENCY_PER_KEY` (default 1) runs of its tenant sharing its
 `concurrency_key` are `RUNNING`, and its tenant's workers hold fewer runs (`RUNNING` with a
-lease) than `RUNS__RUNS__MAX_RUNNING_PER_TENANT` (unset: no cap). The room is counted again
+lease) than `RUNS__LIMITS__MAX_RUNNING_PER_TENANT` (unset: no cap). The room is counted again
 under a transaction lock on the key (and on the tenant, when capped), so two claims at once
 never both take the last place; a key or tenant another claim is counting at that moment is
 passed over for this claim, as a locked row is.
@@ -606,7 +606,7 @@ that cannot be deleted keeps its record for the next tick.
 
 ### Run retention
 
-Runs are kept forever unless the operator sets `RUNS__RUNS__RETENTION_DAYS`. Then the
+Runs are kept forever unless the operator sets `RUNS__LIMITS__RETENTION_DAYS`. Then the
 ticker deletes the runs that ended (`SUCCESS`, `PARTIAL`, `ERROR`, `TIMEOUT`, `CANCELLED`,
 `REJECTED`) longer ago than that, with their resolutions and their event log; a run whose
 artifacts are still kept is deleted after them. A deleted run is `404` like any other.

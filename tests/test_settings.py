@@ -71,6 +71,42 @@ def test_settings_that_were_removed_are_ignored_when_left_set(fresh_settings, mo
     assert get_settings().database.pool_plan(1) == PoolPlan(size=10, overflow=10)
 
 
+def test_the_limits_group_is_read_and_its_old_name_still_works_with_a_warning(
+    fresh_settings, monkeypatch, caplog
+) -> None:
+    """``RUNS__LIMITS__*`` (renamed from ``RUNS__RUNS__*``): the new names are read; for one
+    release an old one still is, with one warning line naming the new one; the new wins."""
+    monkeypatch.setenv("RUNS__LIMITS__MAX_RUN_SECONDS", "30")
+    monkeypatch.setenv("RUNS__LIMITS__CONCURRENCY_PER_KEY", "2")
+    limits = get_settings().limits
+    assert (limits.max_run_seconds, limits.concurrency_per_key) == (30, 2)
+    assert "renamed" not in caplog.text
+    monkeypatch.delenv("RUNS__LIMITS__MAX_RUN_SECONDS")
+    for name, value in {
+        "RUNS__RUNS__MAX_RUN_SECONDS": "40",
+        "RUNS__RUNS__MAX_RUNNING_PER_TENANT": "5",
+        "RUNS__RUNS__RETENTION_DAYS": "90",
+        "RUNS__RUNS__CONCURRENCY_PER_KEY": "3",
+    }.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    with caplog.at_level("WARNING"):
+        limits = get_settings().limits
+    assert (limits.max_run_seconds, limits.max_running_per_tenant) == (40, 5)
+    assert limits.retention_days == 90 and limits.concurrency_per_key == 2, "the new name wins"
+    said = [r.getMessage() for r in caplog.records if "renamed" in r.getMessage()]
+    assert said == [
+        "RUNS__RUNS__MAX_RUN_SECONDS is renamed RUNS__LIMITS__MAX_RUN_SECONDS; the old name "
+        "stops working in the next release",
+        "RUNS__RUNS__CONCURRENCY_PER_KEY is renamed RUNS__LIMITS__CONCURRENCY_PER_KEY (set "
+        "too: the new name wins); the old name stops working in the next release",
+        "RUNS__RUNS__MAX_RUNNING_PER_TENANT is renamed RUNS__LIMITS__MAX_RUNNING_PER_TENANT; "
+        "the old name stops working in the next release",
+        "RUNS__RUNS__RETENTION_DAYS is renamed RUNS__LIMITS__RETENTION_DAYS; the old name "
+        "stops working in the next release",
+    ]
+
+
 @pytest.mark.parametrize(
     ("budget", "processes", "plan"),
     [

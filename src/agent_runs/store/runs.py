@@ -307,9 +307,9 @@ def _counted(error: AgentError | None, retries: int) -> AgentError | None:
 
 class RunStore:
     """Every run operation, in one place. The caller commits. ``max_run_seconds`` is the
-    service's maximum working time (``RUNS__RUNS__MAX_RUN_SECONDS``): a run's own
+    service's maximum working time (``RUNS__LIMITS__MAX_RUN_SECONDS``): a run's own
     ``timeout_seconds`` may only be shorter. ``concurrency_per_key`` and
-    ``max_running_per_tenant`` bound what a claim may take (``RUNS__RUNS__*``)."""
+    ``max_running_per_tenant`` bound what a claim may take (``RUNS__LIMITS__*``)."""
 
     def __init__(
         self,
