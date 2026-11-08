@@ -71,6 +71,24 @@ async def test_a_payload_object_goes_up_as_zstd_json_and_comes_back_checked(
         await runs.artifacts.get_payload(ref)
 
 
+@respx.mock
+async def test_several_payload_objects_come_back_in_one_request_each_checked(
+    runs: RunsClient,
+) -> None:
+    data = [encode([n]) for n in range(3)]
+    refs = [ref_of("acme", d) for d in data]
+    framed = b"".join(len(d).to_bytes(8, "big") + d for d in data)
+    route = respx.post(f"{URL}/v1/payloads/read")
+    route.side_effect = [
+        httpx.Response(200, content=framed),
+        httpx.Response(200, content=framed[:-1]),
+    ]
+    assert await runs.artifacts.get_payloads(refs, tenant="acme") == data
+    assert json.loads(sent(route).content) == {"sha256": [r.sha256 for r in refs]}
+    with pytest.raises(ValueError, match="cut short"):
+        await runs.artifacts.get_payloads(refs)
+
+
 # --------------------------------------------------------------------------- schedules
 SPEC = ScheduleSpec(
     tenant_id="acme", agent_id="briefing", name="morning", cadence="daily", on_behalf_of="u"

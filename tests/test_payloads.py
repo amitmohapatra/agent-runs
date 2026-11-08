@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
@@ -99,9 +98,8 @@ class Unreachable(FilesystemBlobStore):
     async def put(self, *args: Any, **kwargs: Any) -> Any:
         raise OSError("no route to the store")
 
-    async def chunks(self, key: str) -> AsyncIterator[bytes]:
+    async def get(self, key: str) -> bytes:
         raise OSError("no route to the store")
-        yield b""  # pragma: no cover
 
     async def delete(self, key: str) -> None:
         raise OSError("no route to the store")
@@ -135,13 +133,12 @@ class Slow(FilesystemBlobStore):
         super().__init__(root)
         self.running = self.most = 0
 
-    async def chunks(self, key: str) -> AsyncIterator[bytes]:
+    async def get(self, key: str) -> bytes:
         self.running += 1
         self.most = max(self.most, self.running)
         await asyncio.sleep(0.001 * (64 - int(key.removesuffix(".json.zst")[-2:], 16) % 64))
         self.running -= 1
-        async for chunk in super().chunks(key):
-            yield chunk
+        return await super().get(key)
 
 
 async def test_many_payloads_read_in_parallel_come_back_in_order(app: Any, tmp_path: Any) -> None:

@@ -6,6 +6,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A checkpoint's segments read back in one request.** `POST /v1/payloads/read` answers
+  several payload objects at once (read from the store in parallel, each verified; SDK
+  `artifacts.get_payloads`), so a resume is one round trip. A save that adds a segment checks
+  and links only the new one, its cost independent of the run's length. Small objects are
+  read in one call (`BlobStore.get`, `read_whole`). Nothing to do.
 * **Run payloads are written by reference.** A run's input, output, the payload its pause
   waits on, its answers and its checkpoint go to the blob store before any row refers to
   them; reads answer the same JSON (a webhook's body the same bytes). A checkpoint may be a
