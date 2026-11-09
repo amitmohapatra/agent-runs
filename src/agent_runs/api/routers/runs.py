@@ -193,6 +193,7 @@ async def heartbeat(
     repeats no checkpointed side effect. The lease says the working time the run has left
     (``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;
     stop working the run."""
+    bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
     return lease
@@ -211,6 +212,7 @@ async def heartbeat(
 async def release(
     run_id: RunId,
     body: Annotated[ReleaseRequest, Body(openapi_examples=examples.RELEASE)],
+    request: Request,
     db: Session,
     who: Who,
 ) -> RunRecord:
@@ -220,6 +222,7 @@ async def release(
     ``checkpoint``, the progress made so far is saved first, as a heartbeat saves it. A run
     whose cancel was asked for ends ``CANCELLED`` instead. Repeated by the same worker, it
     answers the run as it is."""
+    bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     at = now()
     run, released = await RunStore(db).release(who.tenant_id, run_id, body, now=at)
     if released:
@@ -237,6 +240,7 @@ async def release(
 async def pause(
     run_id: RunId,
     body: Annotated[RunPause, Body(openapi_examples=examples.PAUSE)],
+    request: Request,
     db: Session,
     who: Who,
     worker_id: WorkerId = None,
@@ -246,6 +250,7 @@ async def pause(
     why). ``body.checkpoint`` is kept for the worker that resumes it (413 past the bound).
     The lease ends. Repeated by the same caller on the same interrupt, it answers the stored
     run and changes nothing."""
+    bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     at = now()
     run, paused = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
     if paused:

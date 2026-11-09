@@ -1,8 +1,5 @@
 """Run payloads by reference: the format, the store over each blob adapter, the orphan sweep,
-and the readers. A run whose payloads are in the blob store reads, lists, streams and
-announces exactly as the same run with its payloads inline (the API's and the webhook's
-bytes compared), and one run may hold both at once (rows written before and after the
-change-over)."""
+and the readers of a segmented checkpoint and of a compacted event log."""
 
 from __future__ import annotations
 
@@ -34,13 +31,11 @@ from agent_runs.blob.payloads import (
 from agent_runs.domain.errors import Unavailable
 from agent_runs.store.tables import (
     PayloadBlobRow,
-    ResolutionRow,
     RunEventRow,
     RunPayloadRow,
     RunRow,
-    WebhookDeliveryRow,
 )
-from tests.conftest import pause, resolution, started
+from tests.conftest import started
 from tests.test_blob import fake_gcs, gcs, store  # noqa: F401  (fixtures)
 from tests.test_events import _event
 
@@ -192,94 +187,6 @@ async def test_a_write_after_a_sweep_deleted_its_object_stores_it_again(
 
 
 # ------------------------------------------------------------------ the readers
-async def _by_reference(app: Any, run_id: str) -> None:
-    """Move every payload of the run (and its resolutions, events and deliveries) to the
-    blob store, as the writers and the migration do."""
-    async with app.state.sessions() as db:
-        payloads = payloads_of(db)
-        row = await db.get(RunRow, run_id)
-        assert row is not None
-        tenant = row.tenant_id
-        for column in ("input", "output", "last_resolution", "checkpoint"):
-            if getattr(row, column) is not None:
-                setattr(
-                    row,
-                    f"{column}_ref",
-                    (await payloads.put(tenant, getattr(row, column))).model_dump(),
-                )
-                setattr(row, column, None)
-        if row.awaiting is not None and "payload" in row.awaiting:
-            awaiting = dict(row.awaiting)
-            row.awaiting_ref = (await payloads.put(tenant, awaiting.pop("payload"))).model_dump()
-            row.awaiting = awaiting
-        inline = select(ResolutionRow).where(
-            ResolutionRow.run_id == run_id, ResolutionRow.interrupt.is_not(None)
-        )
-        for res in (await db.scalars(inline)).all():
-            res.interrupt_ref = (await payloads.put(tenant, res.interrupt)).model_dump()
-            res.resolution_ref = (await payloads.put(tenant, res.resolution)).model_dump()
-            res.interrupt = res.resolution = None
-        for dlv in (await db.scalars(select(WebhookDeliveryRow))).all():
-            body = json.loads(json.dumps(dlv.payload))
-            awaiting = body["data"]["run"]["awaiting"]
-            if awaiting and "payload" in awaiting:
-                dlv.payload_ref = (await payloads.put(tenant, awaiting.pop("payload"))).model_dump()
-                dlv.payload = body
-        await db.commit()
-
-
-async def _views(client: Any, run_id: str) -> dict[str, bytes]:
-    """Every read of the run, as the bytes the API answers."""
-    paths = [
-        f"/v1/runs/{run_id}",
-        f"/v1/runs/{run_id}/resolutions",
-        "/v1/runs",
-        f"/v1/runs/{run_id}/events",
-    ]
-    views = {}
-    for path in paths:
-        response = await client.get(path)
-        assert response.status_code == 200, response.text
-        views[path] = response.content
-    return views
-
-
-async def test_a_run_reads_the_same_by_reference_as_inline(app: Any, client: Any) -> None:
-    run = (
-        await client.post(
-            "/v1/runs", json=started(input={"question": "ü", "rows": LARGE["rows"][:50]})
-        )
-    ).json()
-    run_id = run["run_id"]
-    waiting = (
-        await client.post(
-            f"/v1/runs/{run_id}/pause",
-            json=pause(
-                run_id,
-                {"journal": {"calls": {"k": [1, 2]}}},
-                payload={"table": [[1, "a"]], "z": 1, "a": 2},
-            ),
-        )
-    ).json()
-    resumed = await client.post(
-        f"/v1/runs/{run_id}/resume", json=resolution(waiting, "EDIT", payload={"amount": 200})
-    )
-    assert resumed.status_code == 200, resumed.text
-    appended = await client.post(
-        f"/v1/runs/{run_id}/events", json={"events": [_event(run_id, 1, attempt=2)]}
-    )
-    assert appended.status_code == 200, appended.text
-    await client.post(
-        f"/v1/runs/{run_id}/pause", json=pause(run_id, {"step": 2}, payload={"list": [1, "two"]})
-    )
-    inline = await _views(client, run_id)
-    await _by_reference(app, run_id)
-    async with app.state.sessions() as db:
-        row = await db.get(RunRow, run_id)
-        assert row is not None and row.input is None and row.input_ref is not None
-    assert await _views(client, run_id) == inline
-
-
 async def test_a_segmented_checkpoint_reads_as_its_segment_list(app: Any, client: Any) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
     segment = ref_of(TENANT, encode({"calls": {}})).model_dump()
@@ -329,29 +236,3 @@ async def test_an_ended_runs_compacted_log_streams_and_replays(app: Any, client:
     assert (await client.get(f"/v1/runs/{run_id}/events?after=4&limit=1")).json()[0][
         "position"
     ] == 5
-
-
-async def test_a_webhook_body_is_the_same_by_reference(
-    app: Any, client: Any, ticker: Any, receiver: Any
-) -> None:
-    hook = await client.post(
-        "/v1/webhooks", json={"url": "http://hooks.test/runs", "events": ["run.paused"]}
-    )
-    assert hook.status_code == 201, hook.text
-    bodies = []
-    for _ in range(2):
-        run = (await client.post("/v1/runs", json=started())).json()
-        await client.post(
-            f"/v1/runs/{run['run_id']}/pause",
-            json=pause(run["run_id"], payload={"zeta": [1, {"b": 2, "a": "ü"}], "a": None}),
-        )
-        if bodies:
-            await _by_reference(app, run["run_id"])
-        await ticker.tick()
-        bodies.append(receiver.received[-1].content)
-    first, second = (json.loads(b) for b in bodies)
-    assert (
-        second["data"]["run"]["awaiting"]["payload"] == first["data"]["run"]["awaiting"]["payload"]
-    )
-    keys = lambda body: list(json.loads(body)["data"]["run"]["awaiting"])  # noqa: E731
-    assert keys(bodies[1]) == keys(bodies[0]), "the interrupt reads in the inline key order"

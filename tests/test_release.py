@@ -8,8 +8,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from agent_runs.config.constants import MAX_CHECKPOINT_BYTES
-from tests.conftest import started
+from tests.conftest import SETTINGS, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 60}
 
@@ -50,7 +49,7 @@ async def test_only_the_lease_holder_releases_and_a_repeat_answers_the_run(clien
     run_id = await _held(client)
     stranger = await client.post(f"/v1/runs/{run_id}/release", json={"worker_id": "w2"})
     assert (stranger.status_code, stranger.json()["code"]) == (409, "LEASE_LOST")
-    huge = {"blob": "x" * MAX_CHECKPOINT_BYTES}
+    huge = {"blob": "x" * SETTINGS.service.max_payload_bytes}
     too_big = await _release(client, run_id, checkpoint=huge)
     assert (too_big.status_code, too_big.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
     first = await _release(client, run_id)

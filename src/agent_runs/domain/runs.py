@@ -22,7 +22,6 @@ from trellis.contracts.runs import (
 
 from agent_runs.config.constants import (
     DEFAULT_LEASE_SECONDS,
-    MAX_CHECKPOINT_BYTES,
     MAX_EVENTS_PER_APPEND,
     MAX_LEASE_SECONDS,
     MIN_LEASE_SECONDS,
@@ -52,22 +51,10 @@ def _json_size(value: Any) -> int:
 
 
 def bounded_payload(value: Any, *, name: str, limit: int) -> None:
-    """A run's ``input`` or ``output``, refused (413) past ``limit`` bytes of compact JSON
-    (``RUNS__SERVICE__MAX_PAYLOAD_BYTES``): it lives in the run's row and in every read."""
+    """A run's ``input``, ``output`` or ``checkpoint``, refused (413) past ``limit`` bytes of
+    compact JSON (``RUNS__SERVICE__MAX_PAYLOAD_BYTES``): every read of the run reads it."""
     if value is not None and (size := _json_size(value)) > limit:
         raise TooLarge(f"{name} is {size} bytes; the most a run keeps is {limit}")
-
-
-def bounded_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The checkpoint, refused (413) past ``MAX_CHECKPOINT_BYTES`` of compact JSON."""
-    if checkpoint is None:
-        return None
-    size = _json_size(checkpoint)
-    if size > MAX_CHECKPOINT_BYTES:
-        raise TooLarge(
-            f"checkpoint is {size} bytes; the most a run keeps is {MAX_CHECKPOINT_BYTES}"
-        )
-    return checkpoint
 
 
 class RunPause(BaseModel):
@@ -85,9 +72,6 @@ class RunPause(BaseModel):
         description="The executor's opaque resume state (journal, framework state), at most "
         "1 MiB of compact JSON; replaces any earlier one, cleared when the run ends.",
     )
-
-    def bounded_checkpoint(self) -> dict[str, Any] | None:
-        return bounded_checkpoint(self.checkpoint)
 
 
 class RunFinish(BaseModel):

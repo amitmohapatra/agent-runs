@@ -3,8 +3,8 @@ waits on, its answers, its checkpoint and its event log are stored as immutable,
 content-addressed objects, and the run's row holds only a :class:`PayloadRef` to each.
 
 One format for every store (the service's blob store, on GCS or disk, and a local runner's
-folder): compact JSON, its object keys in PostgreSQL ``jsonb`` order (what an inline ``jsonb``
-column hands back, so a value reads the same either way), compressed with zstd at level 3.
+folder): compact JSON, its object keys in PostgreSQL ``jsonb`` order (the order of the run's
+other ``jsonb`` fields, so every response orders keys one way), compressed with zstd at level 3.
 The key is the stored bytes' SHA-256 under the tenant, sharded by the tenant's hash so no one
 prefix is hot, as the Memory Service lays out its archive
 (``tenant-shard=<n>/tenant=<t>/blobs/sha256=<hex>.json.zst``): the same content is stored

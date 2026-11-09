@@ -57,7 +57,7 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 | `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
 | `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, release, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled, finished, or ended past its deadline or working time. **Stop working the run.** |
 | `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a cancel of a run that ended, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook, a redelivery of a delivery still owed |
-| `413` | `PAYLOAD_TOO_LARGE` | a JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (4 MiB), a run's `input` or `output` past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), a `checkpoint` past 1 MiB, an artifact past 50 MiB (see [Limits](#limits)) |
+| `413` | `PAYLOAD_TOO_LARGE` | a JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (4 MiB), a run's `input`, `output` or `checkpoint` past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), an artifact past 50 MiB (see [Limits](#limits)) |
 | `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators), a cursor this listing did not issue, or a webhook URL this deployment does not deliver to (scheme, or a host that does not resolve or resolves to a private address) |
 | `429` | `RATE_LIMIT` | the tenant's request budget is spent for now; retryable after `Retry-After` (see [Limits](#limits)) |
 | `500` | `INTERNAL` | a fault here (an artifact's stored bytes no longer match their checksum, a statement the database refuses, anything unanticipated); the detail says nothing about internals |
@@ -86,11 +86,12 @@ carries none.
 - **Body.** A JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (default 4 MiB) is `413`: at
   once when `Content-Length` says so, else as soon as the bytes that arrived pass it (a
   chunked body is counted too), before the route has it all.
-- **Run payloads.** A run's `input` (`POST /v1/runs`) or `output` (`finish`) past
-  `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (default 1 MiB) of compact JSON is `413`: both live in
-  the run's row and in every read of it. Anything larger belongs in an artifact.
-- **Checkpoints** are at most 1 MiB (`MAX_CHECKPOINT_BYTES`), **artifacts** at most 50 MiB
-  (`MAX_ARTIFACT_BYTES`), streamed to the blob store as they arrive.
+- **Run payloads.** A run's `input` (`POST /v1/runs`), `output` (`finish`) or `checkpoint`
+  (`pause`, `heartbeat`, `release`) past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (default 1 MiB)
+  of compact JSON is `413`: every read of the run carries them. Anything larger belongs in an
+  artifact.
+- **Artifacts** are at most 50 MiB (`MAX_ARTIFACT_BYTES`), streamed to the blob store as they
+  arrive.
 - **Rate.** Each tenant's `/v1` requests draw on one budget, refilled at
   `RUNS__RATE_LIMIT__PER_MINUTE` (default 3000) a minute and holding at most
   `RUNS__RATE_LIMIT__BURST` (500). Every counted response carries `X-RateLimit-Limit` (the
@@ -299,7 +300,7 @@ none available yet, or none with room); poll again later.
 Extends the lease to `now + lease_seconds`. **Progress checkpoints:** `checkpoint`
 (optional) is saved on the run as it stands, replacing the one there (omitted: the run's
 checkpoint is kept as it is), with the pause checkpoint's bound (`413 PAYLOAD_TOO_LARGE`
-past 1 MiB of compact JSON, nothing saved). It comes back as `RunRecord.checkpoint` on the
+past `RUNS__SERVICE__MAX_PAYLOAD_BYTES`, nothing saved). It comes back as `RunRecord.checkpoint` on the
 next claim and on every read, so when this worker dies the next attempt resumes from it and
 repeats no side effect the journal records. Only the lease holder saves one (`409
 LEASE_LOST` otherwise, nothing saved); sending the same checkpoint again is harmless. A
@@ -364,8 +365,8 @@ every read, resume and claim, so whichever worker resumes the run repeats no sid
 Each pause replaces it (omitted means `null`); any ending (`finish`, `cancel`, a `CANCEL`
 answer, a `TIMEOUT`, a run past its deadline or its working-time limit, a run failed on its
 `MAX_LEASE_LAPSES`-th lapsed lease) clears it; a requeue (a lapse, a release, a retried
-error) keeps it for the next attempt. Larger than 1 MiB as compact JSON
-(`MAX_CHECKPOINT_BYTES`) is `413`, and nothing changes. A heartbeat may save one too, as
+error) keeps it for the next attempt. Larger than `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB)
+as compact JSON is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
 
 `worker_id` (query, optional, also on `finish`) fences the write: when given, the write is

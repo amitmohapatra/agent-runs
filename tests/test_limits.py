@@ -17,7 +17,7 @@ from trellis.runs.blob import FilesystemBlobStore
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
 from agent_runs.observability import metrics
-from tests.conftest import SETTINGS, client_of, serving, started
+from tests.conftest import SETTINGS, client_of, pause, serving, started
 
 
 def _settings(**over: Any) -> Any:
@@ -77,6 +77,24 @@ async def test_a_run_input_or_output_past_its_cap_is_refused(small) -> None:
     ended = await small.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": big})
     assert (ended.status_code, ended.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
     assert (await small.get(f"/v1/runs/{rid}")).json()["status"] == "RUNNING"
+
+
+async def test_a_checkpoint_past_the_payload_cap_is_refused_wherever_it_is_saved(small) -> None:
+    big = {"text": "y" * 2100}
+    run = (await small.post("/v1/runs", json=started(queue=True))).json()
+    claim = {"worker_id": "w1", "agent_ids": [run["agent_id"]]}
+    rid = (await small.post("/v1/runs/claim", json=claim)).json()["run"]["run_id"]
+    saves = {
+        "heartbeat": {"worker_id": "w1", "checkpoint": big},
+        "release": {"worker_id": "w1", "checkpoint": big},
+        "pause": pause(rid, big),
+    }
+    for path, body in saves.items():
+        refused = await small.post(f"/v1/runs/{rid}/{path}", params={"worker_id": "w1"}, json=body)
+        assert (refused.status_code, refused.json()["code"]) == (413, "PAYLOAD_TOO_LARGE"), path
+        assert "checkpoint is" in refused.json()["detail"]
+    held = (await small.get(f"/v1/runs/{rid}")).json()
+    assert (held["status"], held["checkpoint"]) == ("RUNNING", None)
 
 
 async def test_an_artifact_is_not_held_to_the_json_cap(small) -> None:

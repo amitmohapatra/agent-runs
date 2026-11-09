@@ -59,7 +59,6 @@ from agent_runs.domain.runs import (
     RunFinish,
     RunPause,
     RunSummary,
-    bounded_checkpoint,
 )
 from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
@@ -74,6 +73,7 @@ from agent_runs.store.tables import (
     RunRow,
 )
 
+#: A record's columns; its payloads are read by reference (``_REFS``).
 _RECORD_FIELDS = (
     "run_id",
     "tenant_id",
@@ -84,12 +84,8 @@ _RECORD_FIELDS = (
     "user_id",
     "workspace_id",
     "on_behalf_of",
-    "input",
-    "output",
     "error",
     "awaiting",
-    "last_resolution",
-    "checkpoint",
     "attempt",
     "deadline",
     "timeout_seconds",
@@ -157,8 +153,7 @@ _REFS = {
 async def _records(
     payloads: PayloadStore, rows: Sequence[RunRow], now: datetime
 ) -> list[RunRecord]:
-    """The runs' records, every payload a row holds by reference read in (all at once): a
-    record reads the same whether its payloads are inline or in the blob store."""
+    """The runs' records, every payload the rows refer to read in (all at once)."""
     wanted: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -166,6 +161,7 @@ async def _records(
         fields["metadata"] = row.run_metadata or {}
         fields["worked_seconds"] = _worked(row, now)
         for name, column in _REFS.items():
+            fields[name] = None
             if (ref := getattr(row, column)) is not None:
                 wanted.append((fields, name, ref))
         if row.checkpoint_segments is not None:
@@ -232,7 +228,7 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     if to is not RunStatus.PAUSED:
         row.awaiting = row.awaiting_ref = row.assignee = row.awaiting_deadline = None
     if to.final:
-        row.checkpoint = row.checkpoint_ref = row.checkpoint_segments = None
+        row.checkpoint_ref = row.checkpoint_segments = None
 
 
 def _fence(row: RunRow, worker_id: str | None) -> None:
@@ -362,7 +358,6 @@ class RunStore:
                 user_id=record.user_id,
                 workspace_id=record.workspace_id,
                 on_behalf_of=record.on_behalf_of,
-                input=None,
                 input_ref=_dumped(input_ref),
                 deadline=record.deadline,
                 timeout_seconds=record.timeout_seconds,
@@ -426,7 +421,7 @@ class RunStore:
             raise Unprocessable("the interrupt belongs to another run")
         if problem := schema_problem(interrupt.expects):
             raise Unprocessable(problem)
-        checkpoint = await self._checkpoint(tenant_id, pause.bounded_checkpoint())
+        checkpoint = await self._checkpoint(tenant_id, pause.checkpoint)
         awaiting, payload = _asked_without_payload(interrupt)
         payload_ref = await self._put(tenant_id, payload)
         row = await self._locked(tenant_id, run_id, worker_id=None)
@@ -486,7 +481,7 @@ class RunStore:
         answer = await self._payloads.put(tenant_id, _json(resolution))
         question = await self._payloads.put(tenant_id, _json(asked))
         await self._link(run_id, _ANSWER, answer, question)
-        row.last_resolution, row.last_resolution_ref = None, answer.model_dump()
+        row.last_resolution_ref = answer.model_dump()
         self._session.add(
             ResolutionRow(
                 resolution_id=_resolution_id(resolution),
@@ -516,18 +511,13 @@ class RunStore:
         """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
         when the answer is made, so a retried resume sends the same JSON and a second
         answer (another click, another person) never does."""
-        kept = (
-            await self._session.execute(
-                select(ResolutionRow.resolution, ResolutionRow.resolution_ref).where(
-                    ResolutionRow.tenant_id == tenant_id,
-                    ResolutionRow.resolution_id == _resolution_id(resolution),
-                )
+        ref = await self._session.scalar(
+            select(ResolutionRow.resolution_ref).where(
+                ResolutionRow.tenant_id == tenant_id,
+                ResolutionRow.resolution_id == _resolution_id(resolution),
             )
-        ).first()
-        if kept is None:
-            return False
-        inline, ref = kept
-        return (inline if ref is None else await self._payloads.get(ref)) == _json(resolution)
+        )
+        return ref is not None and await self._payloads.get(ref) == _json(resolution)
 
     async def cancel(
         self,
@@ -598,7 +588,7 @@ class RunStore:
             row.settled_by = worker_id
             return await self._flushed(row, now), True
         _move(row, ending.status, now)
-        row.output, row.output_ref = None, _dumped(output_ref)
+        row.output_ref = _dumped(output_ref)
         await self._link(run_id, _OUTPUT, output_ref)
         row.error = _json(_counted(ending.error, row.error_retries))
         row.settled_by = worker_id
@@ -719,7 +709,7 @@ class RunStore:
         """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
         means the lease is gone (it lapsed and the run was re-queued, or the run was
         cancelled or finished): the worker must stop, and nothing is saved."""
-        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
+        checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
@@ -738,7 +728,7 @@ class RunStore:
         progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
         asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
         answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
-        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
+        checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False
@@ -1080,15 +1070,9 @@ class RunStore:
         if after is not None:
             query = query.where(tuple_(*order) > (after["recorded_at"], after["resolution_id"]))
         rows = (await self._session.scalars(query.order_by(*order).limit(limit + 1))).all()
-        refs = [ref for r in rows for ref in (r.interrupt_ref, r.resolution_ref) if ref]
+        refs = (ref for r in rows for ref in (r.interrupt_ref, r.resolution_ref))
         read = iter(await self._payloads.get_many(refs))
-        kept = {
-            r.resolution_id: (
-                next(read) if r.interrupt_ref else r.interrupt,
-                next(read) if r.resolution_ref else r.resolution,
-            )
-            for r in rows
-        }
+        kept = {r.resolution_id: (next(read), next(read)) for r in rows}
         return page_of(
             rows,
             limit=limit,
@@ -1274,7 +1258,6 @@ class RunStore:
                 )
                 if len(linked.all()) != len(added):
                     raise Unprocessable(f"{SEGMENTS} names objects that were never uploaded")
-        row.checkpoint = None
         if checkpoint is None:
             row.checkpoint_ref = row.checkpoint_segments = None
         elif isinstance(checkpoint, list):
