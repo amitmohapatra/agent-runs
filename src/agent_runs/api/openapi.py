@@ -65,8 +65,8 @@ Every listing takes `cursor` and `limit` and answers `Link: <url>; rel="next"` w
 more; the bodies are bare arrays.
 
 ### Limits
-JSON bodies are at most 4 MiB (`413`), a run's `input` and `output` 1 MiB each, a checkpoint
-1 MiB, an artifact 50 MiB. Each tenant's requests draw on one budget, shared by every
+JSON bodies are at most 4 MiB (`413`), a run's `input`, `output` and checkpoint 1 MiB each,
+an artifact 50 MiB. Each tenant's requests draw on one budget, shared by every
 replica (`X-RateLimit-Limit`, `X-RateLimit-Remaining`; `429` when empty).
 """
 

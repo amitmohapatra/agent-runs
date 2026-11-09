@@ -60,8 +60,9 @@ class ServiceSettings(BaseModel):
     #: Request bodies of the JSON routes are refused (413) past this many bytes, counted as
     #: they arrive (chunked bodies too). Artifact uploads have their own bound.
     max_body_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
-    #: The most a run's ``input`` (POST /v1/runs) or ``output`` (finish) may be, as compact
-    #: JSON (413 past it): they live in the run's row, and every read of the run carries them.
+    #: The most a run's ``input`` (POST /v1/runs), ``output`` (finish) or ``checkpoint``
+    #: (pause, heartbeat, release) may be, as compact JSON (413 past it): every read of the run
+    #: carries them.
     max_payload_bytes: int = Field(default=1024 * 1024, ge=1024)
 
     @property

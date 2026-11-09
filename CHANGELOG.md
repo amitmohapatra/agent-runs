@@ -10,8 +10,10 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
   output, answers, the question's payload, checkpoints) lives in the blob store and the rows
   hold references only: migration `a7c1d2e3f4b5` replaces `agent_runs.input`, `output`,
   `last_resolution`, `checkpoint` and `run_resolutions.interrupt`, `resolution` with their
-  `*_ref` columns. There is no inline read path and no `agent-runs-payloads` command. Reset a
-  dev database: `alembic downgrade base && alembic upgrade head`.
+  `*_ref` columns. There is no inline read path and no `agent-runs-payloads` command. A
+  checkpoint is bounded by `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), as `input` and `output`
+  are (`MAX_CHECKPOINT_BYTES` is gone). Reset a dev database:
+  `alembic downgrade base && alembic upgrade head`.
 * **The `runs` settings group is now `limits`.** `RUNS__LIMITS__MAX_RUN_SECONDS`,
   `CONCURRENCY_PER_KEY`, `MAX_RUNNING_PER_TENANT` and `RETENTION_DAYS` replace the
   `RUNS__RUNS__*` names (`Settings.limits`). For this release the old names still work, each

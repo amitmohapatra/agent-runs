@@ -12,12 +12,11 @@ from trellis.contracts.ids import now
 from agent_runs.config.constants import (
     LAPSE_RETRY_BASE,
     LAPSE_RETRY_CAP,
-    MAX_CHECKPOINT_BYTES,
     MAX_LEASE_LAPSES,
 )
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore
-from tests.conftest import backoff_passed, pause, resolution, started
+from tests.conftest import SETTINGS, backoff_passed, pause, resolution, started
 
 
 def claim(worker: str = "w1", agents: tuple[str, ...] = ("triage",), lease: int = 30) -> dict:
@@ -328,7 +327,7 @@ async def test_cancelling_a_paused_run_clears_the_checkpoint(client) -> None:
 async def test_a_checkpoint_past_the_bound_is_refused_and_nothing_moves(client) -> None:
     await queued(client)
     rid = (await client.post("/v1/runs/claim", json=claim())).json()["run"]["run_id"]
-    huge = {"blob": "x" * MAX_CHECKPOINT_BYTES}
+    huge = {"blob": "x" * SETTINGS.service.max_payload_bytes}
     refused = await client.post(
         f"/v1/runs/{rid}/pause", params={"worker_id": "w1"}, json=pause(rid, huge)
     )
@@ -492,7 +491,7 @@ async def test_only_the_lease_holder_saves_progress_and_within_the_bound(client)
         f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w2", "checkpoint": {"x": 1}}
     )
     assert (stranger.status_code, stranger.json()["code"]) == (409, "LEASE_LOST")
-    huge = {"blob": "x" * (MAX_CHECKPOINT_BYTES + 1)}
+    huge = {"blob": "x" * (SETTINGS.service.max_payload_bytes + 1)}
     too_big = await client.post(
         f"/v1/runs/{rid}/heartbeat", json={"worker_id": "w1", "checkpoint": huge}
     )

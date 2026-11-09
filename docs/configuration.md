@@ -38,7 +38,7 @@ filesystem blob store is for one machine.
 | `RUNS__SERVICE__WORKERS` | one per CPU, 1 to 8 | derived | API | uvicorn worker processes; each keeps its own key cache and metrics (rate-limit budgets are shared, in the database) | `4` |
 | `RUNS__SERVICE__GRACEFUL_SHUTDOWN_SECONDS` | `20` | yes | API | on `SIGTERM`, how long requests in flight may finish before they are closed | `30` |
 | `RUNS__SERVICE__MAX_BODY_BYTES` | `4194304` (4 MiB) | yes | API | a JSON body past this is `413`, counted as it arrives (chunked too); artifacts have their own 50 MiB | `8388608` |
-| `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` (1 MiB) | yes | API | a run's `input` or `output` past this (compact JSON) is `413` | `2097152` |
+| `RUNS__SERVICE__MAX_PAYLOAD_BYTES` | `1048576` (1 MiB) | yes | API | a run's `input`, `output` or `checkpoint` past this (compact JSON) is `413` | `2097152` |
 
 ## The Memory Service (`RUNS__MEMORY__*`)
 

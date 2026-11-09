@@ -59,7 +59,6 @@ from agent_runs.domain.runs import (
     RunFinish,
     RunPause,
     RunSummary,
-    bounded_checkpoint,
 )
 from agent_runs.keys import KeyInfo
 from agent_runs.retry import backoff, jittered
@@ -422,7 +421,7 @@ class RunStore:
             raise Unprocessable("the interrupt belongs to another run")
         if problem := schema_problem(interrupt.expects):
             raise Unprocessable(problem)
-        checkpoint = await self._checkpoint(tenant_id, pause.bounded_checkpoint())
+        checkpoint = await self._checkpoint(tenant_id, pause.checkpoint)
         awaiting, payload = _asked_without_payload(interrupt)
         payload_ref = await self._put(tenant_id, payload)
         row = await self._locked(tenant_id, run_id, worker_id=None)
@@ -710,7 +709,7 @@ class RunStore:
         """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
         means the lease is gone (it lapsed and the run was re-queued, or the run was
         cancelled or finished): the worker must stop, and nothing is saved."""
-        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
+        checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
@@ -729,7 +728,7 @@ class RunStore:
         progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
         asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
         answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
-        checkpoint = await self._checkpoint(tenant_id, bounded_checkpoint(request.checkpoint))
+        checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False

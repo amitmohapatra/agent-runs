@@ -44,11 +44,6 @@ MAX_CACHED_KEYS: Final = 10_000
 DEFAULT_PAGE: Final = 50
 MAX_PAGE: Final = 500
 
-#: The largest executor checkpoint a pause may carry, serialized as compact JSON. A resume
-#: journal and a framework's resume state fit well inside it; anything bigger belongs in an
-#: artifact the checkpoint refers to.
-MAX_CHECKPOINT_BYTES: Final = 1024 * 1024
-
 # --------------------------------------------------------------------------- the database
 
 #: Connections one process (an API worker, the ticker) opens when no budget is set
