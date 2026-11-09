@@ -816,8 +816,7 @@
           "APPROVAL",
           "REVIEW",
           "CHOICE",
-          "AUTH",
-          "PAUSE"
+          "AUTH"
         ],
         "title": "InterruptReason",
         "type": "string"
@@ -1912,17 +1911,6 @@
             "title": "Updated At",
             "type": "string"
           },
-          "usage": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RunUsage"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "What the run has used so far (model and tool calls, commands, tokens, cost), as its executor last saved it; None until it saved any."
-          },
           "user_id": {
             "anyOf": [
               {
@@ -2057,55 +2045,6 @@
           "updated_at"
         ],
         "title": "RunSummary",
-        "type": "object"
-      },
-      "RunUsage": {
-        "description": "What a run has used so far, its sub-agents' runs included, as its executor counts it\nand saves it with its progress, its pause and its ending.",
-        "properties": {
-          "cached_tokens": {
-            "default": 0,
-            "description": "Input tokens read from a cache.",
-            "minimum": 0.0,
-            "title": "Cached Tokens",
-            "type": "integer"
-          },
-          "commands": {
-            "default": 0,
-            "description": "Tool calls that ran a shell or sandbox command.",
-            "minimum": 0.0,
-            "title": "Commands",
-            "type": "integer"
-          },
-          "cost": {
-            "default": 0.0,
-            "description": "US dollars, as the model gateway reported them.",
-            "minimum": 0.0,
-            "title": "Cost",
-            "type": "number"
-          },
-          "model_calls": {
-            "default": 0,
-            "description": "Model calls made.",
-            "minimum": 0.0,
-            "title": "Model Calls",
-            "type": "integer"
-          },
-          "tokens": {
-            "default": 0,
-            "description": "Input and output tokens of every call.",
-            "minimum": 0.0,
-            "title": "Tokens",
-            "type": "integer"
-          },
-          "tool_calls": {
-            "default": 0,
-            "description": "Tool calls made, commands included.",
-            "minimum": 0.0,
-            "title": "Tool Calls",
-            "type": "integer"
-          }
-        },
-        "title": "RunUsage",
         "type": "object"
       },
       "Schedule": {

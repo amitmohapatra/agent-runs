@@ -6,6 +6,9 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Built on trellis-contracts 0.7.0.** `docs/openapi.json` no longer lists the run inbox
+  names 0.7.0 removed (`InterruptReason.PAUSE`, `RunRecord.usage`, `RunMessage`); the service
+  never used them. Requires `trellis-contracts>=0.6.2,<0.8`, as before. Nothing to do.
 * **Storage is reference-only; no migration (dev databases reset).** Every run payload (input,
   output, answers, the question's payload, checkpoints) lives in the blob store and the rows
   hold references only: migration `a7c1d2e3f4b5` replaces `agent_runs.input`, `output`,
