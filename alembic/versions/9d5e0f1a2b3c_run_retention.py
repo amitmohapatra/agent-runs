@@ -1,4 +1,4 @@
-"""runs: retention of ended runs (``RUNS__RUNS__RETENTION_DAYS``)
+"""runs: retention of ended runs (``RUNS__LIMITS__RETENTION_DAYS``)
 
 ``ix_runs_ended`` serves the ticker's sweep of runs that ended before the retention window,
 which it deletes with their resolutions (their events go by ``ON DELETE CASCADE``). Nothing

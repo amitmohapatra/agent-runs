@@ -1,8 +1,7 @@
-"""Run payloads are written by reference: a run's rows hold no payload, reads answer exactly
-what they answered inline, a checkpoint may be a list of segments the worker uploaded, an
-unchanged save stores nothing new, a write that never commits leaves only an orphan the sweep
-deletes, an ended run's events become one object, and a run written before the change-over
-goes on."""
+"""Run payloads are written by reference: a run's rows hold no payload, reads answer the JSON
+that was sent, a checkpoint may be a list of segments the worker uploaded, an unchanged save
+stores nothing new, a write that never commits leaves only an orphan the sweep deletes, and an
+ended run's events become one object."""
 
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ from trellis.contracts.ids import now
 from trellis.runs.payloads import FRAMED_MEDIA_TYPE, SEGMENTS, decode, encode, frames, ref_of
 
 from agent_runs.api.routers.artifacts import MAX_READ_OBJECTS
-from agent_runs.blob.payloads import ORPHAN_AGE, payloads_of
+from agent_runs.blob.payloads import ORPHAN_AGE
 from agent_runs.config.settings import BlobSettings
 from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import (
@@ -215,7 +214,7 @@ async def test_a_store_that_does_not_answer_refuses_the_save_and_keeps_the_last(
     assert (await client.get(f"/v1/runs/{run_id}")).json()["checkpoint"] == {"n": 1}
 
 
-# ------------------------------------------------------------------ before and after
+# ------------------------------------------------------------------ webhook bodies
 async def test_a_webhook_body_is_sent_as_it_was_announced(
     app: Any, client: Any, ticker: Any, receiver: Any
 ) -> None:
@@ -223,33 +222,15 @@ async def test_a_webhook_body_is_sent_as_it_was_announced(
         "/v1/webhooks", json={"url": "http://hooks.test/runs", "events": ["run.paused"]}
     )
     run = (await client.post("/v1/runs", json=started())).json()
-    await client.post(
-        f"/v1/runs/{run['run_id']}/pause",
-        json=pause(run["run_id"], payload={"z": [1, {"b": "ü", "a": 2}], "a": None}),
-    )
+    payload = {"z": [1, {"b": "ü", "a": 2}], "a": None}
+    await client.post(f"/v1/runs/{run['run_id']}/pause", json=pause(run["run_id"], payload=payload))
     async with app.state.sessions() as db:
         delivery = (await db.scalars(select(WebhookDeliveryRow))).one()
         assert delivery.payload_ref is not None, "the body refers to the run's payload"
         assert "payload" not in delivery.payload["data"]["run"]["awaiting"]
-        inline = json.loads(json.dumps(delivery.payload))
-        inline["data"]["run"]["awaiting"]["payload"] = await payloads_of(db).get(
-            delivery.payload_ref
-        )
     await ticker.tick()
-    sent = receiver.received[-1].content
-    async with app.state.sessions() as db:  # the same delivery as the last release kept it
-        db.add(
-            WebhookDeliveryRow(
-                delivery_id="dlv_inline",
-                webhook_id=delivery.webhook_id,
-                payload=inline,
-                attempts=0,
-                next_attempt_at=now(),
-            )
-        )
-        await db.commit()
-    await ticker.tick()
-    assert len(receiver.received) == 2 and receiver.received[-1].content == sent
+    sent = json.loads(receiver.received[-1].content)
+    assert sent["data"]["run"]["awaiting"]["payload"] == payload
 
 
 # ------------------------------------------------------------------ event compaction
@@ -348,4 +329,7 @@ async def test_a_save_that_adds_a_segment_costs_the_same_however_many_there_are(
     finally:
         event.remove(app.state.engine.sync_engine, "before_cursor_execute", count)
     assert len(set(costs[1:])) == 1, costs
+    # the rate limit, the run's row locked, the new segment linked (checked stored), the row
+    # written once: as many as a whole checkpoint's save took before references, plus the link
+    assert costs[-1] == 4, costs
     assert await _links(app, run_id) == {"checkpoint": 30}

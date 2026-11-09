@@ -11,7 +11,7 @@ means in practice, and what to do.
 | `401 AUTHENTICATION` | `AuthenticationError` | no `X-API-Key`, or one the Memory Service does not know (revoked, expired, mistyped) | set `TRELLIS_API_KEY` (or `RunsClient(api_key=)`) to a key the Memory Service issued; check `RUNS__MEMORY__URL` points at the registry that issued it |
 | `400 VALIDATION` (no tenant) | `ValidationError` | a platform key sent no `X-Trellis-Tenant` | pass `tenant=` to the call or `RunsClient(tenant=)` |
 | `403 AUTHORIZATION` | `AuthorizationError` | the tenant is suspended; the body names another tenant; `on_behalf_of` is someone the key may not act for; an answer or cancel the key may not give; an artifact for a paused run from a non-`service` key | the detail says which. For answers, see [who may answer](../README.md#who-may-answer-a-paused-run) |
-| `404 NOT_FOUND` | `NotFoundError` (reads by id answer `None`) | the record is in another tenant, or was purged by retention | check the key's tenant; `RUNS__RUNS__RETENTION_DAYS` deletes ended runs |
+| `404 NOT_FOUND` | `NotFoundError` (reads by id answer `None`) | the record is in another tenant, or was purged by retention | check the key's tenant; `RUNS__LIMITS__RETENTION_DAYS` deletes ended runs |
 | `409 LEASE_LOST` | `LeaseLostError` | the worker's lease lapsed (no heartbeat within it), or the run was cancelled, paused, finished, or ended past its deadline or working time | **stop working the run**; the SDK's `Worker` cancels the handler. Heartbeat every third of the lease; raise `lease_seconds` for long steps |
 | `409 CONFLICT` | `ConflictError` | an illegal transition (finishing a run that ended), a second answer to a question, a cancel of an ended run, an idempotency key reused with another start, a fire of a paused schedule, a 21st webhook, a redelivery of a delivery still owed | read the run (`GET /v1/runs/{id}`): it has moved on. A resend of the very same resolution or finish is not a conflict |
 | `413 PAYLOAD_TOO_LARGE` | `PayloadTooLargeError` | a body past 4 MiB, a run's `input` or `output` past 1 MiB, a `checkpoint` past 1 MiB, an artifact past 50 MiB | put large payloads in an artifact (`artifacts.upload`) and pass its `ArtifactRef` |
@@ -34,9 +34,9 @@ GCS bucket: set `RUNS__BLOB__BUCKET` (the filesystem blob store is for a single 
 * no worker claims its `agent_id` (`Worker(..., ["the-agent-id"])`);
 * its `available_at` has not passed: it is waiting out a retry backoff (5 s doubling after a
   lapse, 10 s doubling after a retryable error);
-* another run with the same `concurrency_key` is `RUNNING` (`RUNS__RUNS__CONCURRENCY_PER_KEY`,
+* another run with the same `concurrency_key` is `RUNNING` (`RUNS__LIMITS__CONCURRENCY_PER_KEY`,
   default 1);
-* the tenant holds `RUNS__RUNS__MAX_RUNNING_PER_TENANT` runs already.
+* the tenant holds `RUNS__LIMITS__MAX_RUNNING_PER_TENANT` runs already.
 
 A claim then answers `204`.
 
@@ -49,7 +49,7 @@ retryable error and is being retried (up to 3 times). `attempt` counts these.
 
 **A run ended `TIMEOUT` with `run_deadline` or `run_timeout`.** Past its `deadline` (queue and
 waiting time count), or past its working-time limit (`timeout_seconds`, or
-`RUNS__RUNS__MAX_RUN_SECONDS`; only time `RUNNING` counts).
+`RUNS__LIMITS__MAX_RUN_SECONDS`; only time `RUNNING` counts).
 
 **A paused run timed out or changed assignee.** The interrupt's `deadline` passed: the ticker
 moves it to `escalate_to` once, or ends it `TIMEOUT` when there is none.

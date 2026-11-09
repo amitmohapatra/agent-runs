@@ -4,7 +4,7 @@
    queueing its run idempotently on ``(schedule_id, fire_time)``);
 2. time out runs not yet ended (queued, running or paused) past their own deadline;
 3. time out running runs whose working time passed their limit (their ``timeout_seconds``, or
-   the service's ``RUNS__RUNS__MAX_RUN_SECONDS``, the lesser);
+   the service's ``RUNS__LIMITS__MAX_RUN_SECONDS``, the lesser);
 4. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
    lapse);
 5. escalate or time out interrupts past their deadline;
@@ -13,7 +13,7 @@
 7. drop the dead deliveries older than their retention (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``);
 8. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
    row: a blob delete that fails leaves the row for the next tick);
-9. when the deployment sets a retention (``RUNS__RUNS__RETENTION_DAYS``), delete the runs that
+9. when the deployment sets a retention (``RUNS__LIMITS__RETENTION_DAYS``), delete the runs that
    ended before it, with their resolutions and events (after their artifacts).
 
 Steps 2 to 5 write the webhook events they cause into the outbox in their own transaction.
@@ -307,9 +307,9 @@ async def run() -> None:
             webhooks,
             blobs,
             heartbeat_path=beat,
-            max_run_seconds=settings.runs.max_run_seconds,
+            max_run_seconds=settings.limits.max_run_seconds,
             dead_retention=settings.webhooks.dead_retention,
-            run_retention=settings.runs.retention,
+            run_retention=settings.limits.retention,
         )
         await ticker.run_forever(stop)
     finally:

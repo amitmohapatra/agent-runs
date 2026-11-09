@@ -128,7 +128,7 @@ flowchart LR
 | Rate limit | `api/ratelimit.py` `TenantRateLimiter`, `api/deps.py` `_within_budget` | one budget per tenant in PostgreSQL (`rate_limit_buckets`, a GCRA bucket moved by one upsert under the database's clock, on its own connection), shared by every worker of every replica; `429` with `Retry-After`, `X-RateLimit-*` on every counted response |
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller`; `claimer`, `Claimer` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for`. A claim (`claimer`) also takes a platform key with no tenant: it claims from every tenant's queue |
-| Claim order | `store/runs.py` `RunStore.claim`, `_next_queued`, `_tenant_has_room`, `_key_has_room` | the next queued run: the tenant whose workers hold fewest runs of the claimed agents first (fair share), then `priority`, then `queued_at`, among runs with room under their `concurrency_key` (`RUNS__RUNS__CONCURRENCY_PER_KEY`) and their tenant's cap (`RUNS__RUNS__MAX_RUNNING_PER_TENANT`); the room recounted under `pg_try_advisory_xact_lock` on the key or tenant, a key another claim is counting passed over like a locked row |
+| Claim order | `store/runs.py` `RunStore.claim`, `_next_queued`, `_tenant_has_room`, `_key_has_room` | the next queued run: the tenant whose workers hold fewest runs of the claimed agents first (fair share), then `priority`, then `queued_at`, among runs with room under their `concurrency_key` (`RUNS__LIMITS__CONCURRENCY_PER_KEY`) and their tenant's cap (`RUNS__LIMITS__MAX_RUNNING_PER_TENANT`); the room recounted under `pg_try_advisory_xact_lock` on the key or tenant, a key another claim is counting passed over like a locked row |
 | Run events | `store/runs.py` `RunStore.append_events`, `events`; `api/routers/runs.py` `stream_events`, `_follow` | each run's event log (`run_events`): appends fenced like a heartbeat, a position per event under the run's row lock, repeats (`attempt`, `sequence`) dropped; reads by position, and a server-sent event stream that polls in short transactions of its own (`EVENT_POLL_SECONDS`), keeps quiet connections open (`EVENT_KEEPALIVE_SECONDS`), ends with `end` once the run has, and lasts at most `EVENT_STREAM_SECONDS` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Answering | `answering.py` `require_may_answer`, `require_may_cancel` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question. `RunStore.cancel` applies the same rule (as any principal the key may act for) |
@@ -194,7 +194,7 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`) and
   `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
   `time_out_overworked` ends a run whose working time passed its limit (`timeout_seconds`
-  or `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser) `TIMEOUT` (`run_timeout`); `_lease` tells
+  or `RUNS__LIMITS__MAX_RUN_SECONDS`, the lesser) `TIMEOUT` (`run_timeout`); `_lease` tells
   the worker the time left (`remaining_seconds`).
 - Leaving `PAUSED` clears `awaiting`, `assignee`, `awaiting_deadline`; leaving `QUEUED`
   clears `available_at`; any ending clears `checkpoint` and starts the run's artifacts'
@@ -224,10 +224,10 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   that continues the run, and a requeue, announce nothing.
 - `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
 - A claim takes a run only with room (`RunStore.claim`): fewer `RUNNING` runs of its
-  tenant share its `concurrency_key` than `RUNS__RUNS__CONCURRENCY_PER_KEY`, and fewer runs
-  of its tenant are leased than `RUNS__RUNS__MAX_RUNNING_PER_TENANT`. A run kept in its
+  tenant share its `concurrency_key` than `RUNS__LIMITS__CONCURRENCY_PER_KEY`, and fewer runs
+  of its tenant are leased than `RUNS__LIMITS__MAX_RUNNING_PER_TENANT`. A run kept in its
   caller's process takes its key's place while it runs, but is never held back.
-- With `RUNS__RUNS__RETENTION_DAYS` set, the ticker deletes runs that ended before it
+- With `RUNS__LIMITS__RETENTION_DAYS` set, the ticker deletes runs that ended before it
   (`RunStore.purge_ended`, `ix_runs_ended`) with their `run_resolutions` and `run_events`; a
   run whose artifacts are still kept waits for them.
 - `checkpoint` is written by a pause and, as progress, by the lease holder's heartbeat or
@@ -621,7 +621,7 @@ a run's events.
    `RUNNING`, across attempts: kept on the run (`worked_seconds`) as each stretch ends, so a
    crash does not reset it, and time queued or waiting for a person does not count. The
    limit is the caller's `RunStart.timeout_seconds` or the operator's
-   `RUNS__RUNS__MAX_RUN_SECONDS`, the lesser; neither set, there is none. Every lease (claim,
+   `RUNS__LIMITS__MAX_RUN_SECONDS`, the lesser; neither set, there is none. Every lease (claim,
    heartbeat) says the time left (`remaining_seconds`), so a worker can stop in time; one
    that does not is fenced off as for a deadline.
 4. **Leases.** A `RUNNING` run whose lease lapsed (its worker stopped heartbeating) goes
@@ -638,7 +638,7 @@ a run's events.
    (7) are dropped.
 8. **Artifacts.** Artifacts of runs that ended more than `ARTIFACT_RETENTION` (7 days) ago
    are deleted: the blob, then the record.
-9. **Run retention.** Only when the operator sets `RUNS__RUNS__RETENTION_DAYS`: runs that
+9. **Run retention.** Only when the operator sets `RUNS__LIMITS__RETENTION_DAYS`: runs that
    ended longer ago are deleted with their resolutions and events, a run with artifacts
    still kept after them. Unset, every run is kept.
 

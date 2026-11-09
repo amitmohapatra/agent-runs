@@ -6,38 +6,39 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
-* **The inline payload columns are dropped (contract step).** `agent_runs.input`, `output`,
-  `last_resolution`, `checkpoint` and `run_resolutions.interrupt`, `resolution` go; every
-  payload is read from the blob store by its reference, and `agent-runs-payloads` is removed.
-  **Run `agent-runs-payloads clear` (the previous release) before upgrading**: migration
-  `b9e3f4a5c6d7` refuses while any payload is still inline. Rolling back: redeploy the previous
-  release after `alembic downgrade` (the columns come back empty; it reads the references).
+* **Storage is reference-only; no migration (dev databases reset).** Every run payload (input,
+  output, answers, the question's payload, checkpoints) lives in the blob store and the rows
+  hold references only: migration `a7c1d2e3f4b5` replaces `agent_runs.input`, `output`,
+  `last_resolution`, `checkpoint` and `run_resolutions.interrupt`, `resolution` with their
+  `*_ref` columns. There is no inline read path and no `agent-runs-payloads` command. Reset a
+  dev database: `alembic downgrade base && alembic upgrade head`.
+* **The `runs` settings group is now `limits`.** `RUNS__LIMITS__MAX_RUN_SECONDS`,
+  `CONCURRENCY_PER_KEY`, `MAX_RUNNING_PER_TENANT` and `RETENTION_DAYS` replace the
+  `RUNS__RUNS__*` names (`Settings.limits`). For this release the old names still work, each
+  with a one-line warning at startup naming its new name, and the new name wins if both are set.
+  The next release removes the old names.
+* **A segment's save is four statements.** The new segment is checked stored and linked in one
+  statement, and the run's row is written once (the links before it, no autoflush between).
+  Nothing to do.
 * **A checkpoint's segments read back in one request.** `POST /v1/payloads/read` answers
   several payload objects at once (read from the store in parallel, each verified; SDK
   `artifacts.get_payloads`), so a resume is one round trip. A save that adds a segment checks
   and links only the new one, its cost independent of the run's length. Small objects are
   read in one call (`BlobStore.get`, `read_whole`). Nothing to do.
-* **`agent-runs-payloads copy|verify|clear` moves old inline payloads to the blob store.**
-  Run it once after deploying the release that writes references: `copy` stores what earlier
-  releases kept inline and sets the references (readers use them at once), `verify` reads
-  every copy back and compares, `clear` clears the inline values only when every copy matches.
-  Batched and resumable; it exits 1 on any mismatch. The next release drops the inline
-  columns, so run `clear` before deploying it.
 * **Run payloads are written by reference.** A run's input, output, the payload its pause
   waits on, its answers and its checkpoint go to the blob store before any row refers to
   them; reads answer the same JSON (a webhook's body the same bytes). A checkpoint may be a
   list of segments the worker uploads (`POST /v1/runs/{run_id}/payloads`, read back with
   `GET /v1/payloads/{sha256}`; SDK `artifacts.put_payload` / `get_payload`), so a save sends
   only what changed. An ended run's events become one object (the ticker). Artifact retention
-  is a setting, `RUNS__BLOB__RETENTION_DAYS` (7, as before). Old rows keep working; nothing
-  to do. Set `RUNS__RUNS__RETENTION_DAYS` to bound what is kept.
-* **Run payloads can be read by reference (expand step).** Every payload column gets a
-  nullable `*_ref` (a `PayloadRef` to a zstd-compressed JSON object in the blob store, keyed by its
-  SHA-256 under the tenant, hash-sharded as the Memory Service's archive is), and every reader (a run, the listing, resolutions, events, a
-  webhook's body) takes either, answering the same JSON. Nothing writes references yet. A
-  ticker sweep deletes payload objects no row refers to once a day old. Migration
-  `a7c1d2e3f4b5` (adds columns and two tables). SDK: `trellis.runs.payloads` (the format).
-  Nothing to do; roll back by redeploying the previous release.
+  is a setting, `RUNS__BLOB__RETENTION_DAYS` (7, as before). Set
+  `RUNS__LIMITS__RETENTION_DAYS` to bound what is kept.
+* **Run payloads are stored by reference.** Every payload has a `*_ref` (a `PayloadRef` to a
+  zstd-compressed JSON object in the blob store, keyed by its SHA-256 under the tenant,
+  hash-sharded as the Memory Service's archive is), read by a run, the listing, resolutions,
+  events and a webhook's body. A ticker sweep deletes payload objects no row refers to once a
+  day old. Migration `a7c1d2e3f4b5` (the `*_ref` columns and two tables). SDK:
+  `trellis.runs.payloads` (the format).
 * **One run of a schedule at a time, spread over the minute.** A tick while the schedule's
   last run is queued, running or paused is skipped (the schedule waits for its next
   occurrence), so workers down across several ticks run it once on recovery. Each schedule

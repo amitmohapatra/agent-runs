@@ -107,8 +107,7 @@ def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
 
 def _with_payload(body: dict[str, Any], payload: Any) -> dict[str, Any]:
     """The body as it was announced: the run's interrupt payload, kept by reference, back in
-    its place, the interrupt's keys in the order ``jsonb`` keeps them (as an inline body
-    reads back)."""
+    its place, the interrupt's keys in the order ``jsonb`` keeps them."""
     run = body["data"]["run"]
     awaiting = jsonb_order({**run["awaiting"], "payload": payload})
     return {**body, "data": {**body["data"], "run": {**run, "awaiting": awaiting}}}
