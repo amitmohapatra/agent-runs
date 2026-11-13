@@ -733,6 +733,49 @@ async def test_an_idle_worker_backs_off_up_to_a_cap(monkeypatch: pytest.MonkeyPa
     assert worker_module.IDLE_MAX_SECONDS / 2 <= capped <= worker_module.IDLE_MAX_SECONDS
 
 
+@pytest.mark.parametrize(
+    ("jitter", "expected"), [("low", [0.25, 0.5, 1.0, 5.0]), ("high", [0.5, 1.0, 2.0, 10.0])]
+)
+async def test_the_idle_wait_is_the_documented_doubling_with_equal_jitter(
+    monkeypatch: pytest.MonkeyPatch, jitter: str, expected: list[float]
+) -> None:
+    """IDLE_SECONDS (0.5 s) doubling per empty round up to IDLE_MAX_SECONDS (10 s), half of
+    it fixed and half random: at either end of the jitter the waits are exact."""
+    waits: list[float] = []
+    real_timeout = asyncio.timeout
+
+    def recording(delay: float | None) -> Any:
+        waits.append(delay or 0.0)
+        return real_timeout(0)
+
+    monkeypatch.setattr("trellis.runs.worker.asyncio.timeout", recording)
+    pick = (lambda low, high: low) if jitter == "low" else (lambda low, high: high)
+    monkeypatch.setattr("trellis.runs.worker.random.uniform", pick)
+    worker = Worker(Store(), nothing, ["triage"])
+    for rounds in (1, 2, 3, 30):
+        await worker._idle(rounds)
+    assert waits == expected
+
+
+async def test_work_resets_the_idle_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each empty round waits longer; a claim that got work starts the count again."""
+    store = Store()
+    rounds: list[int] = []
+    worker = Worker(store, nothing, ["triage"])
+
+    async def idle(n: int) -> None:
+        rounds.append(n)
+        if len(rounds) == 2:
+            store.queue.append(run())  # work arrives after the second empty round
+        if len(rounds) == 4:
+            worker.stop()
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(worker, "_idle", idle)
+    await asyncio.wait_for(worker.run(), 5)
+    assert rounds == [1, 2, 1, 2]
+
+
 async def test_a_stop_cuts_an_idle_wait_short() -> None:
     worker = Worker(Store(), nothing, ["triage"])
     idling = asyncio.create_task(worker._idle(30))  # up to 10 s
