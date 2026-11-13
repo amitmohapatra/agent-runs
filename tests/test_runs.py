@@ -72,6 +72,26 @@ async def test_a_run_id_another_tenant_holds_is_a_conflict_not_a_read(client, ot
         assert leak not in theirs.text, leak
 
 
+async def test_a_known_run_id_under_a_new_idempotency_key_is_the_same_run(
+    client, other_tenant
+) -> None:
+    """Either half of the idempotency promise is enough: a start whose ``run_id`` exists
+    answers ``200`` with that run even when it also sends a key nothing has used, and the key
+    mints no second run. Another tenant's run id stays a conflict, key or no key."""
+    first = (await client.post("/v1/runs", json=started(run_id="run_keyed"))).json()
+    again = await client.post(
+        "/v1/runs", json=started(run_id="run_keyed", idempotency_key="fresh-key")
+    )
+    assert again.status_code == 200
+    assert again.json()["run_id"] == first["run_id"] and again.json()["idempotency_key"] is None
+    assert len((await client.get("/v1/runs")).json()) == 1
+    theirs = await other_tenant.post(
+        "/v1/runs",
+        json=started(tenant_id="globex", run_id="run_keyed", idempotency_key="fresh-key"),
+    )
+    assert (theirs.status_code, theirs.json()["code"]) == (409, "CONFLICT")
+
+
 async def test_two_tenants_may_use_the_same_idempotency_key(client, other_tenant) -> None:
     body = started(idempotency_key="nightly")
     mine = (await client.post("/v1/runs", json=body)).json()
@@ -267,6 +287,11 @@ async def test_an_ending_that_is_not_one_or_a_success_with_an_error_is_refused(c
     assert (
         await client.post(f"/v1/runs/{rid}/finish", json={"status": "PAUSED"})
     ).status_code == 422
+    # the states a run lives in are not endings either: finish never requeues or restarts it
+    for living in ("QUEUED", "RUNNING"):
+        refused = await client.post(f"/v1/runs/{rid}/finish", json={"status": living})
+        assert (refused.status_code, refused.json()["code"]) == (422, "VALIDATION"), living
+    assert (await client.get(f"/v1/runs/{rid}")).json()["status"] == "RUNNING"
     with_error = {"status": "SUCCESS", "error": {"code": "x"}}
     assert (await client.post(f"/v1/runs/{rid}/finish", json=with_error)).status_code == 422
 
