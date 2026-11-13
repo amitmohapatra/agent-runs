@@ -295,6 +295,8 @@ async def test_iterate_stops_after_max_pages(runs: RunsClient) -> None:
     route = respx.get(f"{URL}/v1/runs").respond(200, json=[summary()], headers={"Link": NEXT})
     seen = [s async for s in runs.iterate(assignee="user:alice", tenant="acme", max_pages=3)]
     assert len(seen) == 3 and route.call_count == 3
+    # by default every run is listed, sub-agents' included
+    assert all("top_level" not in call.request.url.params for call in route.calls)
 
 
 @respx.mock
