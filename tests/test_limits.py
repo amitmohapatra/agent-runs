@@ -61,6 +61,22 @@ async def test_a_chunked_body_past_the_cap_is_counted_and_refused(small) -> None
     assert (await small.get("/v1/runs")).json() == []
 
 
+async def test_a_chunked_body_is_held_to_the_body_cap_to_the_byte(small) -> None:
+    """The body cap counts what arrives, not what the run keeps: blank JSON padding makes a
+    body past 4 KiB whose run is tiny, so only the body count can refuse it. Exactly the cap
+    goes through; one byte more does not."""
+    head, tail = b'{"tenant_id": "acme", "agent_id": "triage"', b"}"
+    for size, status in ((4096, 201), (4097, 413)):
+        padding = b" " * (size - len(head) - len(tail))
+        response = await small.post(
+            "/v1/runs",
+            content=_chunks(head, padding, tail),
+            headers={"content-type": "application/json"},
+        )
+        assert "content-length" not in response.request.headers, "sent chunked"
+        assert response.status_code == status, (size, response.text)
+
+
 async def test_a_chunked_body_within_the_cap_goes_through(small) -> None:
     body = _chunks(b'{"tenant_id": "acme", ', b'"agent_id": "triage"}')
     response = await small.post(
@@ -254,6 +270,16 @@ async def test_no_budget_headers_when_the_limit_is_off(migrated, memory, blobs) 
             response = await c.get("/v1/runs")
             assert response.status_code == 200
             assert "x-ratelimit-limit" not in response.headers
+
+
+async def test_a_budget_of_one_a_minute_is_a_limit_not_off(migrated, memory, blobs) -> None:
+    """Only ``0`` turns the limit off: the smallest budget there is still limits."""
+    settings = _settings(rate_limit=RateLimitSettings(per_minute=1, burst=1))
+    async with serving(settings, memory, blobs) as application, client_of(application) as c:
+        first = await c.get("/v1/runs")
+        assert (first.status_code, first.headers["x-ratelimit-limit"]) == (200, "1")
+        refused = await c.get("/v1/runs")
+        assert (refused.status_code, refused.headers["retry-after"]) == (429, "60")
 
 
 async def _elapse(app: Any, seconds: float) -> None:
