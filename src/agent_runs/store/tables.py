@@ -97,6 +97,10 @@ class RunRow(Base):
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(200))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: who holds a run kept in its caller's process (a heartbeat's ``worker_id``), and until
+    #: when: past it the ticker ends the run ERROR (``end_abandoned``). Set only while RUNNING
+    holder: Mapped[str | None] = mapped_column(String(200))
+    held_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: the worker_id whose pause or finish made the current state (null: no worker), so a
     #: repeat of that call answers the stored run instead of a conflict
     settled_by: Mapped[str | None] = mapped_column(String(200))
@@ -131,6 +135,12 @@ class RunRow(Base):
             "status",
             "lease_expires_at",
             postgresql_where=text("lease_expires_at IS NOT NULL"),
+        ),
+        # the hold sweep: RUNNING runs kept in their caller's process whose hold lapsed
+        Index(
+            "ix_runs_held",
+            "held_until",
+            postgresql_where=text("status = 'RUNNING' AND held_until IS NOT NULL"),
         ),
         # the escalation sweep: PAUSED runs past the interrupt's deadline
         Index(

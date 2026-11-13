@@ -521,7 +521,7 @@
       },
       "HeartbeatRequest": {
         "additionalProperties": false,
-        "description": "Extend the lease, and optionally save a progress ``checkpoint``: the executor's resume\njournal as it stands (tool calls done and their outputs), so the attempt after a worker\ncrash resumes from it instead of repeating side effects. It replaces the run's\ncheckpoint (absent: kept as it is), has the pause checkpoint's bound, and comes back on\nthe next claim and every read.",
+        "description": "Extend the lease (or hold a run kept in the caller's process), and optionally save a\nprogress ``checkpoint``: the executor's resume journal as it stands (tool calls done and\ntheir outputs), so the attempt after a worker crash resumes from it instead of repeating\nside effects. It replaces the run's\ncheckpoint (absent: kept as it is), has the pause checkpoint's bound, and comes back on\nthe next claim and every read.",
         "properties": {
           "checkpoint": {
             "anyOf": [
@@ -538,14 +538,14 @@
           },
           "lease_seconds": {
             "default": 60,
-            "description": "The new lease, from now, 5 to 3600 s.",
+            "description": "The new lease (or hold), from now, 5 to 3600 s. A run never queued whose hold lapses is ended ERROR (holder_lost).",
             "maximum": 3600.0,
             "minimum": 5.0,
             "title": "Lease Seconds",
             "type": "integer"
           },
           "worker_id": {
-            "description": "The worker holding the lease.",
+            "description": "The worker holding the lease; for a run kept in the caller's process (never queued), the process holding it.",
             "maxLength": 200,
             "minLength": 1,
             "title": "Worker Id",
@@ -913,7 +913,7 @@
         "type": "object"
       },
       "Lease": {
-        "description": "A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what\nthe worker must know to stop in time: the working time the run has left.",
+        "description": "A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what\nthe worker must know to stop in time: the working time the run has left. For a run kept\nin its caller's process, the caller's hold on it.",
         "properties": {
           "cancel_requested": {
             "default": false,
@@ -7909,7 +7909,7 @@
     },
     "/v1/runs/{run_id}/heartbeat": {
       "post": {
-        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. The lease says the working time the run has left\n(``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;\nstop working the run.",
+        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. The lease says the working time the run has left\n(``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;\nstop working the run.\n\nA run kept in its caller's process (started ``RUNNING``, never queued) has no lease: the\nheartbeat holds it for ``worker_id`` (the process running it) until ``now +\nlease_seconds``. Once a hold lapses the ticker ends the run ``ERROR`` (``holder_lost``),\nnever queueing it. A hold fences none of the caller's writes and a pause lets go of it;\nanother holder's hold in force is 409 ``LEASE_LOST``.",
         "operationId": "runs.heartbeat",
         "parameters": [
           {
@@ -7985,7 +7985,7 @@
                 }
               }
             },
-            "description": "The extended lease.",
+            "description": "The extended lease, or the hold.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -8145,7 +8145,7 @@
                 }
               }
             },
-            "description": "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: stop working the run. Nothing is saved.",
+            "description": "LEASE_LOST: the lease is no longer this worker's, another holder holds the run, or the run no longer runs: stop working the run. Nothing is saved.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -8309,7 +8309,7 @@
             "ApiKeyAuth": []
           }
         ],
-        "summary": "Extend a lease, optionally saving progress",
+        "summary": "Extend a lease (or hold a run kept in the caller's process), optionally saving progress",
         "tags": [
           "runs"
         ]

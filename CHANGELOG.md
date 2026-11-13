@@ -6,6 +6,16 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A run kept in its caller's process can be held, and is ended when its holder stops.** A run
+  started `RUNNING` (never queued) had no lease, so one whose process crashed stayed `RUNNING`
+  forever unless it had a `deadline` or the service a `RUNS__LIMITS__MAX_RUN_SECONDS`. Now the
+  existing `POST /v1/runs/{run_id}/heartbeat` (SDK `heartbeat`), sent for such a run, holds it
+  for its `worker_id` for `lease_seconds`; once the hold lapses the ticker ends the run `ERROR`
+  with code `holder_lost` (category `TIMEOUT`, not retryable), never queueing it. A hold fences
+  none of the caller's writes, takes no worker's place, and a pause lets go of it. No request or
+  answer schema changes: such a heartbeat was a `409 LEASE_LOST` before, so no caller sends one
+  unless it means to hold. Migration `b8d3e4f5a6c7` adds `agent_runs.holder` and `held_until`
+  (null: nothing holds the run, as before) and `ix_runs_held`. Nothing to do.
 * **Built on trellis-contracts 0.7.0.** `docs/openapi.json` no longer lists the run inbox
   names 0.7.0 removed (`InterruptReason.PAUSE`, `RunRecord.usage`, `RunMessage`); the service
   never used them. Requires `trellis-contracts>=0.6.2,<0.8`, as before. Nothing to do.

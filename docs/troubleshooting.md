@@ -47,6 +47,10 @@ retryable error and is being retried (up to 3 times). `attempt` counts these.
 **A run ended `ERROR` with `lease_expired`.** Its lease lapsed five times
 (`MAX_LEASE_LAPSES`): something kills its worker. Look at the worker's logs for that run.
 
+**A run ended `ERROR` with `holder_lost`.** It ran in its caller's process (never queued),
+which held it with heartbeats and stopped (it crashed, was killed or restarted). The message
+names the holder; look at that process's logs.
+
 **A run ended `TIMEOUT` with `run_deadline` or `run_timeout`.** Past its `deadline` (queue and
 waiting time count), or past its working-time limit (`timeout_seconds`, or
 `RUNS__LIMITS__MAX_RUN_SECONDS`; only time `RUNNING` counts).
