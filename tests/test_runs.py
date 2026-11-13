@@ -5,6 +5,7 @@ what a person cancelled, one tenant reaching for another's work)."""
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -404,31 +405,22 @@ async def test_a_malformed_start_is_refused_and_records_nothing(client, body) ->
 
 
 async def test_every_route_needs_a_key(app) -> None:
+    """Every ``/v1`` operation the service publishes, read from its own OpenAPI document so a
+    route added later is checked too (a hand-kept list had fallen 11 routes behind)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runs") as anon:
-        for method, path in [
-            ("POST", "/v1/runs"),
-            ("POST", "/v1/runs/claim"),
-            ("GET", "/v1/runs"),
-            ("GET", "/v1/runs/run_x"),
-            ("GET", "/v1/runs/run_x/resolutions"),
-            ("POST", "/v1/runs/run_x/pause"),
-            ("POST", "/v1/runs/run_x/resume"),
-            ("POST", "/v1/runs/run_x/finish"),
-            ("POST", "/v1/runs/run_x/heartbeat"),
-            ("POST", "/v1/runs/run_x/artifacts"),
-            ("GET", "/v1/artifacts/art_x"),
-            ("POST", "/v1/schedules"),
-            ("GET", "/v1/schedules"),
-            ("GET", "/v1/schedules/sch_x"),
-            ("PATCH", "/v1/schedules/sch_x"),
-            ("DELETE", "/v1/schedules/sch_x"),
-            ("POST", "/v1/schedules/sch_x/fire"),
-            ("POST", "/v1/webhooks"),
-            ("GET", "/v1/webhooks"),
-            ("DELETE", "/v1/webhooks/wh_x"),
-        ]:
+        spec = (await anon.get("/openapi.json")).json()
+        operations = [
+            (method.upper(), path)
+            for path, item in spec["paths"].items()
+            if path.startswith("/v1")
+            for method in item
+            if method in {"get", "post", "put", "patch", "delete"}
+        ]
+        assert len(operations) >= 30, operations  # the document listed the routes
+        for method, template in operations:
+            path = re.sub(r"\{[^}]+\}", "x_1", template)
             response = await anon.request(method, path)
-            assert response.status_code == 401, (method, path, response.status_code)
+            assert response.status_code == 401, (method, template, response.status_code)
             assert response.headers["content-type"] == "application/problem+json"
             problem = response.json()
             assert (problem["code"], problem["detail"]) == ("AUTHENTICATION", "missing X-API-Key")
