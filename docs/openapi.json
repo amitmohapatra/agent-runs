@@ -869,10 +869,11 @@
           },
           "remember": {
             "default": "once",
-            "description": "once: the decision covers this call only. run: approve calls like it for the rest of the run without asking again (APPROVE of a tool call only).",
+            "description": "once: the decision covers this call only. run: for this conversation - approve the tool's later calls in this run and in later runs of the same thread for the same user without asking again. always: approve them for this user in every conversation until the permission is revoked. run and always: APPROVE of a tool call only.",
             "enum": [
               "once",
-              "run"
+              "run",
+              "always"
             ],
             "title": "Remember",
             "type": "string"

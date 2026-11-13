@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **`docs/openapi.json` on trellis-contracts 0.7.1.** CI checks agent-contracts' `main` out
+  beside this repository, which is 0.7.1 (`InterruptRemember.ALWAYS`), so the committed
+  document generated on 0.7.0 failed the "OpenAPI document is current" step and
+  `tests/test_openapi.py`. Regenerated; the only difference is `remember: "always"` in
+  `InterruptResolution`. Requires `trellis-contracts>=0.6.2,<0.8`, as before (a resolution with
+  `remember: "always"` needs 0.7.1 to be read).
 * **A run kept in its caller's process can be held, and is ended when its holder stops.** A run
   started `RUNNING` (never queued) had no lease, so one whose process crashed stayed `RUNNING`
   forever unless it had a `deadline` or the service a `RUNS__LIMITS__MAX_RUN_SECONDS`. Now the
