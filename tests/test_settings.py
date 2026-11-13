@@ -15,6 +15,7 @@ from agent_runs.api.errors import is_unavailable
 from agent_runs.config.settings import (
     BlobSettings,
     DatabaseSettings,
+    LimitsSettings,
     PoolPlan,
     ServiceSettings,
     Settings,
@@ -104,6 +105,20 @@ def test_the_limits_group_is_read_and_its_old_name_still_works_with_a_warning(
         "the old name stops working in the next release",
         "RUNS__RUNS__RETENTION_DAYS is renamed RUNS__LIMITS__RETENTION_DAYS; the old name "
         "stops working in the next release",
+    ]
+
+
+def test_one_old_limit_name_moves_that_limit_only(fresh_settings, monkeypatch, caplog) -> None:
+    """An old group with one name set moves that one value and warns once: the limits it
+    does not name keep their defaults and draw no warning."""
+    monkeypatch.setenv("RUNS__RUNS__RETENTION_DAYS", "30")
+    with caplog.at_level("WARNING"):
+        limits = get_settings().limits
+    assert limits == LimitsSettings(retention_days=30)
+    said = [r.getMessage() for r in caplog.records if "renamed" in r.getMessage()]
+    assert said == [
+        "RUNS__RUNS__RETENTION_DAYS is renamed RUNS__LIMITS__RETENTION_DAYS; the old name "
+        "stops working in the next release"
     ]
 
 

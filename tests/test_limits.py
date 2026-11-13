@@ -5,6 +5,7 @@ reads, the per-tenant rate limit, and the metrics that show all of it."""
 from __future__ import annotations
 
 import gzip
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -77,6 +78,17 @@ async def test_a_run_input_or_output_past_its_cap_is_refused(small) -> None:
     ended = await small.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": big})
     assert (ended.status_code, ended.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
     assert (await small.get(f"/v1/runs/{rid}")).json()["status"] == "RUNNING"
+
+
+async def test_a_payload_is_measured_in_the_utf8_bytes_of_its_compact_json(small) -> None:
+    """``ü`` is two bytes of compact UTF-8 JSON, not the six of an ASCII escape: 900 of them
+    (about 1.8 KiB) fit the 2 KiB cap, though escaped they would be 5.4 KiB."""
+    body = json.dumps(started(input={"t": "ü" * 900}), ensure_ascii=False).encode()
+    response = await small.post(
+        "/v1/runs", content=body, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["input"] == {"t": "ü" * 900}
 
 
 async def test_a_checkpoint_past_the_payload_cap_is_refused_wherever_it_is_saved(small) -> None:
