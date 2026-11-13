@@ -233,7 +233,8 @@ async def test_run_once_hands_the_claimed_run_to_the_handler(
 
     async def handler(job: Job) -> str:  # any result: the harness's composition returns one
         jobs.append(job)
-        await job.checkpoint({"step": 1})
+        renewed = await job.checkpoint({"step": 1})
+        assert renewed.run_id == "run_1", "the checkpoint answers the lease it extended"
         await job.pause(interrupt("run_1"), checkpoint={"step": 2})
         await job.finish(RunStatus.SUCCESS, output={"ok": True})
         return "the agent's answer"
