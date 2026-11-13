@@ -43,6 +43,7 @@ from agent_runs.config.constants import (
     MAX_ERROR_RETRIES,
     MAX_LEASE_LAPSES,
     PAUSED_ARTIFACT_ROLE,
+    RESUME_GRACE,
 )
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
 from agent_runs.domain.runs import (
@@ -211,9 +212,9 @@ def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: boo
 
 def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     """The one transition check. Leaving RUNNING adds the stretch to the working time and
-    clears the lease and the hold; leaving PAUSED clears what it waited on; an ending clears the
-    checkpoint, which only a run that may still continue needs. Whoever settled the old state
-    did not settle the new one."""
+    clears the lease and the hold (a pause keeps who held it: ``resume``); leaving PAUSED
+    clears what it waited on; an ending clears the checkpoint, which only a run that may still
+    continue needs. Whoever settled the old state did not settle the new one."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
     row.worked_seconds = _worked(row, now)
@@ -225,7 +226,9 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
         row.available_at = None
     if to is not RunStatus.RUNNING:
         row.lease_owner = row.lease_expires_at = row.cancel_requested_at = None
-        row.holder = row.held_until = None
+        row.held_until = None
+        if to is not RunStatus.PAUSED:
+            row.holder = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.awaiting_ref = row.assignee = row.awaiting_deadline = None
     if to.final:
@@ -459,7 +462,8 @@ class RunStore:
         otherwise), both before anything is written. ``CANCEL`` ends the run; any other
         decision continues it as the next attempt: back on the queue when the run is durable
         (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
-        process.
+        process — which, when the run was held before it paused, must hold it again within
+        ``RESUME_GRACE`` (:meth:`end_abandoned`).
 
         Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
         very same resolution, as a client retries it after losing the answer) answers the
@@ -505,6 +509,8 @@ class RunStore:
         else:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
+            if row.holder is not None:  # held before it paused: whoever continues it holds it
+                row.holder, row.held_until = None, now + RESUME_GRACE
         await self._ended([row], now)
         return await self._flushed(row, now), True
 
@@ -755,11 +761,22 @@ class RunStore:
         once as the next attempt, for another worker, keeping ``request.checkpoint`` as its
         progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
         asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
-        answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
+        answers the run as it is with ``released`` false; any other worker is ``LeaseLost``.
+
+        A run kept in its caller's process is never queued: its holder (:meth:`_hold`) lets go
+        of the hold, and the run goes on ``RUNNING``, unheld."""
         checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False
+        if row.status == RunStatus.RUNNING and row.lease_owner is None and row.queued_at is None:
+            # kept in its caller's process: its holder lets go of it, and it goes on unheld
+            if row.holder != request.worker_id:
+                raise LeaseLost(f"{request.worker_id} does not hold run {run_id}")
+            if checkpoint is not None:
+                await self._keep_checkpoint(row, checkpoint)
+            row.holder = row.held_until = None
+            return await self._flushed(row, now), True
         _fence(row, request.worker_id)
         if _cancelled_instead(row, now):
             await self._ended([row], now)
@@ -890,9 +907,10 @@ class RunStore:
 
     async def end_abandoned(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
-        holding one stopped heartbeating — it crashed or was killed) end as ``ERROR``: only
-        that process could run them, so they are never put on the queue. A run nobody holds
-        is never ended here. Returns every run ended."""
+        holding one stopped heartbeating — it crashed or was killed), and answered ones held
+        before they paused that nobody took up within ``RESUME_GRACE`` (:meth:`resume`), end
+        as ``ERROR``: only that process could run them, so they are never put on the queue. A
+        run never held is never ended here. Returns every run ended."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.held_until < now,
@@ -902,12 +920,19 @@ class RunStore:
         for row in rows:
             holder, held_until = row.holder, row.held_until
             _move(row, RunStatus.ERROR, now)
+            stopped = (
+                f"its holder stopped: {holder} kept the run in its own process and stopped "
+                f"heartbeating (held until {held_until}), so nothing runs it"
+                if holder is not None
+                else "nobody took the run up after its answer: it ran in its caller's process, "
+                f"and nothing held it by {held_until} (the process that ran it before it paused "
+                "stopped while it waited)"
+            )
             row.error = _json(
                 AgentError(
                     code="holder_lost",
                     category=ErrorCategory.TIMEOUT,
-                    message=f"its holder stopped: {holder} kept the run in its own process and "
-                    f"stopped heartbeating (held until {held_until}), so nothing runs it",
+                    message=stopped,
                     # nothing could retry it: the work was in the process that stopped
                     retryable=False,
                     source="agent-runs",

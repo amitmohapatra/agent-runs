@@ -217,7 +217,9 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 - A run that was never queued has no lease; its caller may hold it instead (`_hold`: a
   heartbeat sets `holder`, `held_until`), fencing nothing. `end_abandoned` ends a run whose
   hold lapsed `ERROR` (`holder_lost`): the process that held it stopped, and nothing else
-  could run it.
+  could run it. A pause keeps `holder` (clearing `held_until`); the resume of such a run
+  clears it and sets `held_until = now + RESUME_GRACE`, so an answered run nothing continues
+  is ended too. `release` by its holder clears both: the run goes on unheld.
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
 - `attempt` counts executions: `+1` on a resume that continues the run and on every requeue

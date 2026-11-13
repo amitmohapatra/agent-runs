@@ -100,11 +100,12 @@ async def test_holding_fences_nothing_the_caller_writes(client) -> None:
     assert (await _hold(client, run_id)).status_code == 409
 
 
-async def test_a_pause_lets_go_of_the_hold_and_the_next_heartbeat_takes_it_again(
+async def test_a_pause_lets_go_of_the_hold_and_whoever_continues_the_run_takes_it_again(
     client, ticker
 ) -> None:
     """A paused run waits for a person, not for its holder: the sweep leaves it. Answered, it
-    runs in its caller's process again, held once its holder's next heartbeat comes."""
+    runs in its caller's process again — this server's or another's, whichever continues
+    it — held once that one's first heartbeat comes."""
     run_id = await _running(client)
     await _hold(client, run_id, seconds=5)
     response = await client.post(f"/v1/runs/{run_id}/pause", json=pause(run_id))
@@ -113,9 +114,57 @@ async def test_a_pause_lets_go_of_the_hold_and_the_next_heartbeat_takes_it_again
     assert (await ticker.tick(now=at(5))).abandoned == 0
     resumed = await client.post(f"/v1/runs/{run_id}/resume", json=resolution(response.json()))
     assert resumed.json()["status"] == "RUNNING"
-    assert (await ticker.tick(now=at(5))).abandoned == 0  # nobody holds it yet
-    assert (await _hold(client, run_id, seconds=5)).status_code == 200
-    assert (await ticker.tick(now=at(5))).abandoned == 1
+    assert (await _hold(client, run_id, holder="server-2", seconds=5)).status_code == 200
+    assert (await ticker.tick(now=at(0.05))).abandoned == 0
+    assert (await ticker.tick(now=at(5))).abandoned == 1  # server-2 stopped too
+
+
+async def test_an_answered_run_nothing_continues_ends_in_error_once_the_grace_passes(
+    client, ticker
+) -> None:
+    """A run held before it paused, whose holder stopped while it waited (its server was
+    killed): answered, it runs in its caller's process — which is gone. Whoever continues it
+    holds it at once; nobody did within ``RESUME_GRACE``, so the ticker ends it ``ERROR``
+    (``holder_lost``), saying nobody took it up, instead of leaving it ``RUNNING``."""
+    run_id = await _running(client)
+    await _hold(client, run_id)
+    response = await client.post(f"/v1/runs/{run_id}/pause", json=pause(run_id))
+    resumed = await client.post(f"/v1/runs/{run_id}/resume", json=resolution(response.json()))
+    assert resumed.json()["status"] == "RUNNING"
+    assert (await ticker.tick(now=at(0.5))).abandoned == 0  # within the grace
+    assert (await ticker.tick(now=at(2))).abandoned == 1
+    ended = await _run(client, run_id)
+    assert ended["status"] == "ERROR" and ended["error"]["code"] == "holder_lost"
+    assert "nobody took the run up after its answer" in ended["error"]["message"]
+    assert ended["error"]["retryable"] is False
+
+
+async def test_a_run_never_held_is_left_running_after_its_answer(client, ticker) -> None:
+    """A caller that never held its run (one that does not know holds) is not timed out
+    after an answer: nothing says a holder ever ran it."""
+    run_id = await _running(client)
+    response = await client.post(f"/v1/runs/{run_id}/pause", json=pause(run_id))
+    await client.post(f"/v1/runs/{run_id}/resume", json=resolution(response.json()))
+    assert (await ticker.tick(now=at(60))).abandoned == 0
+    assert (await _run(client, run_id))["status"] == "RUNNING"
+
+
+async def test_its_holder_lets_go_of_a_held_run_which_goes_on_unheld(client, ticker) -> None:
+    """A release of a run kept in its caller's process lets go of the hold (its holder no
+    longer runs it, and does not end it: a helper whose parent waits for a person): the run
+    stays ``RUNNING`` and the sweep leaves it. Only its holder lets go; nothing held is 409."""
+    run_id = await _running(client)
+    await _hold(client, run_id, seconds=5)
+    other = await client.post(f"/v1/runs/{run_id}/release", json={"worker_id": "server-2"})
+    assert other.status_code == 409
+    released = await client.post(f"/v1/runs/{run_id}/release", json={"worker_id": "server-1"})
+    assert released.status_code == 200, released.text
+    assert (released.json()["status"], released.json()["attempt"]) == ("RUNNING", 1)
+    assert (await ticker.tick(now=at(5))).abandoned == 0
+    assert (await _run(client, run_id))["status"] == "RUNNING"
+    again = await client.post(f"/v1/runs/{run_id}/release", json={"worker_id": "server-1"})
+    assert again.status_code == 409
+    assert (await _hold(client, run_id, holder="server-2")).status_code == 200  # taken anew
 
 
 async def test_a_held_run_is_cancelled_at_once_and_its_holder_told(client, ticker) -> None:
