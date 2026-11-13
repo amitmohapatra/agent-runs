@@ -47,6 +47,7 @@ async def test_a_declared_body_past_the_cap_is_refused_before_it_is_read(small) 
         "/v1/runs", content=b"{" + b" " * 5000 + b"}", headers={"content-type": "application/json"}
     )
     assert (response.status_code, response.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
+    assert response.json()["retryable"] is False, "the same body is refused again"
     assert response.headers["content-type"] == "application/problem+json"
     assert (await small.get("/v1/runs")).json() == []
 
