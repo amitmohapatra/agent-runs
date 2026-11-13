@@ -128,9 +128,28 @@ async def test_a_stream_that_cannot_be_reopened_raises(slept: list[float]) -> No
     with respx.mock:
         respx.get(STREAM).mock(side_effect=httpx.ConnectError("down"))
         async with RunsClient(URL, api_key="k", max_retries=2) as runs:
-            with pytest.raises(DependencyUnavailableError, match="events of run_1 unreachable"):
+            with pytest.raises(
+                DependencyUnavailableError, match="events of run_1 unreachable"
+            ) as e:
                 await _follow(runs)
     assert len(slept) == 2
+    assert (e.value.code, e.value.retryable) == ("DEPENDENCY_UNAVAILABLE", True)
+
+
+async def test_only_failures_in_a_row_count_against_a_stream(slept: list[float]) -> None:
+    """``max_retries`` connection failures *in a row*: an event that arrives between two
+    drops starts the count again, so a long stream on a flaky network keeps going."""
+    answers = [
+        _sse(_entry(1), cut=httpx.ReadError("cut")),
+        _sse(_entry(2), cut=httpx.ReadError("cut")),
+        _sse(_entry(3), cut=httpx.ReadError("cut")),
+        _sse(_entry(4), END),
+    ]
+    with respx.mock:
+        respx.get(STREAM).mock(side_effect=answers)
+        async with RunsClient(URL, api_key="k", max_retries=1) as runs:
+            assert await _follow(runs) == [1, 2, 3, 4]
+    assert len(slept) == 3
 
 
 async def test_a_stream_refused_by_the_service_raises_its_error() -> None:
