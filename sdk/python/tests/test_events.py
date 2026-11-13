@@ -86,6 +86,18 @@ async def test_events_are_read_by_position() -> None:
     assert dict(route.calls.last.request.url.params) == {"after": "2", "limit": "10"}
 
 
+async def test_by_default_events_are_read_and_followed_from_the_first() -> None:
+    """Positions start at 1, so the default ``after`` is 0: nothing is skipped."""
+    with respx.mock:
+        read = respx.get(f"{URL}/v1/runs/run_1/events").respond(200, json=[])
+        followed = respx.get(STREAM).mock(return_value=_sse(END))
+        async with RunsClient(URL, api_key="k") as runs:
+            await runs.events("run_1")
+            assert [e async for e in runs.stream_events("run_1")] == []
+    assert read.calls.last.request.url.params["after"] == "0"
+    assert followed.calls.last.request.url.params["after"] == "0"
+
+
 async def test_a_stream_yields_each_event_until_the_run_ended() -> None:
     with respx.mock:
         route = respx.get(STREAM).mock(

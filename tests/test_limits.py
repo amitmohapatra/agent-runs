@@ -75,6 +75,11 @@ async def test_a_chunked_body_is_held_to_the_body_cap_to_the_byte(small) -> None
         )
         assert "content-length" not in response.request.headers, "sent chunked"
         assert response.status_code == status, (size, response.text)
+        declared = await small.post(
+            "/v1/runs", content=head + padding + tail, headers={"content-type": "application/json"}
+        )
+        assert declared.request.headers["content-length"] == str(size)
+        assert declared.status_code == status, (size, declared.text)
 
 
 async def test_a_chunked_body_within_the_cap_goes_through(small) -> None:
