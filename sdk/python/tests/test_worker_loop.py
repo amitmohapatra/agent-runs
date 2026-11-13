@@ -655,6 +655,33 @@ async def test_a_run_past_the_grace_period_is_released(
     ]
 
 
+async def test_a_run_that_finished_leaves_the_others_held_to_be_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run ending forgets only its own entry: the run still in flight is the one the stop
+    hands back, and the finished one is never released."""
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.05)
+    long_started = asyncio.Event()
+    quick_done = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        if job.record.run_id == "run_quick":
+            quick_done.set()
+            return
+        long_started.set()
+        await asyncio.Event().wait()
+
+    store = Store(run("run_long"), run("run_quick"))
+    worker = Worker(store, handler, ["triage"], worker_id="w-1", concurrency=2)
+    task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(asyncio.gather(long_started.wait(), quick_done.wait()), 5)
+    await asyncio.sleep(0.01)  # the quick run's execution has wound up
+    worker.stop()
+    await asyncio.wait_for(task, 5)
+    released = [write["run_id"] for kind, write in store.writes if kind == "release"]
+    assert released == ["run_long"]
+
+
 async def test_a_run_that_cannot_be_released_is_left_to_its_lease(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
