@@ -7,16 +7,18 @@
    the service's ``RUNS__LIMITS__MAX_RUN_SECONDS``, the lesser);
 4. put runs whose lease lapsed back on the queue (or fail them on their ``MAX_LEASE_LAPSES``-th
    lapse);
-5. escalate or time out interrupts past their deadline;
-6. send the webhook deliveries that are due from the outbox (one attempt each), keeping one
+5. end ``ERROR`` the runs kept in their caller's process whose hold lapsed (their holder
+   stopped heartbeating: nothing else can run them);
+6. escalate or time out interrupts past their deadline;
+7. send the webhook deliveries that are due from the outbox (one attempt each), keeping one
    given up on as dead;
-7. drop the dead deliveries older than their retention (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``);
-8. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
+8. drop the dead deliveries older than their retention (``RUNS__WEBHOOKS__DEAD_RETENTION_DAYS``);
+9. delete the artifacts of runs that ended more than ``ARTIFACT_RETENTION`` ago (blob, then
    row: a blob delete that fails leaves the row for the next tick);
-9. when the deployment sets a retention (``RUNS__LIMITS__RETENTION_DAYS``), delete the runs that
-   ended before it, with their resolutions and events (after their artifacts).
+10. when the deployment sets a retention (``RUNS__LIMITS__RETENTION_DAYS``), delete the runs
+    that ended before it, with their resolutions and events (after their artifacts).
 
-Steps 2 to 5 write the webhook events they cause into the outbox in their own transaction.
+Steps 2 to 6 write the webhook events they cause into the outbox in their own transaction.
 
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
@@ -84,6 +86,7 @@ class TickReport:
     timed_out: int = 0
     overworked: int = 0
     requeued: int = 0
+    abandoned: int = 0
     escalated: int = 0
     sent: int = 0
     dropped: int = 0
@@ -129,6 +132,7 @@ class Ticker:
                 timed_out=await self._sweep_runs(RunStore.time_out_past_deadline, now),
                 overworked=await self._sweep_runs(RunStore.time_out_overworked, now),
                 requeued=await self._sweep_runs(RunStore.requeue_lapsed, now),
+                abandoned=await self._sweep_runs(RunStore.end_abandoned, now),
                 escalated=await self._sweep_runs(RunStore.escalate_overdue, now),
                 sent=await self._send_webhooks(now),
                 dropped=await self._drop_dead(now),

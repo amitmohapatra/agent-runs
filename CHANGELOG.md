@@ -6,6 +6,34 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Requires `trellis-contracts>=0.7.1,<0.8`** (the service and the SDK; was `>=0.6.2`).
+  agent-runs keeps interrupt resolutions, and a harness on 0.7.1 may send `remember: "always"`,
+  which an older contracts package refuses to read: the store takes 0.7.1 before any harness
+  sends it, as the contracts' changelog asks. `uv.lock` updated (`uv lock`). Install
+  trellis-contracts 0.7.1 (agent-contracts `main`) beside this repository.
+* **`docs/openapi.json` on trellis-contracts 0.7.1.** CI checks agent-contracts' `main` out
+  beside this repository, which is 0.7.1 (`InterruptRemember.ALWAYS`), so the committed
+  document generated on 0.7.0 failed the "OpenAPI document is current" step and
+  `tests/test_openapi.py`. Regenerated; the only difference is `remember: "always"` in
+  `InterruptResolution`.
+* **A run kept in its caller's process can be held, and is ended when its holder stops.** A run
+  started `RUNNING` (never queued) had no lease, so one whose process crashed stayed `RUNNING`
+  forever unless it had a `deadline` or the service a `RUNS__LIMITS__MAX_RUN_SECONDS`. Now the
+  existing `POST /v1/runs/{run_id}/heartbeat` (SDK `heartbeat`), sent for such a run, holds it
+  for its `worker_id` for `lease_seconds`; once the hold lapses the ticker ends the run `ERROR`
+  with code `holder_lost` (category `TIMEOUT`, not retryable), never queueing it. A hold fences
+  none of the caller's writes, takes no worker's place, and a pause lets go of it. No request or
+  answer schema changes: such a heartbeat was a `409 LEASE_LOST` before, so no caller sends one
+  unless it means to hold. Migration `b8d3e4f5a6c7` adds `agent_runs.holder` and `held_until`
+  (null: nothing holds the run, as before) and `ix_runs_held`. Nothing to do.
+* **An answered run nothing continues is ended.** A run held when it paused, answered after
+  the process that held it stopped, ran in nobody's process and stayed `RUNNING`. Its resume
+  now gives whoever continues it `RESUME_GRACE` (60 s) to hold it, after which the ticker ends
+  it `ERROR` (`holder_lost`, "nobody took the run up after its answer"). A run never held is
+  unaffected.
+* **A holder can let go of a hold.** `POST /v1/runs/{run_id}/release` by the holder of a run
+  kept in its caller's process (a 409 before) clears the hold; the run stays `RUNNING`, unheld
+  (a helper whose parent run waits for a person).
 * **Built on trellis-contracts 0.7.0.** `docs/openapi.json` no longer lists the run inbox
   names 0.7.0 removed (`InterruptReason.PAUSE`, `RunRecord.usage`, `RunMessage`); the service
   never used them. Requires `trellis-contracts>=0.6.2,<0.8`, as before. Nothing to do.

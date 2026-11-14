@@ -122,17 +122,23 @@ class ClaimRequest(BaseModel):
 
 
 class HeartbeatRequest(BaseModel):
-    """Extend the lease, and optionally save a progress ``checkpoint``: the executor's resume
-    journal as it stands (tool calls done and their outputs), so the attempt after a worker
-    crash resumes from it instead of repeating side effects. It replaces the run's
+    """Extend the lease (or hold a run kept in the caller's process), and optionally save a
+    progress ``checkpoint``: the executor's resume journal as it stands (tool calls done and
+    their outputs), so the attempt after a worker crash resumes from it instead of repeating
+    side effects. It replaces the run's
     checkpoint (absent: kept as it is), has the pause checkpoint's bound, and comes back on
     the next claim and every read."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    worker_id: WorkerId = Field(description="The worker holding the lease.")
+    worker_id: WorkerId = Field(
+        description="The worker holding the lease; for a run kept in the caller's process "
+        "(never queued), the process holding it."
+    )
     lease_seconds: LeaseSeconds = Field(
-        default=DEFAULT_LEASE_SECONDS, description="The new lease, from now, 5 to 3600 s."
+        default=DEFAULT_LEASE_SECONDS,
+        description="The new lease (or hold), from now, 5 to 3600 s. A run never queued whose "
+        "hold lapses is ended ERROR (holder_lost).",
     )
     checkpoint: dict[str, Any] | None = Field(
         default=None,
@@ -157,7 +163,8 @@ class ReleaseRequest(BaseModel):
 
 class Lease(BaseModel):
     """A worker's hold on a running run, until ``expires_at`` unless it heartbeats, and what
-    the worker must know to stop in time: the working time the run has left."""
+    the worker must know to stop in time: the working time the run has left. For a run kept
+    in its caller's process, the caller's hold on it."""
 
     model_config = ConfigDict(frozen=True)
 

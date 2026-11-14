@@ -43,6 +43,7 @@ from agent_runs.config.constants import (
     MAX_ERROR_RETRIES,
     MAX_LEASE_LAPSES,
     PAUSED_ARTIFACT_ROLE,
+    RESUME_GRACE,
 )
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
 from agent_runs.domain.runs import (
@@ -211,9 +212,9 @@ def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: boo
 
 def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
     """The one transition check. Leaving RUNNING adds the stretch to the working time and
-    clears the lease; leaving PAUSED clears what it waited on; an ending clears the
-    checkpoint, which only a run that may still continue needs. Whoever settled the old state
-    did not settle the new one."""
+    clears the lease and the hold (a pause keeps who held it: ``resume``); leaving PAUSED
+    clears what it waited on; an ending clears the checkpoint, which only a run that may still
+    continue needs. Whoever settled the old state did not settle the new one."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
     row.worked_seconds = _worked(row, now)
@@ -225,6 +226,9 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
         row.available_at = None
     if to is not RunStatus.RUNNING:
         row.lease_owner = row.lease_expires_at = row.cancel_requested_at = None
+        row.held_until = None
+        if to is not RunStatus.PAUSED:
+            row.holder = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.awaiting_ref = row.assignee = row.awaiting_deadline = None
     if to.final:
@@ -458,7 +462,8 @@ class RunStore:
         otherwise), both before anything is written. ``CANCEL`` ends the run; any other
         decision continues it as the next attempt: back on the queue when the run is durable
         (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
-        process.
+        process — which, when the run was held before it paused, must hold it again within
+        ``RESUME_GRACE`` (:meth:`end_abandoned`).
 
         Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
         very same resolution, as a client retries it after losing the answer) answers the
@@ -504,6 +509,8 @@ class RunStore:
         else:
             _move(row, RunStatus.RUNNING, now)
             row.attempt += 1
+            if row.holder is not None:  # held before it paused: whoever continues it holds it
+                row.holder, row.held_until = None, now + RESUME_GRACE
         await self._ended([row], now)
         return await self._flushed(row, now), True
 
@@ -708,17 +715,44 @@ class RunStore:
     ) -> Lease:
         """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
         means the lease is gone (it lapsed and the run was re-queued, or the run was
-        cancelled or finished): the worker must stop, and nothing is saved."""
+        cancelled or finished): the worker must stop, and nothing is saved.
+
+        A run kept in its caller's process (started ``RUNNING``, never queued) has no worker's
+        lease: a heartbeat holds it instead (:meth:`_hold`)."""
         checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
-        row = await self._locked(tenant_id, run_id, worker_id=request.worker_id)
+        row = await self._locked(tenant_id, run_id, worker_id=None)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
+        in_process = row.lease_owner is None and row.queued_at is None
+        if not in_process:
+            _fence(row, request.worker_id)
         if checkpoint is not None:
             await self._keep_checkpoint(row, checkpoint)
             row.updated_at = now
-        lease = self._lease(row, request.worker_id, request.lease_seconds, now)
+        if in_process:
+            lease = self._hold(row, request.worker_id, request.lease_seconds, now)
+        else:
+            lease = self._lease(row, request.worker_id, request.lease_seconds, now)
         await self._session.flush()
         return lease
+
+    def _hold(self, row: RunRow, holder: str, seconds: int, now: datetime) -> Lease:
+        """Hold a run kept in its caller's process for ``holder`` (the process that runs it)
+        for ``seconds``: once the hold lapses, the ticker ends the run ``ERROR``
+        (:meth:`end_abandoned`), as nothing else can run it. Unlike a worker's lease it fences
+        nothing (the caller writes to the run without a ``worker_id``, as before), takes no
+        worker's place and never puts the run on the queue; a pause lets go of it. Another
+        holder's hold in force is ``LeaseLost``."""
+        if row.holder not in (None, holder) and row.held_until and row.held_until >= now:
+            raise LeaseLost(f"run {row.run_id} is held by {row.holder}")
+        expires_at = now + timedelta(seconds=seconds)
+        row.holder, row.held_until = holder, expires_at
+        return Lease(
+            run_id=row.run_id,
+            worker_id=holder,
+            expires_at=expires_at,
+            remaining_seconds=self._remaining(row, now),
+        )
 
     async def release(
         self, tenant_id: str, run_id: str, request: ReleaseRequest, *, now: datetime
@@ -727,11 +761,22 @@ class RunStore:
         once as the next attempt, for another worker, keeping ``request.checkpoint`` as its
         progress when sent. No lapse is counted: nothing crashed. A run whose cancel was
         asked for ends ``CANCELLED`` instead. Returns ``(run, released)``: the worker's repeat
-        answers the run as it is with ``released`` false; any other worker is ``LeaseLost``."""
+        answers the run as it is with ``released`` false; any other worker is ``LeaseLost``.
+
+        A run kept in its caller's process is never queued: its holder (:meth:`_hold`) lets go
+        of the hold, and the run goes on ``RUNNING``, unheld."""
         checkpoint = await self._checkpoint(tenant_id, request.checkpoint)
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False
+        if row.status == RunStatus.RUNNING and row.lease_owner is None and row.queued_at is None:
+            # kept in its caller's process: its holder lets go of it, and it goes on unheld
+            if row.holder != request.worker_id:
+                raise LeaseLost(f"{request.worker_id} does not hold run {run_id}")
+            if checkpoint is not None:
+                await self._keep_checkpoint(row, checkpoint)
+            row.holder = row.held_until = None
+            return await self._flushed(row, now), True
         _fence(row, request.worker_id)
         if _cancelled_instead(row, now):
             await self._ended([row], now)
@@ -750,15 +795,18 @@ class RunStore:
         cancelling = row.cancel_requested_at
         expires_at = (cancelling or now) + timedelta(seconds=seconds)
         row.lease_owner, row.lease_expires_at = worker_id, expires_at
-        limit = self._limit(row)
-        remaining = None if limit is None else max(0.0, limit - _worked(row, now))
         return Lease(
             run_id=row.run_id,
             worker_id=worker_id,
             expires_at=expires_at,
-            remaining_seconds=remaining,
+            remaining_seconds=self._remaining(row, now),
             cancel_requested=cancelling is not None,
         )
+
+    def _remaining(self, row: RunRow, now: datetime) -> float | None:
+        """The working time the run has left (``None``: no limit)."""
+        limit = self._limit(row)
+        return None if limit is None else max(0.0, limit - _worked(row, now))
 
     # ------------------------------------------------------------------ the ticker's sweeps
     async def time_out_past_deadline(self, *, now: datetime, limit: int) -> list[RunRecord]:
@@ -853,6 +901,43 @@ class RunStore:
             else:
                 wait = backoff(LAPSE_RETRY_BASE, row.lease_lapses, cap=LAPSE_RETRY_CAP)
                 _requeue(row, now, wait=jittered(wait))
+        await self._ended(rows, now)
+        await self._session.flush()
+        return await _records(self._payloads, rows, now)
+
+    async def end_abandoned(self, *, now: datetime, limit: int) -> list[RunRecord]:
+        """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
+        holding one stopped heartbeating — it crashed or was killed), and answered ones held
+        before they paused that nobody took up within ``RESUME_GRACE`` (:meth:`resume`), end
+        as ``ERROR``: only that process could run them, so they are never put on the queue. A
+        run never held is never ended here. Returns every run ended."""
+        rows = await self._sweep(
+            RunRow.status == RunStatus.RUNNING.value,
+            RunRow.held_until < now,
+            order=RunRow.held_until,
+            limit=limit,
+        )
+        for row in rows:
+            holder, held_until = row.holder, row.held_until
+            _move(row, RunStatus.ERROR, now)
+            stopped = (
+                f"its holder stopped: {holder} kept the run in its own process and stopped "
+                f"heartbeating (held until {held_until}), so nothing runs it"
+                if holder is not None
+                else "nobody took the run up after its answer: it ran in its caller's process, "
+                f"and nothing held it by {held_until} (the process that ran it before it paused "
+                "stopped while it waited)"
+            )
+            row.error = _json(
+                AgentError(
+                    code="holder_lost",
+                    category=ErrorCategory.TIMEOUT,
+                    message=stopped,
+                    # nothing could retry it: the work was in the process that stopped
+                    retryable=False,
+                    source="agent-runs",
+                )
+            )
         await self._ended(rows, now)
         await self._session.flush()
         return await _records(self._payloads, rows, now)

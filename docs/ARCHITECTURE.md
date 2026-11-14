@@ -167,6 +167,7 @@ stateDiagram-v2
   RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
   RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
   RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
+  RUNNING --> ERROR: ticker, never queued and its hold lapsed (holder_lost)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
@@ -191,8 +192,8 @@ stateDiagram-v2
 What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 
 - Entering `RUNNING` sets `running_since`; leaving it adds the stretch to `worked_seconds`
-  and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`) and
-  `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
+  and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`), the hold
+  (`holder`, `held_until`) and `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
   `time_out_overworked` ends a run whose working time passed its limit (`timeout_seconds`
   or `RUNS__LIMITS__MAX_RUN_SECONDS`, the lesser) `TIMEOUT` (`run_timeout`); `_lease` tells
   the worker the time left (`remaining_seconds`).
@@ -213,6 +214,12 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   cancelled within one lease: the worker finishes it, or a pause, a release or the lapse
   sweep ends it `CANCELLED` instead of pausing or requeueing it (`_cancelled_instead`).
   `cancel_reason` and `cancelled_by` keep why and who.
+- A run that was never queued has no lease; its caller may hold it instead (`_hold`: a
+  heartbeat sets `holder`, `held_until`), fencing nothing. `end_abandoned` ends a run whose
+  hold lapsed `ERROR` (`holder_lost`): the process that held it stopped, and nothing else
+  could run it. A pause keeps `holder` (clearing `held_until`); the resume of such a run
+  clears it and sets `held_until = now + RESUME_GRACE`, so an answered run nothing continues
+  is ended too. `release` by its holder clears both: the run goes on unheld.
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
 - `attempt` counts executions: `+1` on a resume that continues the run and on every requeue
@@ -808,6 +815,7 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_inbox` | `agent_runs (tenant_id, status, assignee, created_at)` | the inbox, `status=PAUSED&assignee=` |
 | `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
+| `ix_runs_held` | `agent_runs (held_until) WHERE status = 'RUNNING' AND held_until IS NOT NULL` | `RunStore.end_abandoned` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
 | `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
 | `ix_runs_working` | `agent_runs (running_since) WHERE status = 'RUNNING'` | `RunStore.time_out_overworked` |

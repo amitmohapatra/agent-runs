@@ -173,11 +173,12 @@ async def claim(
 
 @router.post(
     "/{run_id}/heartbeat",
-    summary="Extend a lease, optionally saving progress",
-    response_description="The extended lease.",
+    summary="Extend a lease (or hold a run kept in the caller's process), optionally saving "
+    "progress",
+    response_description="The extended lease, or the hold.",
     responses=conflict(
-        "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: stop "
-        "working the run. Nothing is saved."
+        "LEASE_LOST: the lease is no longer this worker's, another holder holds the run, or "
+        "the run no longer runs: stop working the run. Nothing is saved."
     ),
 )
 async def heartbeat(
@@ -192,7 +193,15 @@ async def heartbeat(
     the run, replacing the one there: the next attempt's claim gets it, so a worker crash
     repeats no checkpointed side effect. The lease says the working time the run has left
     (``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;
-    stop working the run."""
+    stop working the run.
+
+    A run kept in its caller's process (started ``RUNNING``, never queued) has no lease: the
+    heartbeat holds it for ``worker_id`` (the process running it) until ``now +
+    lease_seconds``. Once a hold lapses the ticker ends the run ``ERROR`` (``holder_lost``),
+    never queueing it. A hold fences none of the caller's writes and a pause lets go of it;
+    another holder's hold in force is 409 ``LEASE_LOST``. Answered, a run held before it
+    paused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the
+    ticker ends it ``ERROR`` (``holder_lost``) too."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
@@ -201,12 +210,13 @@ async def heartbeat(
 
 @router.post(
     "/{run_id}/release",
-    summary="Let go of a run: back on the queue",
+    summary="Let go of a run: back on the queue (or, kept in the caller's process, unheld)",
     response_description="The run, `QUEUED` as its next attempt (or `CANCELLED`, when its "
-    "cancel was asked for); for a repeat, the run as it is.",
+    "cancel was asked for; or still `RUNNING`, unheld, when it is kept in the caller's "
+    "process); for a repeat, the run as it is.",
     responses=conflict(
-        "LEASE_LOST: the lease is no longer this worker's, or the run no longer runs: there "
-        "is nothing to let go of. Nothing is saved."
+        "LEASE_LOST: the lease (or hold) is no longer this worker's, or the run no longer "
+        "runs: there is nothing to let go of. Nothing is saved."
     ),
 )
 async def release(
@@ -221,7 +231,8 @@ async def release(
     for another worker, without counting a lapsed lease (nothing crashed). With
     ``checkpoint``, the progress made so far is saved first, as a heartbeat saves it. A run
     whose cancel was asked for ends ``CANCELLED`` instead. Repeated by the same worker, it
-    answers the run as it is."""
+    answers the run as it is. A run kept in its caller's process (never queued) is not
+    queued: its holder lets go of the hold, and it goes on ``RUNNING``, unheld."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     at = now()
     run, released = await RunStore(db).release(who.tenant_id, run_id, body, now=at)

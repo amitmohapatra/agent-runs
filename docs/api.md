@@ -309,6 +309,22 @@ this worker's (it lapsed and the run was re-queued, possibly claimed by another 
 the run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do
 not write to it**. Heartbeat well inside the lease (every third of it).
 
+**Holding a run kept in your own process.** A run started `RUNNING` (`queue: false`, never
+queued) has no worker's lease, and a process that crashes while running one leaves it
+`RUNNING`. Its caller may hold it: the same heartbeat, with a `worker_id` naming the process,
+holds the run until `now + lease_seconds`. If the holder stops heartbeating (it crashed, it
+was killed), within a tick of the hold lapsing the ticker ends the run `ERROR` with code
+`holder_lost` (category `TIMEOUT`, not retryable): only that process could run it, so it is
+never put on the queue. A hold fences nothing (the caller still writes without a
+`worker_id`), takes no worker's place, and a pause lets go of it (heartbeat again once the run
+runs again: until then `409 LEASE_LOST`). Another holder's hold in force is `409 LEASE_LOST`;
+so is a heartbeat once the run ended. A run nobody holds is never ended this way.
+Answered (`resume`), a run that was held when it paused runs unheld until whoever continues it
+holds it again; if nobody does within `RESUME_GRACE` (60 s) — the process that ran it stopped
+while it waited — the ticker ends it `ERROR` (`holder_lost`, "nobody took the run up after its
+answer"). Its holder lets go of a hold without ending the run with `release` (the run stays
+`RUNNING`, unheld).
+
 The answer is the `Lease`:
 
 ```json
