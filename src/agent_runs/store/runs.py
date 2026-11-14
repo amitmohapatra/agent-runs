@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, delete, func, literal, or_, select, tuple_
+from sqlalchemy import Select, case, delete, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -309,7 +309,7 @@ def _place(table: Any) -> Any:
     when its latest answer was recorded (it took its place again then)."""
     answered = (
         select(func.max(ResolutionRow.recorded_at))
-        .where(ResolutionRow.run_id == table.run_id)
+        .where(ResolutionRow.tenant_id == table.tenant_id, ResolutionRow.run_id == table.run_id)
         .correlate(table)
         .scalar_subquery()
     )
@@ -388,8 +388,6 @@ class RunStore:
         (:meth:`_placed`): its ``created_at`` is after theirs.
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
-        if start.concurrency_key is not None:
-            now = await self._placed(start.tenant_id, start.concurrency_key, now)
         record = RunRecord.from_start(start, status=status)
         input_ref = await self._put(record.tenant_id, record.input)
         row = await self._session.scalar(
@@ -423,7 +421,11 @@ class RunStore:
         )
         if row is not None:
             await self._link(row.run_id, _INPUT, input_ref)
-            return await self._record(row, now), True
+            started = await self._record(row, now)
+            if row.concurrency_key is not None:
+                at = await self._placed(row, now, started=True)
+                started = started.model_copy(update={"created_at": at, "updated_at": at})
+            return started, True
         if start.idempotency_key:
             keyed = await self._one(
                 RunRow.tenant_id == start.tenant_id,
@@ -527,9 +529,6 @@ class RunStore:
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
         if problem := answer_problem(asked, resolution):
             raise Unprocessable(problem)
-        continues = resolution.decision is not InterruptDecision.CANCEL
-        if continues and row.concurrency_key is not None:
-            now = await self._placed(tenant_id, row.concurrency_key, now)
         answer = await self._payloads.put(tenant_id, _json(resolution))
         question = await self._payloads.put(tenant_id, _json(asked))
         await self._link(run_id, _ANSWER, answer, question)
@@ -559,7 +558,11 @@ class RunStore:
             if row.holder is not None:  # held before it paused: whoever continues it holds it
                 row.holder, row.held_until = None, now + RESUME_GRACE
         await self._ended([row], now)
-        return await self._flushed(row, now), True
+        continued = await self._flushed(row, now)
+        if resolution.decision is not InterruptDecision.CANCEL and row.concurrency_key is not None:
+            at = await self._placed(row, now, answered=_resolution_id(resolution))
+            continued = continued.model_copy(update={"updated_at": at})
+        return continued, True
 
     async def _answered_by(self, tenant_id: str, resolution: InterruptResolution) -> bool:
         """Did this very resolution answer its interrupt? Its ``resolved_at`` is set once,
@@ -766,26 +769,67 @@ class RunStore:
         lock = func.pg_try_advisory_xact_lock(_lock_id(*names))
         return bool(await self._session.scalar(select(lock)))
 
-    async def _placed(self, tenant_id: str, key: str, now: datetime) -> datetime:
-        """When a run takes its place among the runs sharing ``key`` (it starts, queued or
-        running, or continues after its answer): ``now``, or just after the latest change of
-        one of them running or queued when that is later. Taken under the key's transaction
-        lock (a claim counts the key's room under it too), so of two runs placed at once the
-        one that commits second is placed after the first, whatever their clocks: once a caller
-        reads its run back, every run placed before it is there to read. A run's place is
-        :func:`_place`; a caller orders the runs of one conversation by it (the harness answers
-        a conversation's messages one at a time, in this order, on whichever process each
-        arrives), and a claim respects it (:meth:`_key_has_room`)."""
-        lock = func.pg_advisory_xact_lock(_lock_id("key", tenant_id, key))
+    async def _placed(
+        self, row: RunRow, now: datetime, *, started: bool = False, answered: str | None = None
+    ) -> datetime:
+        """The run takes its place among the runs sharing its ``concurrency_key`` — it
+        ``started`` (queued or running), or continues after the answer ``answered`` (its
+        resolution's id) — and when that is: ``now``, or just after the latest change of one of
+        them running or queued when that is later. Its ``created_at`` (started) or its answer's
+        ``recorded_at``, and ``updated_at``, say it (:func:`_place`).
+
+        The key's transaction lock (a claim counts the key's room under it too), then one
+        statement, the transaction's last before its commit: of two runs placed at once the
+        one that commits second is placed after the first, whatever their clocks, so once a
+        caller reads its run back every run placed before it is there to read. (The lock is a
+        statement of its own: the statement that places reads the runs committed while it
+        waited for the lock.) A caller orders the runs of one conversation by the places (the
+        harness answers a conversation's messages one at a time, in this order, on whichever
+        process each arrives), and a claim respects them (:meth:`_key_has_room`).
+        ``ix_runs_concurrency`` serves the read."""
+        assert row.concurrency_key is not None
+        lock = func.pg_advisory_xact_lock(_lock_id("key", row.tenant_id, row.concurrency_key))
         await self._session.execute(select(lock))
-        latest = await self._session.scalar(
-            select(func.max(RunRow.updated_at)).where(
-                RunRow.status.in_(_IN_LINE),
-                RunRow.tenant_id == tenant_id,
-                RunRow.concurrency_key == key,
+        others = aliased(RunRow)
+        latest = (
+            select(func.max(others.updated_at))
+            .where(
+                others.tenant_id == row.tenant_id,
+                others.concurrency_key == row.concurrency_key,
+                others.status.in_(_IN_LINE),
+                others.run_id != row.run_id,
             )
+            .scalar_subquery()
         )
-        return now if latest is None or latest < now else latest + _AFTER
+        clock = literal(now, type_=RunRow.updated_at.type)
+        place = select(func.greatest(clock, latest + _AFTER).label("at")).cte("place")
+        at = select(place.c.at).scalar_subquery()
+        moved = {
+            RunRow.updated_at: at,
+            RunRow.running_since: case((RunRow.running_since.is_not(None), at)),
+            RunRow.queued_at: case((RunRow.queued_at.is_not(None), at)),
+        }
+        if started:
+            moved[RunRow.created_at] = at
+        placing = (
+            update(RunRow)
+            .where(RunRow.run_id == row.run_id)
+            .values(moved)
+            .returning(RunRow.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if answered is not None:
+            recorded = (
+                update(ResolutionRow)
+                .where(
+                    ResolutionRow.tenant_id == row.tenant_id,
+                    ResolutionRow.resolution_id == answered,
+                )
+                .values(recorded_at=at)
+                .cte("answered")
+            )
+            placing = placing.add_cte(recorded)
+        return (await self._session.execute(placing)).scalar_one()
 
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime

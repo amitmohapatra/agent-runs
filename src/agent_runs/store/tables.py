@@ -179,12 +179,15 @@ class RunRow(Base):
                 "('SUCCESS', 'PARTIAL', 'ERROR', 'TIMEOUT', 'CANCELLED', 'REJECTED')"
             ),
         ),
-        # the claim: RUNNING runs sharing a concurrency key
+        # a concurrency key's line: its RUNNING runs (the claim counts them) and QUEUED ones
+        # (a run is placed after them all)
         Index(
             "ix_runs_concurrency",
             "tenant_id",
             "concurrency_key",
-            postgresql_where=text("status = 'RUNNING' AND concurrency_key IS NOT NULL"),
+            postgresql_where=text(
+                "status IN ('RUNNING', 'QUEUED') AND concurrency_key IS NOT NULL"
+            ),
         ),
         # the claim: each tenant's runs held by workers (fair share, the per-tenant cap)
         Index(
