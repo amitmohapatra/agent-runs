@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.dialects import postgresql
 from trellis.contracts.ids import now
+from trellis.contracts.runs import RunStatus
 
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore, _after_the_line
@@ -39,3 +40,27 @@ async def test_a_claim_scans_no_table_whole(app, client) -> None:
     async with app.state.sessions() as db:
         plan = await _plan(db, RunStore(db)._next_queued("acme", request, now(), []))
     assert "Seq Scan" not in plan and "ix_run_resolutions_run" in plan, plan
+
+
+async def test_listing_a_keys_line_reads_the_index_and_each_place_from_its_answers(app) -> None:
+    """SEC-R-11 and ARCH-15: a key's running (or queued) runs are listed from
+    ``ix_runs_concurrency`` — not by walking the tenant's runs newest first, here 4,000 ended
+    turns of the same conversation and others — and each one's ``placed_at`` is read from
+    ``ix_run_resolutions_run``."""
+    async with app.state.sessions() as db:
+        await db.execute(
+            text(
+                "INSERT INTO agent_runs (run_id, tenant_id, agent_id, status, concurrency_key, "
+                "attempt, created_at, updated_at) SELECT 'run_' || n, 'acme', 'triage', "
+                "'SUCCESS', 'thread:' || (n % 2), 1, now(), now() "
+                "FROM generate_series(1, 4000) AS n"
+            )
+        )
+        await db.commit()
+        await db.execute(text("ANALYZE agent_runs"))
+        listing = RunStore(db)._listing(
+            "acme", status=RunStatus.RUNNING, concurrency_key="thread:1"
+        )
+        plan = await _plan(db, listing)
+    assert "ix_runs_concurrency" in plan and "ix_run_resolutions_run" in plan, plan
+    assert "Seq Scan" not in plan, plan

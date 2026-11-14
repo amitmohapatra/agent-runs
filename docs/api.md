@@ -126,7 +126,7 @@ sections after the table have the bodies and the exact semantics.
 | `POST /v1/runs/{id}/events` | `{events: [RunEvent]}` (1–500), `?worker_id=` | `200 {appended, position}` | `404`, `409` not `RUNNING` or leased (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` an event of another run |
 | `GET /v1/runs/{id}/events` | `?after=&limit=` | `200 [RunEventEntry]` | `404`, `422` |
 | `GET /v1/runs/{id}/events/stream` | `?after=`, `Last-Event-ID` | `200 text/event-stream` | `404`, `422` |
-| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
+| `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&concurrency_key=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
 | `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
@@ -249,7 +249,8 @@ commit. A run
 recorded `RUNNING` in its caller's process takes its key's place too (it runs), and is never
 held back; a claim takes a queued run only while no run placed before it runs (one placed
 after it waits for it in its caller's process: the harness orders a conversation's turns by
-the places).
+the places). The place is on the run's record and summary as `placed_at` (read-only; null for
+a run with no key), so no client recomputes it.
 
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
@@ -535,10 +536,13 @@ the run as stored (the first `output` and `error`) and changes nothing (no secon
 
 - `GET /v1/runs/{id}` → `RunRecord`, the full record (input, output, error, checkpoint,
   `worked_seconds` counting the stretch it is running now).
-- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&parent_run_id=&top_level=&cursor=&limit=` →
-  `[RunSummary]`, newest first, paged (`Link`). The inbox is
+- `GET /v1/runs?status=&assignee=&agent_id=&thread_id=&concurrency_key=&parent_run_id=&top_level=&cursor=&limit=` →
+  `[RunSummary]`, newest first, paged (`Link`; the cursor is `created_at, run_id`, and
+  `created_at` never changes, so a run never moves between pages). The inbox is
   `status=PAUSED&assignee=role:procurement`; `top_level=true` keeps only runs with no
   `parent_run_id`, so a paused sub-agent is not listed next to the parent that waits on it.
+  `concurrency_key=…&status=RUNNING` (or `QUEUED`) is that key's line in the caller's tenant
+  (`ix_runs_concurrency`), each run's place its `placed_at`.
 
 ```json
 [{"run_id": "run_…", "agent_id": "triage", "status": "PAUSED",

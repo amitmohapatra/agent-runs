@@ -209,6 +209,12 @@ class RunSummary(BaseModel):
         default=None, description="The conversation the run is a turn of (null: none)."
     )
     updated_at: AwareDatetime = Field(description="When the run last changed.")
+    placed_at: AwareDatetime | None = Field(
+        default=None,
+        description="Read-only: the run's place among the runs sharing its concurrency_key "
+        "(the record's placed_at): when it was started, or when its latest answer was "
+        "recorded. Null for a run with no concurrency_key.",
+    )
 
 
 class Claimed(BaseModel):

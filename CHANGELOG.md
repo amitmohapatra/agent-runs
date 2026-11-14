@@ -6,6 +6,17 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A run's place in its key's line is on the wire, and a key's line can be listed.** The run
+  record and the run summary carry `placed_at` (read-only, optional; `trellis-contracts`
+  `RunRecord.placed_at`): when the run was started, or when its latest answer was recorded —
+  the place agent-runs decides under the key's lock. Null for a run with no
+  `concurrency_key`. `GET /v1/runs` (and the SDK's `list`/`iterate`) takes `concurrency_key`:
+  only that key's runs, in the caller's tenant; with `status=RUNNING` or `QUEUED` it is served
+  by `ix_runs_concurrency`, each place read from `ix_run_resolutions_run` (plan kept in
+  `tests/test_plans.py`). Additive: an older client ignores the field and never sends the
+  filter. The harness orders a conversation's turns by `placed_at` and lists its line by its
+  key, so it no longer reads every answer of every run in the line, nor another user's runs
+  on a thread of the same name.
 * **A key's runs are placed in the order they commit, and a queued one holds its place.** A run
   with a `concurrency_key` is created in its place among the key's runs: under the key's
   transaction lock (the one claims count the key's room under), in the one statement that
