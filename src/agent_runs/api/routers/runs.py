@@ -203,7 +203,9 @@ async def heartbeat(
     paused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the
     ticker ends it ``ERROR`` (``holder_lost``) too."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
+    lease = await _leasing(request, db).heartbeat(
+        who.tenant_id, run_id, body, caller=who.credential, now=now()
+    )
     await db.commit()
     return lease
 
@@ -235,7 +237,9 @@ async def release(
     queued: its holder lets go of the hold, and it goes on ``RUNNING``, unheld."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     at = now()
-    run, released = await RunStore(db).release(who.tenant_id, run_id, body, now=at)
+    run, released = await RunStore(db).release(
+        who.tenant_id, run_id, body, caller=who.credential, now=at
+    )
     if released:
         await WebhookStore(db).announce(run, now=at)
     await db.commit()

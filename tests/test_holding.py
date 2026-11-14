@@ -8,8 +8,10 @@ for days)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import text
 from trellis.contracts.runs import RunEventType
 
 from tests.conftest import at, pause, resolution, started
@@ -194,3 +196,52 @@ async def test_a_queued_run_is_held_only_by_the_worker_that_claimed_it(client) -
     holds no lease on it takes nothing."""
     queued = (await client.post("/v1/runs", json=started(queue=True))).json()["run_id"]
     assert (await _hold(client, queued)).status_code == 409
+
+
+async def test_a_keys_run_started_in_process_is_ended_when_nobody_ever_holds_it(
+    client, ticker
+) -> None:
+    """ARCH-5: a run started ``RUNNING`` with a ``concurrency_key`` takes its key's place, so
+    the process that started it must hold it within ``RESUME_GRACE`` (60 s), as after an
+    answer: one killed between the start and its first heartbeat leaves a run the ticker
+    ends, not one its key's line waits behind for ever. A run with no key is as before."""
+    orphan = await _running(client, concurrency_key="thread:1")
+    held = await _running(client, concurrency_key="thread:2")
+    keyless = await _running(client)
+    await _hold(client, held, seconds=600)
+    assert (await ticker.tick(now=at(0.5))).abandoned == 0  # within the grace
+    assert (await ticker.tick(now=at(1.1))).abandoned == 1
+    run = await _run(client, orphan)
+    assert (run["status"], run["error"]["code"]) == ("ERROR", "holder_lost")
+    assert [(await _run(client, r))["status"] for r in (held, keyless)] == ["RUNNING", "RUNNING"]
+
+
+async def test_only_a_key_that_may_act_for_the_runs_person_holds_it(client, narrow, app) -> None:
+    """SEC-R-4: a hold decides when a run ends (its lapse ends it), so only a key that may
+    act for the person the run is for takes, extends or drops one: an ordinary user's key is
+    refused another person's run (403), and nothing is held."""
+    run_id = await _running(client, on_behalf_of="user:ada")
+    refused = await _hold(narrow, run_id)
+    assert (refused.status_code, refused.json()["code"]) == (403, "AUTHORIZATION")
+    assert (
+        await narrow.post(f"/v1/runs/{run_id}/release", json={"worker_id": "x"})
+    ).status_code == 403
+    async with app.state.engine.connect() as conn:
+        kept = await conn.execute(
+            text("SELECT holder, held_until FROM agent_runs WHERE run_id = :r"), {"r": run_id}
+        )
+        assert tuple(kept.one()) == (None, None)
+    own = await _running(narrow, on_behalf_of="user_bob")
+    assert (await _hold(narrow, own)).status_code == 200  # its own person's run
+
+
+async def test_a_refused_hold_does_not_say_who_holds_the_run_and_a_hold_is_short(client) -> None:
+    """SEC-R-4: the holder's name is what lets another caller extend or drop its hold, so a
+    refusal does not give it; and a hold lasts at most 300 s, whatever was asked (a worker's
+    lease may last 3600 s: a lapsed hold is how a dead server's run ends)."""
+    run_id = await _running(client)
+    held = await _hold(client, run_id, holder="trellis@host:1:secret", seconds=3600)
+    lasting = datetime.fromisoformat(held.json()["expires_at"]) - datetime.now(UTC)
+    assert timedelta(seconds=200) < lasting <= timedelta(seconds=300)
+    refused = await _hold(client, run_id, holder="someone-else")
+    assert refused.status_code == 409 and "trellis@host" not in refused.text

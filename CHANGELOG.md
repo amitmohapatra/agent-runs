@@ -6,18 +6,27 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
-* **A queued run of a key holds its place.** A run started `QUEUED` with a `concurrency_key`, or
-  answered back onto the queue, is placed among the key's runs as one started `RUNNING` is,
-  and a claim takes it only while no run placed before it runs: one kept in its caller's
-  process placed after it no longer holds it back (that caller waits for it).
-* **A key's runs kept in their caller's process start after its running runs, in commit
-  order.** A run started `RUNNING` with a `concurrency_key`, or continued `RUNNING` after its
-  answer, takes the key's transaction lock (the one claims count the key's room under) and is
-  placed just after the latest change of the key's running runs when its clock would put it
-  before: its `created_at` (or its answer's `recorded_at`) orders it after every run of the key
-  committed before it, whatever the replicas' clocks. The harness answers a conversation's
-  messages one at a time in this order, on whichever process each arrives. The wire is
-  unchanged.
+* **A key's runs are placed in the order they commit, and a queued one holds its place.** A run
+  with a `concurrency_key` is created in its place among the key's runs: under the key's
+  transaction lock (the one claims count the key's room under), in the one statement that
+  follows it, its `created_at` is set just after the latest of the key's running and queued
+  runs when its clock is behind — and never changes. A run continued after its answer takes
+  its place again the same way (its answer's `recorded_at`). A claim takes a queued run only
+  while no run placed before it runs; one kept in its caller's process placed after it no
+  longer holds it back. `ix_runs_concurrency` holds the queued runs too (migration
+  `c9e4f5a6b7d8`). The harness answers a conversation's messages one at a time in this order.
+  The wire is unchanged.
+* **A key's run kept in its caller's process is born to be held.** Started `RUNNING` with a
+  `concurrency_key`, it must be held (a heartbeat) within `RESUME_GRACE` (60 s), as a run
+  continued after its answer must: the ticker ends one nobody ever held `ERROR`
+  (`holder_lost`), so a process killed between the start and its first heartbeat leaves no run
+  its key's line waits behind. A caller that starts keyed runs in its own process and never
+  heartbeats them: heartbeat them, or start them without a key.
+* **Who may hold a run.** A hold decides when a run kept in its caller's process ends, so a
+  heartbeat or a release on one takes a key that administers the tenant, may act for anyone,
+  or may act for the person the run is for (`on_behalf_of`, else its user): `403` otherwise.
+  A hold lasts at most 300 s whatever `lease_seconds` asks, and a refused hold no longer
+  names the holder.
 * **Requires `trellis-contracts>=0.7.1,<0.8`** (the service and the SDK; was `>=0.6.2`).
   agent-runs keeps interrupt resolutions, and a harness on 0.7.1 may send `remember: "always"`,
   which an older contracts package refuses to read: the store takes 0.7.1 before any harness

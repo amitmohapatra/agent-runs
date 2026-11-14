@@ -243,8 +243,9 @@ still running a second later, its `WORKING_TIME_GRACE_SECONDS`, and finishes the
 characters) say how a queued run waits its turn ([the claim](#post-v1runsclaim--200-claimed-or-204)):
 higher priority first, and at most `RUNS__LIMITS__CONCURRENCY_PER_KEY` (default 1) of the
 tenant's runs sharing a key `RUNNING` at once, the others waiting `QUEUED`. Every run of a
-key has a place among its runs: when it was started, or when its latest answer was recorded,
-placed after the key's runs already running or queued in the order the starts commit. A run
+key has a place among its runs: when it was created, or when its latest answer was recorded —
+both set once, after the key's runs already running or queued, in the order the starts
+commit. A run
 recorded `RUNNING` in its caller's process takes its key's place too (it runs), and is never
 held back; a claim takes a queued run only while no run placed before it runs (one placed
 after it waits for it in its caller's process: the harness orders a conversation's turns by
@@ -322,7 +323,12 @@ was killed), within a tick of the hold lapsing the ticker ends the run `ERROR` w
 never put on the queue. A hold fences nothing (the caller still writes without a
 `worker_id`), takes no worker's place, and a pause lets go of it (heartbeat again once the run
 runs again: until then `409 LEASE_LOST`). Another holder's hold in force is `409 LEASE_LOST`;
-so is a heartbeat once the run ended. A run nobody holds is never ended this way.
+so is a heartbeat once the run ended (the refusal does not name the holder). A hold lasts at
+most 300 s, whatever `lease_seconds` asks. Who may hold or let go: a key that administers the
+tenant, may act for anyone, or may act for the person the run is for (`on_behalf_of`, else its
+user); `403` otherwise. A run nobody holds is never ended this way — except one started with a
+`concurrency_key`, which takes its key's place and so is born to be held: nobody holding it
+within 60 s of its start ends it `ERROR` (`holder_lost`) too.
 Answered (`resume`), a run that was held when it paused runs unheld until whoever continues it
 holds it again; if nobody does within `RESUME_GRACE` (60 s) — the process that ran it stopped
 while it waited — the ticker ends it `ERROR` (`holder_lost`, "nobody took the run up after its

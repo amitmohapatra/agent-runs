@@ -1,0 +1,41 @@
+"""The plans of the queries on the claim's and the line's hot paths, kept: each is served by
+an index (``EXPLAIN`` with sequential scans priced out, so a plan that still scans a table
+whole has no index to use). Counts and plans, never time."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy import select, text
+from sqlalchemy.dialects import postgresql
+from trellis.contracts.ids import now
+
+from agent_runs.domain.runs import ClaimRequest
+from agent_runs.store.runs import RunStore, _after_the_line
+from tests.conftest import started
+
+
+async def _plan(db: Any, statement: Any) -> str:
+    """The plan PostgreSQL picks for ``statement`` when an index scan is always cheaper."""
+    await db.execute(text("SET LOCAL enable_seqscan = off"))
+    sql = statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    rows = await db.execute(text(f"EXPLAIN {sql}"))
+    return "\n".join(row[0] for row in rows)
+
+
+async def test_placing_a_run_reads_its_keys_line_from_the_index(app) -> None:
+    """PERF-10: the latest of a key's running and queued runs is an index scan on
+    ``ix_runs_concurrency``, however many runs the tenant keeps."""
+    async with app.state.sessions() as db:
+        plan = await _plan(db, select(_after_the_line("acme", "thread:1", now())))
+    assert "ix_runs_concurrency" in plan and "Seq Scan" not in plan, plan
+
+
+async def test_a_claim_scans_no_table_whole(app, client) -> None:
+    """PERF-9: choosing the next queued run — its key's room, and the place of each run
+    holding the key (its answers) — scans neither ``agent_runs`` nor ``run_resolutions``."""
+    await client.post("/v1/runs", json=started(queue=True, concurrency_key="thread:1"))
+    request = ClaimRequest(worker_id="w1", agent_ids=["triage"], lease_seconds=30)
+    async with app.state.sessions() as db:
+        plan = await _plan(db, RunStore(db)._next_queued("acme", request, now(), []))
+    assert "Seq Scan" not in plan and "ix_run_resolutions_run" in plan, plan

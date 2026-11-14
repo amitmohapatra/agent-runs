@@ -31,10 +31,11 @@ from trellis.contracts.runs import (
 from trellis.runs.answers import answer_problem, schema_problem
 from trellis.runs.payloads import SEGMENTS, PayloadRef, owned_by
 
-from agent_runs.answering import require_may_answer, require_may_cancel
+from agent_runs.answering import require_may_answer, require_may_cancel, require_may_hold
 from agent_runs.blob.payloads import PayloadStore, payloads_of
 from agent_runs.config.constants import (
     CONCURRENCY_PER_KEY,
+    DEFAULT_LEASE_SECONDS,
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
     ERROR_RETRY_CAP,
@@ -110,6 +111,10 @@ _ENDED = tuple(status.value for status in RunStatus if status.final)
 #: How far after the latest of a key's running runs a run kept in its caller's process is
 #: placed when the clock would put it before (``_placed``): PostgreSQL keeps microseconds.
 _AFTER = timedelta(microseconds=1)
+
+#: The longest one heartbeat holds a run kept in its caller's process (a worker's lease may
+#: last ``MAX_LEASE_SECONDS``): five default leases.
+MAX_HOLD = timedelta(seconds=5 * DEFAULT_LEASE_SECONDS)
 
 #: The statuses of the runs in a key's line: running, or queued for a worker (``_placed``).
 _IN_LINE = (RunStatus.RUNNING.value, RunStatus.QUEUED.value)
@@ -324,6 +329,31 @@ def _holds_before(table: Any, place: Any, run_id: Any) -> Any:
     )
 
 
+def _after_the_line(tenant_id: str, key: str, now: datetime, *, but: str = "") -> Any:
+    """When a run takes its place among the runs sharing ``key``, as an expression: ``now``,
+    or just after the latest change of one of them running or queued (``but`` the run itself)
+    when that is later. ``ix_runs_concurrency`` serves it."""
+    others = aliased(RunRow)
+    latest = (
+        select(func.max(others.updated_at))
+        .where(
+            others.tenant_id == tenant_id,
+            others.concurrency_key == key,
+            others.status.in_(_IN_LINE),
+            others.run_id != but,
+        )
+        .scalar_subquery()
+    )
+    clock = literal(now, type_=RunRow.updated_at.type)
+    return func.greatest(clock, latest + _AFTER, type_=RunRow.updated_at.type)
+
+
+def _in_callers_process(row: RunRow) -> bool:
+    """Whether the run is kept in its caller's process: never queued, so no worker leases it
+    and its caller may hold it instead."""
+    return row.lease_owner is None and row.queued_at is None
+
+
 def _lock_id(*names: str) -> Any:
     """The transaction lock of a key's or a tenant's room (``names``), as one number."""
     return func.hashtextextended("\x1f".join(names), 0)
@@ -379,13 +409,22 @@ class RunStore:
         A run id held by another tenant is a ``Conflict`` that says nothing about who holds
         it, or that anyone does.
 
-        A run that shares a ``concurrency_key`` takes its place among the runs sharing it
-        (:meth:`_placed`): its ``created_at`` is after theirs.
+        A run that shares a ``concurrency_key`` is created in its place among the runs sharing
+        it: under the key's lock (:meth:`_key_locked`), in the one statement that follows it,
+        its ``created_at`` is set after theirs (:func:`_after_the_line`) and never changes. One
+        kept in its caller's process is born to be held: its caller holds it within
+        ``RESUME_GRACE``, or the ticker ends it (:meth:`end_abandoned`) — a process that died
+        before its first heartbeat leaves no run its key's line waits behind.
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
         record = RunRecord.from_start(start, status=status)
         input_ref = await self._put(record.tenant_id, record.input)
-        row = await self._session.scalar(
+        at: Any = now
+        if record.concurrency_key is not None:
+            await self._key_locked(record.tenant_id, record.concurrency_key)
+            at = _after_the_line(record.tenant_id, record.concurrency_key, now)
+        born_held = not queue and record.concurrency_key is not None
+        run = (
             insert(RunRow)
             .values(
                 run_id=record.run_id,
@@ -400,27 +439,40 @@ class RunStore:
                 input_ref=_dumped(input_ref),
                 deadline=record.deadline,
                 timeout_seconds=record.timeout_seconds,
-                running_since=None if queue else now,
+                running_since=None if queue else at,
                 idempotency_key=record.idempotency_key,
                 agent_version=record.agent_version,
                 priority=record.priority,
                 concurrency_key=record.concurrency_key,
                 run_metadata=record.metadata or None,
                 attempt=1,
-                queued_at=now if queue else None,
-                created_at=now,
-                updated_at=now,
+                queued_at=at if queue else None,
+                held_until=at + RESUME_GRACE if born_held else None,
+                created_at=at,
+                updated_at=at,
             )
             .on_conflict_do_nothing()
-            .returning(RunRow)
+            .returning(RunRow.created_at)
+            .cte("run")
         )
-        if row is not None:
-            await self._link(row.run_id, _INPUT, input_ref)
-            started = await self._record(row, now)
-            if row.concurrency_key is not None:
-                at = await self._placed(row, now, started=True)
-                started = started.model_copy(update={"created_at": at, "updated_at": at})
-            return started, True
+        started = select(run.c.created_at)
+        if input_ref is not None:  # the run refers to its input: kept while it does
+            linked = (
+                insert(RunPayloadRow)
+                .from_select(
+                    ["run_id", "key", "kind"],
+                    select(literal(record.run_id), literal(input_ref.ref), literal(_INPUT)).where(
+                        select(run.c.created_at).exists()
+                    ),
+                )
+                .on_conflict_do_nothing()
+                .cte("linked")
+            )
+            started = started.add_cte(linked)
+        placed_at = await self._session.scalar(started)
+        if placed_at is not None:
+            placed = {"created_at": placed_at, "updated_at": placed_at}
+            return record.model_copy(update=placed), True
         if start.idempotency_key:
             keyed = await self._one(
                 RunRow.tenant_id == start.tenant_id,
@@ -555,7 +607,7 @@ class RunStore:
         await self._ended([row], now)
         continued = await self._flushed(row, now)
         if resolution.decision is not InterruptDecision.CANCEL and row.concurrency_key is not None:
-            at = await self._placed(row, now, answered=_resolution_id(resolution))
+            at = await self._placed_again(row, now, _resolution_id(resolution))
             continued = continued.model_copy(update={"updated_at": at})
         return continued, True
 
@@ -761,70 +813,56 @@ class RunStore:
         lock = func.pg_try_advisory_xact_lock(_lock_id(*names))
         return bool(await self._session.scalar(select(lock)))
 
-    async def _placed(
-        self, row: RunRow, now: datetime, *, started: bool = False, answered: str | None = None
-    ) -> datetime:
-        """The run takes its place among the runs sharing its ``concurrency_key`` — it
-        ``started`` (queued or running), or continues after the answer ``answered`` (its
-        resolution's id) — and when that is: ``now``, or just after the latest change of one of
-        them running or queued when that is later. Its ``created_at`` (started) or its answer's
-        ``recorded_at``, and ``updated_at``, say it (:func:`_place`).
-
-        The key's transaction lock (a claim counts the key's room under it too), then one
-        statement, the transaction's last before its commit: of two runs placed at once the
-        one that commits second is placed after the first, whatever their clocks, so once a
-        caller reads its run back every run placed before it is there to read. (The lock is a
-        statement of its own: the statement that places reads the runs committed while it
-        waited for the lock.) A caller orders the runs of one conversation by the places (the
-        harness answers a conversation's messages one at a time, in this order, on whichever
-        process each arrives), and a claim respects them (:meth:`_key_has_room`).
-        ``ix_runs_concurrency`` serves the read."""
-        assert row.concurrency_key is not None
-        lock = func.pg_advisory_xact_lock(_lock_id("key", row.tenant_id, row.concurrency_key))
+    async def _key_locked(self, tenant_id: str, key: str) -> None:
+        """Take the transaction lock of the concurrency ``key`` (a claim counts the key's room
+        under it too), a statement of its own: the one statement that follows — it places a
+        run among the key's runs, and is the transaction's last before its commit — reads the
+        runs committed while this one waited. Of two runs placed at once the one that commits
+        second is so placed after the first, whatever their clocks: once a caller reads its run
+        back, every run placed before it is there to read."""
+        lock = func.pg_advisory_xact_lock(_lock_id("key", tenant_id, key))
         await self._session.execute(select(lock))
-        others = aliased(RunRow)
-        latest = (
-            select(func.max(others.updated_at))
-            .where(
-                others.tenant_id == row.tenant_id,
-                others.concurrency_key == row.concurrency_key,
-                others.status.in_(_IN_LINE),
-                others.run_id != row.run_id,
-            )
-            .scalar_subquery()
-        )
-        clock = literal(now, type_=RunRow.updated_at.type)
-        place = select(func.greatest(clock, latest + _AFTER).label("at")).cte("place")
+
+    async def _placed_again(self, row: RunRow, now: datetime, answered: str) -> datetime:
+        """The run continues after the answer ``answered`` (its resolution's id) and takes its
+        place again among the runs sharing its ``concurrency_key``: after them
+        (:func:`_after_the_line`), under the key's lock, in one statement that sets when it
+        runs (or is queued) again and when its answer was recorded. Its ``created_at`` stays."""
+        assert row.concurrency_key is not None
+        await self._key_locked(row.tenant_id, row.concurrency_key)
+        after = _after_the_line(row.tenant_id, row.concurrency_key, now, but=row.run_id)
+        place = select(after.label("at")).cte("place")
         at = select(place.c.at).scalar_subquery()
-        moved = {
-            RunRow.updated_at: at,
-            RunRow.running_since: case((RunRow.running_since.is_not(None), at)),
-            RunRow.queued_at: case((RunRow.queued_at.is_not(None), at)),
-        }
-        if started:
-            moved[RunRow.created_at] = at
+        recorded = (
+            update(ResolutionRow)
+            .where(
+                ResolutionRow.tenant_id == row.tenant_id, ResolutionRow.resolution_id == answered
+            )
+            .values(recorded_at=at)
+            .cte("answered")
+        )
         placing = (
             update(RunRow)
             .where(RunRow.run_id == row.run_id)
-            .values(moved)
+            .values(
+                updated_at=at,
+                running_since=case((RunRow.running_since.is_not(None), at)),
+                queued_at=case((RunRow.queued_at.is_not(None), at)),
+            )
             .returning(RunRow.updated_at)
             .execution_options(synchronize_session=False)
+            .add_cte(recorded)
         )
-        if answered is not None:
-            recorded = (
-                update(ResolutionRow)
-                .where(
-                    ResolutionRow.tenant_id == row.tenant_id,
-                    ResolutionRow.resolution_id == answered,
-                )
-                .values(recorded_at=at)
-                .cte("answered")
-            )
-            placing = placing.add_cte(recorded)
         return (await self._session.execute(placing)).scalar_one()
 
     async def heartbeat(
-        self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime
+        self,
+        tenant_id: str,
+        run_id: str,
+        request: HeartbeatRequest,
+        *,
+        caller: KeyInfo,
+        now: datetime,
     ) -> Lease:
         """Extend the caller's lease, saving its progress checkpoint when it sends one. A 409
         means the lease is gone (it lapsed and the run was re-queued, or the run was
@@ -836,13 +874,14 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if row.status != RunStatus.RUNNING:
             raise LeaseLost(f"run {run_id} is {row.status}: no lease to extend")
-        in_process = row.lease_owner is None and row.queued_at is None
+        in_process = _in_callers_process(row)
         if not in_process:
             _fence(row, request.worker_id)
         if checkpoint is not None:
             await self._keep_checkpoint(row, checkpoint)
             row.updated_at = now
         if in_process:
+            require_may_hold(caller, row.on_behalf_of or row.user_id)
             lease = self._hold(row, request.worker_id, request.lease_seconds, now)
         else:
             lease = self._lease(row, request.worker_id, request.lease_seconds, now)
@@ -855,10 +894,12 @@ class RunStore:
         (:meth:`end_abandoned`), as nothing else can run it. Unlike a worker's lease it fences
         nothing (the caller writes to the run without a ``worker_id``, as before), takes no
         worker's place and never puts the run on the queue; a pause lets go of it. Another
-        holder's hold in force is ``LeaseLost``."""
+        holder's hold in force is ``LeaseLost`` (which does not name it: its name is what lets
+        a caller extend or drop its hold). A hold lasts at most :data:`MAX_HOLD`, whatever was
+        asked: its lapse is how a dead process's run ends."""
         if row.holder not in (None, holder) and row.held_until and row.held_until >= now:
-            raise LeaseLost(f"run {row.run_id} is held by {row.holder}")
-        expires_at = now + timedelta(seconds=seconds)
+            raise LeaseLost(f"run {row.run_id} is held by another process")
+        expires_at = now + min(timedelta(seconds=seconds), MAX_HOLD)
         row.holder, row.held_until = holder, expires_at
         return Lease(
             run_id=row.run_id,
@@ -868,7 +909,13 @@ class RunStore:
         )
 
     async def release(
-        self, tenant_id: str, run_id: str, request: ReleaseRequest, *, now: datetime
+        self,
+        tenant_id: str,
+        run_id: str,
+        request: ReleaseRequest,
+        *,
+        caller: KeyInfo,
+        now: datetime,
     ) -> tuple[RunRecord, bool]:
         """The worker holding the run lets go of it (it is stopping): back on the queue at
         once as the next attempt, for another worker, keeping ``request.checkpoint`` as its
@@ -882,8 +929,9 @@ class RunStore:
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if _settled(row, RunStatus.QUEUED, request.worker_id):
             return await self._record(row, now), False
-        if row.status == RunStatus.RUNNING and row.lease_owner is None and row.queued_at is None:
+        if row.status == RunStatus.RUNNING and _in_callers_process(row):
             # kept in its caller's process: its holder lets go of it, and it goes on unheld
+            require_may_hold(caller, row.on_behalf_of or row.user_id)
             if row.holder != request.worker_id:
                 raise LeaseLost(f"{request.worker_id} does not hold run {run_id}")
             if checkpoint is not None:
