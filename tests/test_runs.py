@@ -314,6 +314,7 @@ async def test_the_listing_is_summaries_and_the_record_is_one_get_away(client) -
         "deadline",
         "thread_id",
         "updated_at",
+        "placed_at",
     }
     assert summary["status"] == "PAUSED" and summary["assignee"] == "user:u1"
     assert summary["awaiting"]["question"] == "Approve?"

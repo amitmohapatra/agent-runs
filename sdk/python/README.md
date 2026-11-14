@@ -99,7 +99,7 @@ are grouped:
 | `runs.cancel` | `cancel(run_id, *, reason=None)` | `RunRecord` (`CANCELLED`, or `RUNNING` until its worker stops) |
 | `runs.finish` | `finish(run_id, status, *, output=None, error=None, worker_id=None)` | `RunRecord` (`QUEUED` when a retryable `ERROR` is retried) |
 | `runs.get` | `get(run_id)` | `RunRecord`, or `None` |
-| `runs.list` | `list(*, status, assignee, agent_id, thread_id, parent_run_id, top_level=False, cursor, limit=50)` | `Page[RunSummary]` (`top_level=True`: no sub-agents) |
+| `runs.list` | `list(*, status, assignee, agent_id, thread_id, concurrency_key, parent_run_id, top_level=False, cursor, limit=50)` | `Page[RunSummary]` (`top_level=True`: no sub-agents; `concurrency_key` with `status` `RUNNING` or `QUEUED`: the key's line, each run's place its `placed_at`) |
 | | `iterate(..., max_pages=None)` | every `RunSummary`, page after page |
 | `runs.resolutions` | `resolutions(run_id, *, cursor, limit=50)` | `Page[ResolutionEntry]` |
 | `runs.append_events` | `append_events(run_id, events, *, worker_id=None)` | `EventsAppended` (`appended`, the log's last `position`); a repeated event is stored once |

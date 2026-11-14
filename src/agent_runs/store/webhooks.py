@@ -94,6 +94,7 @@ def envelope(run: RunRecord, event: WebhookEvent) -> dict[str, Any]:
         assignee=assignee,
         deadline=run.deadline,
         updated_at=run.updated_at,
+        placed_at=run.placed_at,
     )
     return {
         "event_id": stable_id(run.run_id, run.attempt, run.status, event, assignee, prefix="whd_"),

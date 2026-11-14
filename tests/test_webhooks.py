@@ -65,7 +65,12 @@ def test_the_envelope_carries_the_summary_and_a_stable_event_id() -> None:
         "deadline",
         "thread_id",
         "updated_at",
+        "placed_at",
     }
+    assert sent["data"]["run"]["placed_at"] is None  # a run with no concurrency_key
+    placed = _run(status=RunStatus.SUCCESS, concurrency_key="k", placed_at=done.created_at)
+    run = envelope(placed, WebhookEvent.FINISHED)["data"]["run"]
+    assert run["placed_at"] == done.created_at.isoformat().replace("+00:00", "Z")
     assert sent["event_id"] == envelope(done, WebhookEvent.FINISHED)["event_id"]
     retried = _run(status=RunStatus.SUCCESS, attempt=2)
     assert envelope(retried, WebhookEvent.FINISHED)["event_id"] != sent["event_id"]

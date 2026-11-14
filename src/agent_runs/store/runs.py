@@ -100,7 +100,10 @@ _RECORD_FIELDS = (
 )
 
 
-_SUMMARY_COLUMNS = tuple(getattr(RunRow, name) for name in RunSummary.model_fields)
+#: A summary's columns (its ``placed_at`` is computed: :func:`_placed_at`).
+_SUMMARY_COLUMNS = tuple(
+    getattr(RunRow, name) for name in RunSummary.model_fields if name != "placed_at"
+)
 
 #: A run a worker holds: what fair share and the per-tenant cap count.
 _LEASED = (RunRow.status == RunStatus.RUNNING.value, RunRow.lease_owner.is_not(None))
@@ -164,13 +167,18 @@ _REFS = {
 
 
 async def _records(
-    payloads: PayloadStore, rows: Sequence[RunRow], now: datetime
+    payloads: PayloadStore,
+    rows: Sequence[RunRow],
+    now: datetime,
+    places: Mapping[str, datetime],
 ) -> list[RunRecord]:
-    """The runs' records, every payload the rows refer to read in (all at once)."""
+    """The runs' records, every payload the rows refer to read in (all at once), each placed
+    as ``places`` says (by run id; none for a run with no key)."""
     wanted: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     records: list[dict[str, Any]] = []
     for row in rows:
         fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
+        fields["placed_at"] = places.get(row.run_id)
         fields["metadata"] = row.run_metadata or {}
         fields["worked_seconds"] = _worked(row, now)
         for name, column in _REFS.items():
@@ -319,6 +327,12 @@ def _place(table: Any) -> Any:
         .scalar_subquery()
     )
     return func.greatest(table.created_at, answered)
+
+
+def _placed_at(table: Any) -> Any:
+    """``placed_at`` as clients read it: the run's place (:func:`_place`) when it shares a
+    key, else null."""
+    return case((table.concurrency_key.is_not(None), _place(table))).label("placed_at")
 
 
 def _holds_before(table: Any, place: Any, run_id: Any) -> Any:
@@ -472,6 +486,8 @@ class RunStore:
         placed_at = await self._session.scalar(started)
         if placed_at is not None:
             placed = {"created_at": placed_at, "updated_at": placed_at}
+            if record.concurrency_key is not None:  # its place: when it took it, just now
+                placed["placed_at"] = placed_at
             return record.model_copy(update=placed), True
         if start.idempotency_key:
             keyed = await self._one(
@@ -608,7 +624,7 @@ class RunStore:
         continued = await self._flushed(row, now)
         if resolution.decision is not InterruptDecision.CANCEL and row.concurrency_key is not None:
             at = await self._placed_again(row, now, _resolution_id(resolution))
-            continued = continued.model_copy(update={"updated_at": at})
+            continued = continued.model_copy(update={"updated_at": at, "placed_at": at})
         return continued, True
 
     async def _answered_by(self, tenant_id: str, resolution: InterruptResolution) -> bool:
@@ -996,7 +1012,7 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return await _records(self._payloads, rows, now)
+        return await self._records(rows, now)
 
     async def time_out_overworked(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Running runs whose working time passed their limit (``_limit``: their own
@@ -1030,7 +1046,7 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return await _records(self._payloads, rows, now)
+        return await self._records(rows, now)
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
@@ -1064,7 +1080,7 @@ class RunStore:
                 _requeue(row, now, wait=jittered(wait))
         await self._ended(rows, now)
         await self._session.flush()
-        return await _records(self._payloads, rows, now)
+        return await self._records(rows, now)
 
     async def end_abandoned(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
@@ -1101,7 +1117,7 @@ class RunStore:
             )
         await self._ended(rows, now)
         await self._session.flush()
-        return await _records(self._payloads, rows, now)
+        return await self._records(rows, now)
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
@@ -1138,7 +1154,7 @@ class RunStore:
                 )
         await self._ended(rows, now)
         await self._session.flush()
-        return await _records(self._payloads, rows, now)
+        return await self._records(rows, now)
 
     async def purge_ended(self, *, before: datetime, limit: int) -> int:
         """Delete the runs that ended before ``before``, with their resolutions and their
@@ -1343,34 +1359,31 @@ class RunStore:
         assignee: str | None = None,
         agent_id: str | None = None,
         thread_id: str | None = None,
+        concurrency_key: str | None = None,
         parent_run_id: str | None = None,
         top_level: bool = False,
         limit: int = DEFAULT_PAGE,
         after: Mapping[str, Any] | None = None,
     ) -> Page[RunSummary]:
         """This tenant's runs, newest first, as summaries (only the summary's columns are
-        read), a page at a time (keyset ``created_at, run_id``, both descending).
+        read, and each keyed run's place), a page at a time (keyset ``created_at, run_id``,
+        both descending: ``created_at`` is written once, so a run never moves between pages).
         ``status=PAUSED`` with ``assignee`` is the inbox of one person or role, served by
-        ``ix_runs_inbox``; ``top_level`` keeps only the runs no other run started."""
-        order = (RunRow.created_at, RunRow.run_id)
-        query = select(*_SUMMARY_COLUMNS, RunRow.created_at, RunRow.awaiting_ref).where(
-            RunRow.tenant_id == tenant_id
+        ``ix_runs_inbox``; ``concurrency_key`` with ``status`` ``RUNNING`` or ``QUEUED`` is
+        the key's line, served by ``ix_runs_concurrency``; ``top_level`` keeps only the runs
+        no other run started."""
+        newest = self._listing(
+            tenant_id,
+            status=status,
+            assignee=assignee,
+            agent_id=agent_id,
+            thread_id=thread_id,
+            concurrency_key=concurrency_key,
+            parent_run_id=parent_run_id,
+            top_level=top_level,
+            limit=limit,
+            after=after,
         )
-        if after is not None:
-            query = query.where(tuple_(*order) < (after["created_at"], after["run_id"]))
-        filters: dict[Any, Any] = {
-            RunRow.status: status.value if status else None,
-            RunRow.assignee: assignee,
-            RunRow.agent_id: agent_id,
-            RunRow.thread_id: thread_id,
-            RunRow.parent_run_id: parent_run_id,
-        }
-        for column, value in filters.items():
-            if value is not None:
-                query = query.where(column == value)
-        if top_level:
-            query = query.where(RunRow.parent_run_id.is_(None))
-        newest = query.order_by(*(column.desc() for column in order)).limit(limit + 1)
         rows = (await self._session.execute(newest)).all()
         waiting = [row for row in rows if row.awaiting_ref is not None and row.awaiting]
         payloads = await self._payloads.get_many(row.awaiting_ref for row in waiting)
@@ -1390,6 +1403,42 @@ class RunStore:
             item=summary,
             position=lambda row: {"created_at": row.created_at, "run_id": row.run_id},
         )
+
+    def _listing(
+        self,
+        tenant_id: str,
+        *,
+        status: RunStatus | None = None,
+        assignee: str | None = None,
+        agent_id: str | None = None,
+        thread_id: str | None = None,
+        concurrency_key: str | None = None,
+        parent_run_id: str | None = None,
+        top_level: bool = False,
+        limit: int = DEFAULT_PAGE,
+        after: Mapping[str, Any] | None = None,
+    ) -> Select[Any]:
+        """The statement of one page of :meth:`list`."""
+        order = (RunRow.created_at, RunRow.run_id)
+        query = select(
+            *_SUMMARY_COLUMNS, _placed_at(RunRow), RunRow.created_at, RunRow.awaiting_ref
+        ).where(RunRow.tenant_id == tenant_id)
+        if after is not None:
+            query = query.where(tuple_(*order) < (after["created_at"], after["run_id"]))
+        filters: dict[Any, Any] = {
+            RunRow.status: status.value if status else None,
+            RunRow.assignee: assignee,
+            RunRow.agent_id: agent_id,
+            RunRow.thread_id: thread_id,
+            RunRow.concurrency_key: concurrency_key,
+            RunRow.parent_run_id: parent_run_id,
+        }
+        for column, value in filters.items():
+            if value is not None:
+                query = query.where(column == value)
+        if top_level:
+            query = query.where(RunRow.parent_run_id.is_(None))
+        return query.order_by(*(column.desc() for column in order)).limit(limit + 1)
 
     # ------------------------------------------------------------------ internals
     async def _one(self, *conditions: Any) -> RunRow | None:
@@ -1426,7 +1475,16 @@ class RunStore:
         return await self._record(row, now)
 
     async def _record(self, row: RunRow, now: datetime) -> RunRecord:
-        return (await _records(self._payloads, [row], now))[0]
+        return (await self._records([row], now))[0]
+
+    async def _records(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
+        """The rows' records, the places of those that share a key read in one statement."""
+        keyed = [row.run_id for row in rows if row.concurrency_key is not None]
+        places: dict[str, datetime] = {}
+        if keyed:
+            placed = select(RunRow.run_id, _placed_at(RunRow)).where(RunRow.run_id.in_(keyed))
+            places = dict((await self._session.execute(placed)).tuples().all())
+        return await _records(self._payloads, rows, now, places)
 
     # ------------------------------------------------------------------ payloads
     async def _put(self, tenant_id: str, value: Any) -> PayloadRef | None:

@@ -582,6 +582,13 @@ async def listing(
     ] = None,
     agent_id: Annotated[str | None, Query(description="Only runs of this agent.")] = None,
     thread_id: Annotated[str | None, Query(description="Only runs in this thread.")] = None,
+    concurrency_key: Annotated[
+        str | None,
+        Query(
+            description="Only runs sharing this concurrency_key; with status RUNNING or "
+            "QUEUED, the key's line (each run's place is its placed_at)."
+        ),
+    ] = None,
     parent_run_id: Annotated[
         str | None, Query(description="Only the child runs of this run.")
     ] = None,
@@ -604,6 +611,7 @@ async def listing(
         assignee=assignee,
         agent_id=agent_id,
         thread_id=thread_id,
+        concurrency_key=concurrency_key,
         parent_run_id=parent_run_id,
         top_level=top_level,
         limit=limit,

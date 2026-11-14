@@ -30,8 +30,10 @@ from trellis.contracts.runs import (
 class RunSummary(BaseModel):
     """A run as a listing shows it: enough to tell runs apart and to work an inbox. The
     question a paused run asks is ``awaiting``; ``assignee`` is whose inbox it is in;
-    ``deadline`` is the run's own (the interrupt's is ``awaiting.deadline``). Read the run
-    (``RunsClient.get``) for its input, output, error and checkpoint."""
+    ``deadline`` is the run's own (the interrupt's is ``awaiting.deadline``); ``placed_at``
+    is the run's place among the runs sharing its ``concurrency_key`` (``RunRecord.
+    placed_at``; ``None`` for a run with no key). Read the run (``RunsClient.get``) for its
+    input, output, error and checkpoint."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -43,6 +45,7 @@ class RunSummary(BaseModel):
     deadline: datetime | None = None
     thread_id: str | None = None
     updated_at: datetime
+    placed_at: datetime | None = None
 
 
 class Lease(BaseModel):

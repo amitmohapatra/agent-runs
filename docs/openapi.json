@@ -1849,6 +1849,19 @@
             "description": "Run that started this one as a nested agent run; None for a top-level run.",
             "title": "Parent Run Id"
           },
+          "placed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Read-only, set by the run store: the run's place among the runs sharing its concurrency_key, the order they run in (an earlier place first, then the lesser run_id): when it was started, or when its latest answer was recorded (a run continued after an answer takes its place again, after the runs that came in while it waited). None for a run with no concurrency_key, and from a store older than this field.",
+            "title": "Placed At"
+          },
           "priority": {
             "default": 0,
             "description": "Claim order among the tenant's queued runs: higher first, then the oldest; -1000 to 1000, default 0.",
@@ -2010,6 +2023,19 @@
             ],
             "description": "The run's own deadline (not the interrupt's).",
             "title": "Deadline"
+          },
+          "placed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Read-only: the run's place among the runs sharing its concurrency_key (the record's placed_at): when it was started, or when its latest answer was recorded. Null for a run with no concurrency_key.",
+            "title": "Placed At"
           },
           "run_id": {
             "description": "The run's id.",
@@ -4112,6 +4138,24 @@
               ],
               "description": "Only runs in this thread.",
               "title": "Thread Id"
+            }
+          },
+          {
+            "description": "Only runs sharing this concurrency_key; with status RUNNING or QUEUED, the key's line (each run's place is its placed_at).",
+            "in": "query",
+            "name": "concurrency_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs sharing this concurrency_key; with status RUNNING or QUEUED, the key's line (each run's place is its placed_at).",
+              "title": "Concurrency Key"
             }
           },
           {

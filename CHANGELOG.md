@@ -6,6 +6,25 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **An answer is held to its question's `format`s.** `trellis.runs.answers.answer_problem` (what
+  `POST /v1/runs/{id}/resume` checks, and the harness for a run it keeps in its process) now
+  validates `expects` with the schema draft's own format checker (`jsonschema`, already a
+  dependency): an answer to a `{"type": "string", "format": "date"}` question that is not an
+  ISO 8601 calendar date (`"tomorrow"`, `"2026-13-40"`, `""`) is `422 VALIDATION` ("… is not a
+  'date'"), as any misfit is, and the run keeps waiting. Other formats the checker knows
+  (`email`, `ipv4`, `uuid`, …) are held to theirs as well; a format whose checker needs a
+  library that is not installed is not checked, as before.
+* **A run's place in its key's line is on the wire, and a key's line can be listed.** The run
+  record and the run summary carry `placed_at` (read-only, optional; `trellis-contracts`
+  `RunRecord.placed_at`): when the run was started, or when its latest answer was recorded —
+  the place agent-runs decides under the key's lock. Null for a run with no
+  `concurrency_key`. `GET /v1/runs` (and the SDK's `list`/`iterate`) takes `concurrency_key`:
+  only that key's runs, in the caller's tenant; with `status=RUNNING` or `QUEUED` it is served
+  by `ix_runs_concurrency`, each place read from `ix_run_resolutions_run` (plan kept in
+  `tests/test_plans.py`). Additive: an older client ignores the field and never sends the
+  filter. The harness orders a conversation's turns by `placed_at` and lists its line by its
+  key, so it no longer reads every answer of every run in the line, nor another user's runs
+  on a thread of the same name.
 * **A key's runs are placed in the order they commit, and a queued one holds its place.** A run
   with a `concurrency_key` is created in its place among the key's runs: under the key's
   transaction lock (the one claims count the key's room under), in the one statement that
