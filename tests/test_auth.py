@@ -165,9 +165,14 @@ async def test_the_cache_is_bounded(monkeypatch) -> None:
     monkeypatch.setattr("agent_runs.keys.MAX_CACHED_KEYS", 2)
     memory = FakeMemory()
     keys = memory.registry()
-    for key in ("dev-key", "other-key", "narrow-key", "dev-key"):
+    for key in ("dev-key", "other-key", "dev-key"):
         await keys.resolve(key)
-    assert memory.asked == ["dev-key", "other-key", "narrow-key", "dev-key"]
+    assert memory.asked == ["dev-key", "other-key"], "at the bound, every key is still kept"
+    for key in ("narrow-key", "dev-key"):  # dev-key was used after other-key
+        await keys.resolve(key)
+    assert memory.asked == ["dev-key", "other-key", "narrow-key"], "the recently used stay"
+    await keys.resolve("other-key")
+    assert memory.asked[-1] == "other-key", "the least recently used went first"
 
 
 async def test_the_key_goes_to_the_registry_as_x_api_key(app, memory) -> None:

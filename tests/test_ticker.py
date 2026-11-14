@@ -41,6 +41,18 @@ def test_the_breaker_opens_at_the_threshold_and_admits_one_trial_after_cooldown(
     assert not breaker.is_open
 
 
+def test_a_success_forgets_the_failures_before_it() -> None:
+    """Failures count while they are consecutive: after a success it takes ``threshold``
+    new ones to open the breaker, not what is left of the old count."""
+    breaker = Breaker(threshold=2, cooldown=timedelta(seconds=60))
+    breaker.record_failure(NOW)
+    breaker.record_success()
+    breaker.record_failure(NOW)
+    assert not breaker.is_open and breaker.allows(NOW)
+    breaker.record_failure(NOW)
+    assert breaker.is_open
+
+
 def test_a_failed_trial_restarts_the_cooldown() -> None:
     breaker = Breaker(threshold=1, cooldown=timedelta(seconds=60))
     breaker.record_failure(NOW)
