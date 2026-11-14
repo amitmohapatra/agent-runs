@@ -11,9 +11,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
   validates `expects` with the schema draft's own format checker (`jsonschema`, already a
   dependency): an answer to a `{"type": "string", "format": "date"}` question that is not an
   ISO 8601 calendar date (`"tomorrow"`, `"2026-13-40"`, `""`) is `422 VALIDATION` ("… is not a
-  'date'"), as any misfit is, and the run keeps waiting. Other formats the checker knows
-  (`email`, `ipv4`, `uuid`, …) are held to theirs as well; a format whose checker needs a
-  library that is not installed is not checked, as before.
+  'date'"), as any misfit is, and the run keeps waiting. The formats enforced are one named
+  set, `trellis.runs.answers.ANSWER_FORMATS` (`date`, `email`, `ipv4`, `ipv6`, `regex`,
+  `uuid`: those the standard library checks), whatever optional libraries are installed, so
+  two servers never disagree on an answer; any other format (`date-time`, `time`, `hostname`,
+  `uri`, …) is not checked anywhere.
 * **A run's place in its key's line is on the wire, and a key's line can be listed.** The run
   record and the run summary carry `placed_at` (read-only, optional; `trellis-contracts`
   `RunRecord.placed_at`): when the run was started, or when its latest answer was recorded —

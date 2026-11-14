@@ -429,9 +429,12 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
 like it for the rest of the run; the harness, which sees the calls, keeps that promise, and
 this service keeps the record.
 **The answer must fit the question** (`trellis.runs.answers`, checked before anything is
-written): an `ANSWER` fits the interrupt's `expects` — its `format`s too, as the schema's
-draft's format checker knows them (a `"format": "date"` answer is an ISO 8601 calendar date,
-`YYYY-MM-DD`) — or, with no `expects`, picks among its
+written): an `ANSWER` fits the interrupt's `expects` — its `format` too when it is one of
+`trellis.runs.answers.ANSWER_FORMATS`: `date` (an ISO 8601 calendar date, `YYYY-MM-DD`),
+`email`, `ipv4`, `ipv6`, `regex`, `uuid`, the formats the standard library can check, so every
+server enforces the same set whatever else is installed. Any other format (`date-time`, `time`,
+`hostname`, `uri`, …) is not checked: the answer only has to be a string — or, with no
+`expects`, picks among its
 `options` when it has some: one option's `value` (never its `label`), or with `multiple` a
 list of distinct values. An answer the asker's own screen (`component`) collected is held to
 the same. An `EDIT` of a question (no `tool_call`) carries a `payload` that fits `expects`;

@@ -6,8 +6,8 @@ continues, and the harness makes for a run it keeps in its own process (no agent
 * :func:`answer_problem`: a resolution answers the interrupt, an ``ANSWER`` fits ``expects``
   (else picks among ``options``: one option's value, or with ``multiple`` a list of distinct
   values), and the corrected value of an ``EDIT`` of a question fits ``expects``: its
-  ``format`` too, as the schema draft's own format checker knows it (a ``date`` is an
-  ISO 8601 calendar date, ``YYYY-MM-DD``). An answer
+  ``format`` too when it is one of :data:`ANSWER_FORMATS` (a ``date`` is an ISO 8601
+  calendar date, ``YYYY-MM-DD``); any other format is not checked. An answer
   the asker's own screen (``component``) collected is held to the same. ``APPROVE``,
   ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered for the run
   (``remember="run"``) must be of a tool call. A tool call's edited arguments are checked
@@ -19,12 +19,22 @@ Both return why, in words, or ``None``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
-from jsonschema import SchemaError
+from jsonschema import FormatChecker, SchemaError
 from jsonschema.exceptions import best_match
 from jsonschema.validators import validator_for
 from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
+
+#: The ``format`` values an answer is held to, whatever the schema's draft and whatever else is
+#: installed: those jsonschema checks with the standard library alone, so every server and
+#: harness enforces the same set. ``date-time`` and ``time`` are not among them (jsonschema
+#: checks them as RFC 3339 only when the optional ``rfc3339-validator`` is installed), nor is
+#: any format whose checker needs another optional library (``hostname``, ``uri``, ...): a
+#: format outside this set is accepted as any string of its type.
+ANSWER_FORMATS: Final = ("date", "email", "ipv4", "ipv6", "regex", "uuid")
+
+_FORMATS: Final = FormatChecker(formats=ANSWER_FORMATS)
 
 
 def schema_problem(expects: dict[str, Any] | None) -> str | None:
@@ -56,8 +66,7 @@ def _fit_problem(interrupt: Interrupt, value: Any, *, choosing: bool) -> str | N
     if expects is not None:
         if problem := schema_problem(expects):
             return problem
-        validator = validator_for(expects)
-        checked = validator(expects, format_checker=validator.FORMAT_CHECKER)
+        checked = validator_for(expects)(expects, format_checker=_FORMATS)
         error = best_match(checked.iter_errors(value))
         if error is None:
             return None
