@@ -5,6 +5,7 @@ reads, the per-tenant rate limit, and the metrics that show all of it."""
 from __future__ import annotations
 
 import gzip
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -46,6 +47,7 @@ async def test_a_declared_body_past_the_cap_is_refused_before_it_is_read(small) 
         "/v1/runs", content=b"{" + b" " * 5000 + b"}", headers={"content-type": "application/json"}
     )
     assert (response.status_code, response.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
+    assert response.json()["retryable"] is False, "the same body is refused again"
     assert response.headers["content-type"] == "application/problem+json"
     assert (await small.get("/v1/runs")).json() == []
 
@@ -58,6 +60,27 @@ async def test_a_chunked_body_past_the_cap_is_counted_and_refused(small) -> None
     assert "content-length" not in response.request.headers, "sent chunked"
     assert (response.status_code, response.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
     assert (await small.get("/v1/runs")).json() == []
+
+
+async def test_a_chunked_body_is_held_to_the_body_cap_to_the_byte(small) -> None:
+    """The body cap counts what arrives, not what the run keeps: blank JSON padding makes a
+    body past 4 KiB whose run is tiny, so only the body count can refuse it. Exactly the cap
+    goes through; one byte more does not."""
+    head, tail = b'{"tenant_id": "acme", "agent_id": "triage"', b"}"
+    for size, status in ((4096, 201), (4097, 413)):
+        padding = b" " * (size - len(head) - len(tail))
+        response = await small.post(
+            "/v1/runs",
+            content=_chunks(head, padding, tail),
+            headers={"content-type": "application/json"},
+        )
+        assert "content-length" not in response.request.headers, "sent chunked"
+        assert response.status_code == status, (size, response.text)
+        declared = await small.post(
+            "/v1/runs", content=head + padding + tail, headers={"content-type": "application/json"}
+        )
+        assert declared.request.headers["content-length"] == str(size)
+        assert declared.status_code == status, (size, declared.text)
 
 
 async def test_a_chunked_body_within_the_cap_goes_through(small) -> None:
@@ -77,6 +100,17 @@ async def test_a_run_input_or_output_past_its_cap_is_refused(small) -> None:
     ended = await small.post(f"/v1/runs/{rid}/finish", json={"status": "SUCCESS", "output": big})
     assert (ended.status_code, ended.json()["code"]) == (413, "PAYLOAD_TOO_LARGE")
     assert (await small.get(f"/v1/runs/{rid}")).json()["status"] == "RUNNING"
+
+
+async def test_a_payload_is_measured_in_the_utf8_bytes_of_its_compact_json(small) -> None:
+    """``ü`` is two bytes of compact UTF-8 JSON, not the six of an ASCII escape: 900 of them
+    (about 1.8 KiB) fit the 2 KiB cap, though escaped they would be 5.4 KiB."""
+    body = json.dumps(started(input={"t": "ü" * 900}), ensure_ascii=False).encode()
+    response = await small.post(
+        "/v1/runs", content=body, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["input"] == {"t": "ü" * 900}
 
 
 async def test_a_checkpoint_past_the_payload_cap_is_refused_wherever_it_is_saved(small) -> None:
@@ -242,6 +276,16 @@ async def test_no_budget_headers_when_the_limit_is_off(migrated, memory, blobs) 
             response = await c.get("/v1/runs")
             assert response.status_code == 200
             assert "x-ratelimit-limit" not in response.headers
+
+
+async def test_a_budget_of_one_a_minute_is_a_limit_not_off(migrated, memory, blobs) -> None:
+    """Only ``0`` turns the limit off: the smallest budget there is still limits."""
+    settings = _settings(rate_limit=RateLimitSettings(per_minute=1, burst=1))
+    async with serving(settings, memory, blobs) as application, client_of(application) as c:
+        first = await c.get("/v1/runs")
+        assert (first.status_code, first.headers["x-ratelimit-limit"]) == (200, "1")
+        refused = await c.get("/v1/runs")
+        assert (refused.status_code, refused.headers["retry-after"]) == (429, "60")
 
 
 async def _elapse(app: Any, seconds: float) -> None:

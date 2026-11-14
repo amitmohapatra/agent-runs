@@ -66,3 +66,15 @@ def require_may_cancel(key: KeyInfo, assignee: str | None) -> None:
     principal it may act for: who may answer a run may cancel it."""
     as_assignee = assignee if assignee and key.may_act_for(as_principal(assignee)) else None
     require_may_answer(key, assignee, as_assignee)
+
+
+def require_may_hold(key: KeyInfo, person: str | None) -> None:
+    """Refuse (403) a key that may not hold a run kept in its caller's process for ``person``
+    (its ``on_behalf_of``, else its user), or let go of it: a hold decides when the run ends
+    (its lapse ends it), so it takes a key that administers the tenant, one that may act for
+    anyone, or one that may act for that person. A run for nobody is any key's of the tenant."""
+    if person is None or key.role in ADMINISTERING_ROLES or "*" in key.may_act_as:
+        return
+    if not (key.may_act_for(person) or key.may_act_for(as_principal(person))):
+        allowed = ", ".join(key.may_act_as) or key.principal
+        raise Forbidden(f"this key may not hold a run of {person}; it may act only for {allowed}")

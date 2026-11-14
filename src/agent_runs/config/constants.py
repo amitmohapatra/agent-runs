@@ -95,6 +95,11 @@ DEFAULT_LEASE_SECONDS: Final = 60
 #: worker that claims it would otherwise take the fleet down in turn. Only lapses count, not
 #: attempts: a person's answer starts an attempt too, and review rounds are not crashes.
 MAX_LEASE_LAPSES: Final = 5
+#: How long an answered run that was held before it paused may run unheld: whoever continues
+#: it in its own process holds it with its first heartbeat, at once; past this nobody did (the
+#: process that ran it stopped while it waited), and the ticker ends it. A default lease: a
+#: continuing process that is slow to start still makes it.
+RESUME_GRACE: Final = timedelta(seconds=DEFAULT_LEASE_SECONDS)
 #: The wait before a run whose lease lapsed may be claimed again, doubling per lapse up to the
 #: cap (jittered): a run that kills its worker is not handed straight to the next one.
 LAPSE_RETRY_BASE: Final = timedelta(seconds=5)

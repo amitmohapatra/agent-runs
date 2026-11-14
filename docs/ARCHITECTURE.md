@@ -129,6 +129,7 @@ flowchart LR
 | Metrics | `observability/metrics.py` | one Prometheus registry per process: the API's `/metrics`, the ticker's `RUNS__TICKER__METRICS_PORT` |
 | Caller resolution | `api/deps.py` `caller`, `Caller`; `claimer`, `Claimer` | `X-API-Key` (and `X-Trellis-Tenant` for a platform key) → the tenant and principal of the request; `require_tenant`, `require_may_act_for`. A claim (`claimer`) also takes a platform key with no tenant: it claims from every tenant's queue |
 | Claim order | `store/runs.py` `RunStore.claim`, `_next_queued`, `_tenant_has_room`, `_key_has_room` | the next queued run: the tenant whose workers hold fewest runs of the claimed agents first (fair share), then `priority`, then `queued_at`, among runs with room under their `concurrency_key` (`RUNS__LIMITS__CONCURRENCY_PER_KEY`) and their tenant's cap (`RUNS__LIMITS__MAX_RUNNING_PER_TENANT`); the room recounted under `pg_try_advisory_xact_lock` on the key or tenant, a key another claim is counting passed over like a locked row |
+| A key's line | `store/runs.py` `RunStore._key_locked`, `_after_the_line` (in `start`), `_placed_again` (in `resume`), `_place`, `_holds_before` | a run that shares a `concurrency_key` is created — or continues after its answer — in its place: the key's transaction lock (`pg_advisory_xact_lock`, the one claims count under), then the one statement that writes it, the transaction's last, sets its `created_at` (its answer's `recorded_at`) just after the latest `updated_at` of the key's running and queued runs when its clock is behind (`ix_runs_concurrency`). `created_at` never changes. Of two placed at once, the one committing second is placed after the first. A claim takes a queued run only while no run placed before it runs. One kept in its caller's process is born with `held_until = created_at + RESUME_GRACE` |
 | Run events | `store/runs.py` `RunStore.append_events`, `events`; `api/routers/runs.py` `stream_events`, `_follow` | each run's event log (`run_events`): appends fenced like a heartbeat, a position per event under the run's row lock, repeats (`attempt`, `sequence`) dropped; reads by position, and a server-sent event stream that polls in short transactions of its own (`EVENT_POLL_SECONDS`), keeps quiet connections open (`EVENT_KEEPALIVE_SECONDS`), ends with `end` once the run has, and lasts at most `EVENT_STREAM_SECONDS` |
 | Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
 | Answering | `answering.py` `require_may_answer`, `require_may_cancel` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question. `RunStore.cancel` applies the same rule (as any principal the key may act for) |
@@ -167,6 +168,7 @@ stateDiagram-v2
   RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
   RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
   RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
+  RUNNING --> ERROR: ticker, never queued and its hold lapsed (holder_lost)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
@@ -191,8 +193,8 @@ stateDiagram-v2
 What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
 
 - Entering `RUNNING` sets `running_since`; leaving it adds the stretch to `worked_seconds`
-  and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`) and
-  `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
+  and clears `running_since`, the lease (`lease_owner`, `lease_expires_at`), the hold
+  (`holder`, `held_until`) and `cancel_requested_at`. A read adds the stretch going on (`RunRecord.worked_seconds`), and
   `time_out_overworked` ends a run whose working time passed its limit (`timeout_seconds`
   or `RUNS__LIMITS__MAX_RUN_SECONDS`, the lesser) `TIMEOUT` (`run_timeout`); `_lease` tells
   the worker the time left (`remaining_seconds`).
@@ -213,6 +215,12 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   cancelled within one lease: the worker finishes it, or a pause, a release or the lapse
   sweep ends it `CANCELLED` instead of pausing or requeueing it (`_cancelled_instead`).
   `cancel_reason` and `cancelled_by` keep why and who.
+- A run that was never queued has no lease; its caller may hold it instead (`_hold`: a
+  heartbeat sets `holder`, `held_until`), fencing nothing. `end_abandoned` ends a run whose
+  hold lapsed `ERROR` (`holder_lost`): the process that held it stopped, and nothing else
+  could run it. A pause keeps `holder` (clearing `held_until`); the resume of such a run
+  clears it and sets `held_until = now + RESUME_GRACE`, so an answered run nothing continues
+  is ended too. `release` by its holder clears both: the run goes on unheld.
 - "Was queued" means `queued_at` is set: the run entered the queue at least once (a
   `queue: true` start or a schedule fire), so a worker, not the original process, resumes it.
 - `attempt` counts executions: `+1` on a resume that continues the run and on every requeue
@@ -224,9 +232,11 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   that continues the run, and a requeue, announce nothing.
 - `MAX_LEASE_LAPSES` is 5 (`config/constants.py`): the 5th lapse ends the run `ERROR`.
 - A claim takes a run only with room (`RunStore.claim`): fewer `RUNNING` runs of its
-  tenant share its `concurrency_key` than `RUNS__LIMITS__CONCURRENCY_PER_KEY`, and fewer runs
-  of its tenant are leased than `RUNS__LIMITS__MAX_RUNNING_PER_TENANT`. A run kept in its
-  caller's process takes its key's place while it runs, but is never held back.
+  tenant hold its `concurrency_key` than `RUNS__LIMITS__CONCURRENCY_PER_KEY` — a worker's, or
+  one kept in its caller's process placed before it (`_place`: its start or latest answer;
+  `_holds_before`) — and fewer runs of its tenant are leased than
+  `RUNS__LIMITS__MAX_RUNNING_PER_TENANT`. A run kept in its caller's process is never held
+  back.
 - With `RUNS__LIMITS__RETENTION_DAYS` set, the ticker deletes runs that ended before it
   (`RunStore.purge_ended`, `ix_runs_ended`) with their `run_resolutions` and `run_events`; a
   run whose artifacts are still kept waits for them.
@@ -808,10 +818,11 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_inbox` | `agent_runs (tenant_id, status, assignee, created_at)` | the inbox, `status=PAUSED&assignee=` |
 | `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
+| `ix_runs_held` | `agent_runs (held_until) WHERE status = 'RUNNING' AND held_until IS NOT NULL` | `RunStore.end_abandoned` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
 | `ix_runs_deadline` | `agent_runs (deadline) WHERE status IN ('QUEUED', 'RUNNING', 'PAUSED') AND deadline IS NOT NULL` | `RunStore.time_out_past_deadline` |
 | `ix_runs_working` | `agent_runs (running_since) WHERE status = 'RUNNING'` | `RunStore.time_out_overworked` |
-| `ix_runs_concurrency` | `agent_runs (tenant_id, concurrency_key) WHERE status = 'RUNNING' AND concurrency_key IS NOT NULL` | `RunStore.claim`: the runs sharing a key |
+| `ix_runs_concurrency` | `agent_runs (tenant_id, concurrency_key) WHERE status IN ('RUNNING', 'QUEUED') AND concurrency_key IS NOT NULL` | `RunStore.claim`: the runs holding a key; `RunStore._placed`: the latest of a key's running and queued runs |
 | `ix_runs_leased` | `agent_runs (tenant_id, agent_id) WHERE status = 'RUNNING' AND lease_owner IS NOT NULL` | `RunStore.claim`: what each tenant's workers hold (fair share, the cap) |
 | `ix_runs_ended` | `agent_runs (updated_at) WHERE status IN (the endings)` | `RunStore.purge_ended` |
 | `run_events` primary key | `run_events (run_id, position)` | `RunStore.events`, the stream |
@@ -832,7 +843,7 @@ and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run 
 `3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation,
 `5e1f6a7b8c9d` schedules' run limits, `6a2b7c8d9e0f` run priority and concurrency key,
 `7b3c8d9e0f1a` shared rate-limit budgets, `8c4d9e0f1a2b` run events, `9d5e0f1a2b3c` run
-retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key. Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
+retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key, `c9e4f5a6b7d8` a key's line (`ix_runs_concurrency` with the queued runs). Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 

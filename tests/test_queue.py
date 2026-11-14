@@ -387,6 +387,30 @@ async def test_a_claim_without_a_worker_or_with_too_many_agents_is_refused(clien
     assert (await client.post("/v1/runs/claim", json=many)).status_code == 422
 
 
+async def test_a_claims_documented_bounds_and_its_trimmed_worker_id(client) -> None:
+    """api.md: ``lease_seconds`` 5 to 3600, ``agent_ids`` 1 to 100, ``worker_id`` 1 to 200
+    characters with surrounding whitespace dropped. Nothing out of bounds takes the run."""
+    await queued(client)
+    for refused in (
+        claim(lease=4),
+        claim(lease=3601),
+        claim(agents=()),
+        claim(worker="w" * 201),
+    ):
+        response = await client.post("/v1/runs/claim", json=refused)
+        assert (response.status_code, response.json()["code"]) == (422, "VALIDATION"), refused
+    taken = await client.post("/v1/runs/claim", json=claim(worker="  w-edge  ", lease=5))
+    assert taken.status_code == 200
+    lease = taken.json()["lease"]
+    assert lease["worker_id"] == "w-edge"
+    beat = await client.post(
+        f"/v1/runs/{lease['run_id']}/heartbeat", json={"worker_id": "w-edge", "lease_seconds": 3600}
+    )
+    assert beat.status_code == 200, "the trimmed id is the one that holds the lease"
+    longest = await client.post("/v1/runs/claim", json=claim(worker="w" * 200))
+    assert longest.status_code == 204, "a 200-character worker id is a valid claim"
+
+
 # ------------------------------------------------------------------ repeated endings
 
 

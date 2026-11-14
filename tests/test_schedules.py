@@ -99,6 +99,24 @@ async def test_a_fired_run_is_queued_as_the_schedules_own_identity(app, client) 
     assert run["idempotency_key"] == fired["idempotency_key"]
 
 
+async def test_a_repeat_for_the_same_instant_after_an_edit_returns_the_same_run(
+    app, client
+) -> None:
+    """A repeat for the same instant returns the same run (api.md), even when the schedule was
+    edited in between: the tick is the key, and a changed instruction is not a second run
+    for it (nor a 409, as a reused key with another start is for ``POST /v1/runs``)."""
+    sid = (await client.post("/v1/schedules", json=scheduled(input={"topic": "inbox"}))).json()[
+        "schedule_id"
+    ]
+    at = _last_tick().isoformat()
+    first = await client.post(f"/v1/schedules/{sid}/fire", json={"at": at})
+    await client.patch(f"/v1/schedules/{sid}", json={"input": {"topic": "calendar"}})
+    again = await client.post(f"/v1/schedules/{sid}/fire", json={"at": at})
+    assert (first.status_code, again.status_code) == (200, 200), again.text
+    assert again.json()["run_id"] == first.json()["run_id"]
+    assert [run["input"] for run in await queued_runs(app)] == [{"topic": "inbox"}]
+
+
 async def test_a_fire_sends_todays_instruction_not_the_one_frozen_at_creation(app, client) -> None:
     sid = (await client.post("/v1/schedules", json=scheduled(input={"topic": "inbox"}))).json()[
         "schedule_id"

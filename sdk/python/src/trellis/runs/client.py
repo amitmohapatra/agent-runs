@@ -139,7 +139,9 @@ class RunsClient:
     ) -> Lease:
         """Extend the lease; with ``checkpoint``, also save it as the run's progress (it
         replaces the run's checkpoint; without, the one there is kept). Any ``409`` raises
-        :class:`LeaseLostError`: this worker does not hold a running lease on the run."""
+        :class:`LeaseLostError`: this worker does not hold a running lease on the run. On a
+        run kept in the caller's process (started, never queued) it holds the run for
+        ``worker_id`` instead: agent-runs ends the run ``ERROR`` once the hold lapses."""
         body: dict[str, Any] = {"worker_id": worker_id, "lease_seconds": lease_seconds}
         if checkpoint is not None:
             body["checkpoint"] = checkpoint

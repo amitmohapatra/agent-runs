@@ -148,13 +148,21 @@ async def test_only_a_queued_run_is_claimed(client, start: str) -> None:
     assert await status_of(client, run["run_id"]) == start
 
 
-@pytest.mark.parametrize("start", LIVE + ENDINGS)
+@pytest.mark.parametrize("start", ("QUEUED", "PAUSED", *ENDINGS))
 async def test_a_heartbeat_without_a_lease_is_refused(client, start: str) -> None:
-    """Only the holder of a live lease heartbeats; a run that was never leased has none."""
+    """Only the holder of a live lease heartbeats; a run that was never leased has none. (A
+    run kept ``RUNNING`` in its caller's process is held by one instead: test_holding.)"""
     run = await in_status(client, start)
     beat = await client.post(f"/v1/runs/{run['run_id']}/heartbeat", json={"worker_id": "w1"})
     assert beat.status_code == 409
     assert await status_of(client, run["run_id"]) == start
+
+
+async def test_a_heartbeat_holds_a_run_running_in_its_callers_process(client) -> None:
+    run = await in_status(client, "RUNNING")
+    beat = await client.post(f"/v1/runs/{run['run_id']}/heartbeat", json={"worker_id": "w1"})
+    assert beat.status_code == 200
+    assert await status_of(client, run["run_id"]) == "RUNNING"
 
 
 # ------------------------------------------------------------------ unknown runs

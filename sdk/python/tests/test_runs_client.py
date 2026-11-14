@@ -202,6 +202,27 @@ async def test_finish_sends_the_ending_and_its_error(runs: RunsClient) -> None:
 
 
 @respx.mock
+async def test_release_cancel_and_finish_answer_the_run_as_it_now_is(runs: RunsClient) -> None:
+    """Each answers the record agent-runs sent back; a release sends its checkpoint only
+    when there is one (absent: the run's own checkpoint is kept)."""
+    released = respx.post(f"{URL}/v1/runs/run_1/release").respond(
+        200, json=record(status="QUEUED", attempt=2)
+    )
+    run = await runs.release("run_1", "w-1", checkpoint={"tools": {"c1": "done"}})
+    assert (run.status, run.attempt) == (RunStatus.QUEUED, 2)
+    assert json.loads(sent(released).content) == {
+        "worker_id": "w-1",
+        "checkpoint": {"tools": {"c1": "done"}},
+    }
+    await runs.release("run_1", "w-1")
+    assert json.loads(sent(released).content) == {"worker_id": "w-1"}
+    respx.post(f"{URL}/v1/runs/run_1/cancel").respond(200, json=record(status="CANCELLED"))
+    assert (await runs.cancel("run_1", reason="withdrawn")).status is RunStatus.CANCELLED
+    respx.post(f"{URL}/v1/runs/run_1/finish").respond(200, json=record(status="SUCCESS"))
+    assert (await runs.finish("run_1", RunStatus.SUCCESS)).status is RunStatus.SUCCESS
+
+
+@respx.mock
 async def test_get_answers_the_record_or_none(runs: RunsClient) -> None:
     route = respx.get(f"{URL}/v1/runs/run_1")
     route.side_effect = [
@@ -274,6 +295,8 @@ async def test_iterate_stops_after_max_pages(runs: RunsClient) -> None:
     route = respx.get(f"{URL}/v1/runs").respond(200, json=[summary()], headers={"Link": NEXT})
     seen = [s async for s in runs.iterate(assignee="user:alice", tenant="acme", max_pages=3)]
     assert len(seen) == 3 and route.call_count == 3
+    # by default every run is listed, sub-agents' included
+    assert all("top_level" not in call.request.url.params for call in route.calls)
 
 
 @respx.mock

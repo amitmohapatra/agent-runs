@@ -124,8 +124,17 @@ async def test_a_runs_resolutions_page_oldest_first(client) -> None:
         encode_cursor({"created_at": "2026-10-01T00:00:00", "run_id": "run_x"}),
         encode_cursor({"created_at": 5, "run_id": "run_x"}),
         encode_cursor({"created_at": "yesterday", "run_id": "run_x"}),
+        encode_cursor({"created_at": "2026-10-01T00:00:00+00:00", "run_id": 7}),
     ],
-    ids=["garbage", "not-an-object", "another-listing", "naive", "not-a-string", "not-a-date"],
+    ids=[
+        "garbage",
+        "not-an-object",
+        "another-listing",
+        "naive",
+        "not-a-string",
+        "not-a-date",
+        "id-not-a-string",
+    ],
 )
 async def test_a_cursor_this_listing_did_not_issue_is_a_422(client, cursor: str) -> None:
     response = await client.get("/v1/runs", params={"cursor": cursor})

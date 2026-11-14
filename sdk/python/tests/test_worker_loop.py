@@ -233,7 +233,8 @@ async def test_run_once_hands_the_claimed_run_to_the_handler(
 
     async def handler(job: Job) -> str:  # any result: the harness's composition returns one
         jobs.append(job)
-        await job.checkpoint({"step": 1})
+        renewed = await job.checkpoint({"step": 1})
+        assert renewed.run_id == "run_1", "the checkpoint answers the lease it extended"
         await job.pause(interrupt("run_1"), checkpoint={"step": 2})
         await job.finish(RunStatus.SUCCESS, output={"ok": True})
         return "the agent's answer"
@@ -654,6 +655,33 @@ async def test_a_run_past_the_grace_period_is_released(
     ]
 
 
+async def test_a_run_that_finished_leaves_the_others_held_to_be_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run ending forgets only its own entry: the run still in flight is the one the stop
+    hands back, and the finished one is never released."""
+    monkeypatch.setattr(worker_module, "GRACE_SECONDS", 0.05)
+    long_started = asyncio.Event()
+    quick_done = asyncio.Event()
+
+    async def handler(job: Job) -> None:
+        if job.record.run_id == "run_quick":
+            quick_done.set()
+            return
+        long_started.set()
+        await asyncio.Event().wait()
+
+    store = Store(run("run_long"), run("run_quick"))
+    worker = Worker(store, handler, ["triage"], worker_id="w-1", concurrency=2)
+    task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(asyncio.gather(long_started.wait(), quick_done.wait()), 5)
+    await asyncio.sleep(0.01)  # the quick run's execution has wound up
+    worker.stop()
+    await asyncio.wait_for(task, 5)
+    released = [write["run_id"] for kind, write in store.writes if kind == "release"]
+    assert released == ["run_long"]
+
+
 async def test_a_run_that_cannot_be_released_is_left_to_its_lease(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -730,6 +758,49 @@ async def test_an_idle_worker_backs_off_up_to_a_cap(monkeypatch: pytest.MonkeyPa
     first, second, third, capped = waits
     assert 0.25 <= first <= 0.5 and 0.5 <= second <= 1.0 and 1.0 <= third <= 2.0
     assert worker_module.IDLE_MAX_SECONDS / 2 <= capped <= worker_module.IDLE_MAX_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("jitter", "expected"), [("low", [0.25, 0.5, 1.0, 5.0]), ("high", [0.5, 1.0, 2.0, 10.0])]
+)
+async def test_the_idle_wait_is_the_documented_doubling_with_equal_jitter(
+    monkeypatch: pytest.MonkeyPatch, jitter: str, expected: list[float]
+) -> None:
+    """IDLE_SECONDS (0.5 s) doubling per empty round up to IDLE_MAX_SECONDS (10 s), half of
+    it fixed and half random: at either end of the jitter the waits are exact."""
+    waits: list[float] = []
+    real_timeout = asyncio.timeout
+
+    def recording(delay: float | None) -> Any:
+        waits.append(delay or 0.0)
+        return real_timeout(0)
+
+    monkeypatch.setattr("trellis.runs.worker.asyncio.timeout", recording)
+    pick = (lambda low, high: low) if jitter == "low" else (lambda low, high: high)
+    monkeypatch.setattr("trellis.runs.worker.random.uniform", pick)
+    worker = Worker(Store(), nothing, ["triage"])
+    for rounds in (1, 2, 3, 30):
+        await worker._idle(rounds)
+    assert waits == expected
+
+
+async def test_work_resets_the_idle_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each empty round waits longer; a claim that got work starts the count again."""
+    store = Store()
+    rounds: list[int] = []
+    worker = Worker(store, nothing, ["triage"])
+
+    async def idle(n: int) -> None:
+        rounds.append(n)
+        if len(rounds) == 2:
+            store.queue.append(run())  # work arrives after the second empty round
+        if len(rounds) == 4:
+            worker.stop()
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(worker, "_idle", idle)
+    await asyncio.wait_for(worker.run(), 5)
+    assert rounds == [1, 2, 1, 2]
 
 
 async def test_a_stop_cuts_an_idle_wait_short() -> None:
