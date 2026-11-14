@@ -6,6 +6,14 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A key's runs kept in their caller's process start after its running runs, in commit
+  order.** A run started `RUNNING` with a `concurrency_key`, or continued `RUNNING` after its
+  answer, takes the key's transaction lock (the one claims count the key's room under) and is
+  placed just after the latest change of the key's running runs when its clock would put it
+  before: its `created_at` (or its answer's `recorded_at`) orders it after every run of the key
+  committed before it, whatever the replicas' clocks. The harness answers a conversation's
+  messages one at a time in this order, on whichever process each arrives. The wire is
+  unchanged.
 * **Requires `trellis-contracts>=0.7.1,<0.8`** (the service and the SDK; was `>=0.6.2`).
   agent-runs keeps interrupt resolutions, and a harness on 0.7.1 may send `remember: "always"`,
   which an older contracts package refuses to read: the store takes 0.7.1 before any harness
