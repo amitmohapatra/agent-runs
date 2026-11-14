@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -13,7 +15,7 @@ from trellis.contracts.runs import (
     Option,
 )
 from trellis.contracts.tool import ToolCall
-from trellis.runs.answers import answer_problem, schema_problem
+from trellis.runs.answers import ANSWER_FORMATS, answer_problem, schema_problem
 
 
 def _asked(**fields: Any) -> Interrupt:
@@ -214,3 +216,86 @@ def test_only_an_approval_of_a_tool_call_is_remembered_for_the_run() -> None:
     assert answer_problem(
         question, _answer(question, InterruptDecision.APPROVE, remember="run")
     ) == ("only an approval of a tool call is remembered for the run")
+
+
+#: Each enforced format: a value it takes, and one it refuses.
+FORMATS = {
+    "date": ("2026-11-14", "2026-13-40"),
+    "email": ("ada@example.com", "ada"),
+    "ipv4": ("10.0.0.1", "10.0.0.256"),
+    "ipv6": ("::1", "::g"),
+    "regex": ("^a+$", "("),
+    "uuid": ("12345678-1234-5678-1234-567812345678", "1234"),
+}
+
+
+def test_the_enforced_formats_are_one_named_set() -> None:
+    assert sorted(ANSWER_FORMATS) == sorted(FORMATS)
+
+
+@pytest.mark.parametrize("name", sorted(FORMATS))
+def test_each_enforced_format_takes_a_good_value_and_refuses_a_bad_one(name: str) -> None:
+    good, bad = FORMATS[name]
+    asked = _asked(expects={"type": "string", "format": name})
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=good)) is None
+    refused = answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=bad))
+    assert refused == f"the answer does not fit what was asked: {bad!r} is not a {name!r}"
+
+
+@pytest.mark.parametrize("name", ["date-time", "time", "idn-hostname", "hostname", "uri"])
+def test_a_format_outside_the_set_is_any_string(name: str) -> None:
+    """Not checked anywhere, so no server refuses what another takes (``idn-hostname`` is
+    checked by jsonschema when ``idna`` is installed, as it is here)."""
+    asked = _asked(expects={"type": "string", "format": name})
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer="!! no")) is None
+    wrong_type = answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=3))
+    assert wrong_type == "the answer does not fit what was asked: 3 is not of type 'string'"
+
+
+#: The optional libraries jsonschema's other format checkers import.
+OPTIONAL = (
+    "fqdn",
+    "idna",
+    "rfc3987",
+    "rfc3986_validator",
+    "rfc3987_syntax",
+    "rfc3339_validator",
+    "webcolors",
+    "jsonpointer",
+    "uri_template",
+    "isoduration",
+)
+
+#: Run in a fresh interpreter: the libraries made absent (``absent``) or present (a stand-in
+#: ``rfc3339_validator`` that refuses anything) before jsonschema is imported; prints the set
+#: enforced and whether a nonsense date-time and a bad date are refused.
+PROBE = """
+import sys, types
+import httpx  # (it needs idna itself; jsonschema is not imported yet)
+assert "jsonschema" not in sys.modules
+if sys.argv[1] == "absent":
+    for name in {optional!r}:
+        sys.modules[name] = None
+else:
+    stand_in = types.ModuleType("rfc3339_validator")
+    stand_in.validate_rfc3339 = lambda value: False
+    sys.modules["rfc3339_validator"] = stand_in
+from trellis.contracts.runs import Interrupt, InterruptDecision, InterruptResolution
+from trellis.runs.answers import _FORMATS, answer_problem
+def refused(fmt, value):
+    expects = {{"type": "string", "format": fmt}}
+    asked = Interrupt(tenant_id="t", run_id="r", question="q", expects=expects)
+    answer = InterruptResolution(interrupt_id=asked.interrupt_id, run_id="r",
+                                 decision=InterruptDecision.ANSWER, answer=value)
+    return answer_problem(asked, answer) is not None
+print(sorted(_FORMATS.checkers), refused("date-time", "nonsense"), refused("date", "2026-13-40"))
+"""
+
+
+@pytest.mark.parametrize("libraries", ["absent", "present"])
+def test_the_enforced_set_does_not_depend_on_what_is_installed(libraries: str) -> None:
+    probe = PROBE.format(optional=OPTIONAL)
+    ran = subprocess.run(
+        [sys.executable, "-c", probe, libraries], capture_output=True, text=True, check=True
+    )
+    assert ran.stdout.split("\n")[0] == f"{sorted(ANSWER_FORMATS)} False True"
