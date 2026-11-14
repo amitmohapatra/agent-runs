@@ -6,14 +6,6 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
-* **A held run's cancel is asked of its holder** (approved API change: the cancel and heartbeat
-  descriptions in `docs/openapi.json`; no field). A run kept in its caller's process that the
-  process holds is no longer `CANCELLED` at once: like a worker's run it is asked to stop —
-  the holder's next heartbeat answers `cancel_requested: true` and no longer extends the hold;
-  the holder finishes it `CANCELLED` (a `release` ends it so too); a hold that lapses then ends
-  it `CANCELLED`, not `holder_lost`. Until then it is `RUNNING`, so a conversation's next turn
-  never runs beside a turn cancelled on another server. A run nobody holds is cancelled at
-  once, as before. Callers: a harness that holds runs reads `cancel_requested` from its hold.
 * **A queued run of a key holds its place.** A run started `QUEUED` with a `concurrency_key`, or
   answered back onto the queue, is placed among the key's runs as one started `RUNNING` is,
   and a claim takes it only while no run placed before it runs: one kept in its caller's

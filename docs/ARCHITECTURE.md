@@ -168,12 +168,12 @@ stateDiagram-v2
   RUNNING --> QUEUED: release by the lease holder (attempt + 1, no lapse counted)
   RUNNING --> QUEUED: finish ERROR, retryable, was queued, error_retries < MAX_ERROR_RETRIES (attempt + 1, after a backoff)
   RUNNING --> ERROR: ticker, lease lapsed, lease_lapses reaches MAX_LEASE_LAPSES (lease_expired)
-  RUNNING --> ERROR: ticker, never queued and its hold lapsed (holder_lost; CANCELLED when its cancel was asked)
+  RUNNING --> ERROR: ticker, never queued and its hold lapsed (holder_lost)
   RUNNING --> SUCCESS: finish
   RUNNING --> PARTIAL: finish
   RUNNING --> ERROR: finish
   RUNNING --> TIMEOUT: finish, ticker past the run's deadline (run_deadline), or past its working-time limit (run_timeout)
-  RUNNING --> CANCELLED: finish, cancel of a run nobody holds, or after a cancel request: ticker when the lease or hold runs out, pause, release
+  RUNNING --> CANCELLED: finish, cancel of a run no worker holds, or after a cancel request: ticker when the lease runs out, pause, release
   RUNNING --> REJECTED: finish
 
   PAUSED --> RUNNING: resume, not CANCEL, never queued (attempt + 1)
@@ -217,8 +217,7 @@ What each move does to the row (`_move`, `_requeue`, `RunStore.resume`):
   `cancel_reason` and `cancelled_by` keep why and who.
 - A run that was never queued has no lease; its caller may hold it instead (`_hold`: a
   heartbeat sets `holder`, `held_until`), fencing nothing. `end_abandoned` ends a run whose
-  hold lapsed `ERROR` (`holder_lost`; `CANCELLED` when its cancel was asked: a cancel of a held
-  run sets `cancel_requested_at`, which the holder's heartbeat reports): the process that held it stopped, and nothing else
+  hold lapsed `ERROR` (`holder_lost`): the process that held it stopped, and nothing else
   could run it. A pause keeps `holder` (clearing `held_until`); the resume of such a run
   clears it and sets `held_until = now + RESUME_GRACE`, so an answered run nothing continues
   is ended too. `release` by its holder clears both: the run goes on unheld.
