@@ -167,44 +167,13 @@ async def test_its_holder_lets_go_of_a_held_run_which_goes_on_unheld(client, tic
     assert (await _hold(client, run_id, holder="server-2")).status_code == 200  # taken anew
 
 
-async def test_a_held_run_is_asked_to_stop_through_its_holders_heartbeat(client, ticker) -> None:
-    """Cancelled while its process holds it, the run is asked to stop, as a worker's is: the
-    holder's next heartbeat says ``cancel_requested`` and no longer extends the hold, and the
-    run ends ``CANCELLED`` when the holder ends it — so a caller waiting for it to end (the
-    conversation's next turn) never runs beside it."""
+async def test_a_held_run_is_cancelled_at_once_and_its_holder_told(client, ticker) -> None:
     run_id = await _running(client)
-    await _hold(client, run_id, seconds=30)
-    cancelled = await client.post(f"/v1/runs/{run_id}/cancel", json={"reason": "enough"})
-    assert cancelled.json()["status"] == "RUNNING"
-    told = await _hold(client, run_id, seconds=30)
-    assert told.status_code == 200 and told.json()["cancel_requested"] is True
-    later = await _hold(client, run_id, seconds=600)
-    assert later.json()["expires_at"] == told.json()["expires_at"], "the hold is not extended"
-    ended = await client.post(f"/v1/runs/{run_id}/finish", json={"status": "CANCELLED"})
-    assert ended.json()["status"] == "CANCELLED"
-    assert (await _hold(client, run_id)).status_code == 409
-
-
-async def test_a_held_run_asked_to_stop_whose_holder_does_not_ends_cancelled(
-    client, ticker
-) -> None:
-    ignored, released = await _running(client), await _running(client)
-    for run_id in (ignored, released):
-        await _hold(client, run_id, seconds=30)
-        await client.post(f"/v1/runs/{run_id}/cancel", json={"reason": "enough"})
-    let_go = await client.post(f"/v1/runs/{released}/release", json={"worker_id": "server-1"})
-    assert let_go.json()["status"] == "CANCELLED"  # let go of: it ends at once
-    assert (await ticker.tick(now=at(0.25))).abandoned == 0  # within the hold
-    assert (await ticker.tick(now=at(1))).abandoned == 1
-    run = await _run(client, ignored)
-    assert (run["status"], run["error"]) == ("CANCELLED", None)  # cancelled, not holder_lost
-
-
-async def test_a_run_in_its_callers_process_nobody_holds_is_cancelled_at_once(client) -> None:
-    """A caller that holds no run (it never heartbeats one) sees its cancel at once, as before."""
-    run_id = await _running(client)
+    await _hold(client, run_id)
     cancelled = await client.post(f"/v1/runs/{run_id}/cancel", json={"reason": "enough"})
     assert cancelled.json()["status"] == "CANCELLED"
+    assert (await _hold(client, run_id)).status_code == 409
+    assert (await ticker.tick(now=at(5))).abandoned == 0
 
 
 async def test_a_held_run_takes_no_workers_place_and_is_never_queued(client, ticker) -> None:

@@ -324,11 +324,6 @@ def _holds_before(table: Any, place: Any, run_id: Any) -> Any:
     )
 
 
-def _held(row: RunRow, now: datetime) -> bool:
-    """Whether a process holds the run kept in its caller's process now (:meth:`RunStore._hold`)."""
-    return row.holder is not None and row.held_until is not None and row.held_until >= now
-
-
 def _lock_id(*names: str) -> Any:
     """The transaction lock of a key's or a tenant's room (``names``), as one number."""
     return func.hashtextextended("\x1f".join(names), 0)
@@ -589,14 +584,11 @@ class RunStore:
         it (``answering.py``, against its assignee now), checked before anything is
         written. Why and who asked are kept with the run.
 
-        A queued or waiting run, and a running one nobody holds (kept in a caller's process
-        that never holds it), ends ``CANCELLED`` at once. A run a worker holds, or its caller's
-        process holds (:meth:`_hold`), is asked to stop (``cancel_requested_at``): from then
-        on its heartbeats say ``cancel_requested`` and no longer extend the lease or the hold,
-        its holder finishes it ``CANCELLED``, and if it has not when the lease or the hold runs
-        out, the ticker cancels it (``requeue_lapsed``, :meth:`end_abandoned`). Until then it
-        is ``RUNNING``: whoever waits for it to end (a conversation's next turn) never runs
-        beside it.
+        A queued or waiting run, and a running one no worker holds (kept in its caller's
+        process), ends ``CANCELLED`` at once. A run a worker holds is asked to stop
+        (``cancel_requested_at``): from then on its heartbeats say ``cancel_requested`` and
+        no longer extend the lease, the worker finishes it ``CANCELLED``, and if it has not
+        when the lease runs out, the ticker cancels it (``requeue_lapsed``).
 
         Returns ``(run, changed)``: a cancel already asked for, or the run already cancelled
         by the same principal for the same reason (a retried request), answers the run as it
@@ -606,7 +598,7 @@ class RunStore:
         asked = (row.cancelled_by, row.cancel_reason) == (canceller.principal, cancel.reason)
         if row.cancel_requested_at is not None or (row.status == RunStatus.CANCELLED and asked):
             return await self._record(row, now), False
-        if row.status == RunStatus.RUNNING and (row.lease_owner is not None or _held(row, now)):
+        if row.status == RunStatus.RUNNING and row.lease_owner is not None:
             row.cancel_requested_at = row.updated_at = now
         else:
             _move(row, RunStatus.CANCELLED, now)
@@ -863,21 +855,16 @@ class RunStore:
         (:meth:`end_abandoned`), as nothing else can run it. Unlike a worker's lease it fences
         nothing (the caller writes to the run without a ``worker_id``, as before), takes no
         worker's place and never puts the run on the queue; a pause lets go of it. Another
-        holder's hold in force is ``LeaseLost``. Once the run's cancel was asked for
-        (:meth:`cancel`), the hold says ``cancel_requested`` and is no longer extended."""
+        holder's hold in force is ``LeaseLost``."""
         if row.holder not in (None, holder) and row.held_until and row.held_until >= now:
             raise LeaseLost(f"run {row.run_id} is held by {row.holder}")
-        cancelling = row.cancel_requested_at
-        expires_at = (cancelling or now) + timedelta(seconds=seconds)
-        if cancelling is not None and row.held_until is not None:
-            expires_at = min(expires_at, row.held_until)  # asked to stop: never extended
+        expires_at = now + timedelta(seconds=seconds)
         row.holder, row.held_until = holder, expires_at
         return Lease(
             run_id=row.run_id,
             worker_id=holder,
             expires_at=expires_at,
             remaining_seconds=self._remaining(row, now),
-            cancel_requested=cancelling is not None,
         )
 
     async def release(
@@ -899,9 +886,6 @@ class RunStore:
             # kept in its caller's process: its holder lets go of it, and it goes on unheld
             if row.holder != request.worker_id:
                 raise LeaseLost(f"{request.worker_id} does not hold run {run_id}")
-            if _cancelled_instead(row, now):  # asked to stop: let go of, it ends
-                await self._ended([row], now)
-                return await self._flushed(row, now), True
             if checkpoint is not None:
                 await self._keep_checkpoint(row, checkpoint)
             row.holder = row.held_until = None
@@ -1038,9 +1022,8 @@ class RunStore:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
         holding one stopped heartbeating — it crashed or was killed), and answered ones held
         before they paused that nobody took up within ``RESUME_GRACE`` (:meth:`resume`), end
-        as ``ERROR``: only that process could run them, so they are never put on the queue
-        (one whose cancel was asked for ends ``CANCELLED``). A run never held is never ended
-        here. Returns every run ended."""
+        as ``ERROR``: only that process could run them, so they are never put on the queue. A
+        run never held is never ended here. Returns every run ended."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.held_until < now,
@@ -1048,8 +1031,6 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
-            if _cancelled_instead(row, now):  # asked to stop, and its holder never ended it
-                continue
             holder, held_until = row.holder, row.held_until
             _move(row, RunStatus.ERROR, now)
             stopped = (

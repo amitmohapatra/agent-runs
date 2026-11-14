@@ -327,10 +327,7 @@ Answered (`resume`), a run that was held when it paused runs unheld until whoeve
 holds it again; if nobody does within `RESUME_GRACE` (60 s) — the process that ran it stopped
 while it waited — the ticker ends it `ERROR` (`holder_lost`, "nobody took the run up after its
 answer"). Its holder lets go of a hold without ending the run with `release` (the run stays
-`RUNNING`, unheld). A held run whose cancel was asked for: the heartbeat answers
-`cancel_requested: true` and no longer extends the hold; the holder stops and finishes the run
-`CANCELLED` (or lets go of it: it ends `CANCELLED`), and a hold that lapses then ends it
-`CANCELLED`, not `holder_lost`.
+`RUNNING`, unheld).
 
 The answer is the `Lease`:
 
@@ -483,15 +480,9 @@ every run, lists every inbox (`assignee` is a filter, not a lock) and works the 
 Cancels the run, whatever its status, keeping `reason` (optional, at most 1000 characters)
 and the principal of the key that asked with it:
 
-- `QUEUED` or `PAUSED`, or `RUNNING` with nobody holding it (a run kept in a caller's
-  process that does not hold it): `CANCELLED` at once, announced as `run.finished`; the
-  checkpoint is cleared and the artifacts' retention starts. The caller's process gets `409`
-  on its next write.
-- `RUNNING` and held by its caller's process (a heartbeat holds it): asked to stop, as a
-  worker's run is below. The holder's next heartbeat answers `cancel_requested: true`; it
-  stops the run and finishes it `CANCELLED`; a hold that lapses first ends it `CANCELLED`.
-  Until then the run is `RUNNING`, so whatever waits for it to end (the conversation's next
-  turn) never runs beside it.
+- `QUEUED` or `PAUSED`, or `RUNNING` with no worker holding it (a run kept in its caller's
+  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared and
+  the artifacts' retention starts. The caller's process gets `409` on its next write.
 - `RUNNING` and held by a worker: the run stays `RUNNING` with its cancel asked. The
   worker's next heartbeat answers `cancel_requested: true` and no longer extends the lease;
   the worker stops and finishes the run `CANCELLED` (the SDK's `Worker` cancels the handler
