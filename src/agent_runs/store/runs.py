@@ -107,6 +107,10 @@ _LEASED = (RunRow.status == RunStatus.RUNNING.value, RunRow.lease_owner.is_not(N
 #: The statuses a run ends in, as ``ix_runs_ended`` names them: the runs retention deletes.
 _ENDED = tuple(status.value for status in RunStatus if status.final)
 
+#: How far after the latest of a key's running runs a run kept in its caller's process is
+#: placed when the clock would put it before (``_placed``): PostgreSQL keeps microseconds.
+_AFTER = timedelta(microseconds=1)
+
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
 _UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
@@ -297,6 +301,11 @@ def _cancelled_instead(row: RunRow, now: datetime) -> bool:
     return True
 
 
+def _lock_id(*names: str) -> Any:
+    """The transaction lock of a key's or a tenant's room (``names``), as one number."""
+    return func.hashtextextended("\x1f".join(names), 0)
+
+
 def _counted(error: AgentError | None, retries: int) -> AgentError | None:
     """The error a run ends with, saying how often agent-runs retried the run before it."""
     if error is None or not retries:
@@ -346,8 +355,13 @@ class RunStore:
 
         A run id held by another tenant is a ``Conflict`` that says nothing about who holds
         it, or that anyone does.
+
+        A run kept in its caller's process that shares a ``concurrency_key`` takes its place
+        among the runs sharing it (:meth:`_placed`): its ``created_at`` is after theirs.
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
+        if not queue and start.concurrency_key is not None:
+            now = await self._placed(start.tenant_id, start.concurrency_key, now)
         record = RunRecord.from_start(start, status=status)
         input_ref = await self._put(record.tenant_id, record.input)
         row = await self._session.scalar(
@@ -463,7 +477,9 @@ class RunStore:
         decision continues it as the next attempt: back on the queue when the run is durable
         (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
         process — which, when the run was held before it paused, must hold it again within
-        ``RESUME_GRACE`` (:meth:`end_abandoned`).
+        ``RESUME_GRACE`` (:meth:`end_abandoned`); one that shares a ``concurrency_key`` takes
+        its place again among the runs sharing it (:meth:`_placed`): the answer's
+        ``recorded_at`` is after theirs.
 
         Returns ``(run, resumed)``: a repeat of the resume that answered the interrupt (the
         very same resolution, as a client retries it after losing the answer) answers the
@@ -483,6 +499,9 @@ class RunStore:
         require_may_answer(answerer, asked.assignee, resolution.reviewer)
         if problem := answer_problem(asked, resolution):
             raise Unprocessable(problem)
+        continues = resolution.decision is not InterruptDecision.CANCEL
+        if continues and row.queued_at is None and row.concurrency_key is not None:
+            now = await self._placed(tenant_id, row.concurrency_key, now)
         answer = await self._payloads.put(tenant_id, _json(resolution))
         question = await self._payloads.put(tenant_id, _json(asked))
         await self._link(run_id, _ANSWER, answer, question)
@@ -707,8 +726,28 @@ class RunStore:
         """Take the transaction lock claims count a key's or a tenant's room under, unless
         another claim holds it (then pass over, as ``SKIP LOCKED`` passes over a row). The
         count after it sees every claim committed before it."""
-        lock = func.pg_try_advisory_xact_lock(func.hashtextextended("\x1f".join(names), 0))
+        lock = func.pg_try_advisory_xact_lock(_lock_id(*names))
         return bool(await self._session.scalar(select(lock)))
+
+    async def _placed(self, tenant_id: str, key: str, now: datetime) -> datetime:
+        """When a run kept in its caller's process starts running among the runs sharing
+        ``key`` (it starts, or continues after its answer): ``now``, or just after the latest
+        change of one running now when that is later. Taken under the key's transaction lock
+        (a claim counts the key's room under it too), so of two runs starting at once the one
+        that commits second is placed after the first, whatever their clocks: once a caller
+        reads its run back, every run placed before it is there to read. A caller orders the
+        runs of one conversation by it (the harness answers a conversation's messages one at
+        a time, in this order, on whichever process each arrives)."""
+        lock = func.pg_advisory_xact_lock(_lock_id("key", tenant_id, key))
+        await self._session.execute(select(lock))
+        latest = await self._session.scalar(
+            select(func.max(RunRow.updated_at)).where(
+                RunRow.status == RunStatus.RUNNING.value,
+                RunRow.tenant_id == tenant_id,
+                RunRow.concurrency_key == key,
+            )
+        )
+        return now if latest is None or latest < now else latest + _AFTER
 
     async def heartbeat(
         self, tenant_id: str, run_id: str, request: HeartbeatRequest, *, now: datetime

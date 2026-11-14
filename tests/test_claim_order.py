@@ -1,17 +1,23 @@
 """Which queued run a claim takes: the highest priority, then the oldest; never past a
 concurrency key's or a tenant's room; and from a platform key that names no tenant, the
-tenant whose workers hold the fewest runs first (the fair share of a shared fleet)."""
+tenant whose workers hold the fewest runs first (the fair share of a shared fleet). A run kept
+in its caller's process takes its key's place too, and starts after the key's running runs, in
+the order their starts commit."""
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta
 from typing import Any
 
 from trellis.contracts.ids import now
+from trellis.contracts.runs import InterruptResolution, RunStart
 
 from agent_runs.config.settings import LimitsSettings
 from agent_runs.domain.runs import ClaimRequest
+from agent_runs.keys import KeyInfo
 from agent_runs.store.runs import RunStore
-from tests.conftest import SETTINGS, client_of, serving, started
+from tests.conftest import SETTINGS, client_of, paused, resolution, serving, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 30}
 
@@ -169,3 +175,69 @@ async def test_a_repeated_start_asking_another_priority_or_key_is_a_conflict(cli
     again = await client.post("/v1/runs", json={**body, "priority": 2, "concurrency_key": "c"})
     assert again.status_code == 409
     assert again.json()["details"]["differing"] == ["concurrency_key", "priority"]
+
+
+# ------------------------------------------------------------------ a key's runs in process
+async def _start(db: Any, at: datetime, **over: Any) -> Any:
+    record, _ = await RunStore(db).start(RunStart(**started(**over)), queue=False, now=at)
+    return record
+
+
+async def test_a_run_in_its_callers_process_starts_after_its_keys_running_runs(app) -> None:
+    """A clock behind the store's (another replica's) does not put a run of a key before the
+    runs of that key already running: it is placed just after the latest; another key's run,
+    and a run with none, keep their clock."""
+    clock = now()
+    async with app.state.sessions() as db:
+        first = await _start(db, clock, concurrency_key="thread:1")
+        second = await _start(db, clock - timedelta(seconds=5), concurrency_key="thread:1")
+        other = await _start(db, clock - timedelta(seconds=5), concurrency_key="thread:2")
+        keyless = await _start(db, clock - timedelta(seconds=5))
+        await db.commit()
+    assert first.created_at == clock
+    assert second.created_at == clock + timedelta(microseconds=1)
+    assert other.created_at == keyless.created_at == clock - timedelta(seconds=5)
+
+
+async def test_two_runs_of_a_key_started_at_once_are_placed_in_commit_order(app) -> None:
+    """The mechanism, shown directly: start A has taken its place (uncommitted); start B, its
+    clock earlier, waits for A's transaction and is placed after A — so a caller that reads
+    its run back once B is committed finds A before it, never a run placed before its own
+    that it could not see yet."""
+    clock = now()
+    async with app.state.sessions() as a, app.state.sessions() as b:
+        first = await _start(a, clock, concurrency_key="k")
+        waiting = asyncio.create_task(_start(b, clock - timedelta(seconds=1), concurrency_key="k"))
+        await asyncio.sleep(0.3)
+        assert not waiting.done(), "B waits for the key while A's start is uncommitted"
+        await a.commit()
+        second = await waiting
+        await b.commit()
+    assert second.created_at > first.created_at
+
+
+async def test_a_run_answered_in_its_callers_process_starts_after_its_keys_running_runs(
+    app, client
+) -> None:
+    """Continued after its answer, a run kept in its caller's process takes its place again:
+    after the key's runs running then, its answer's ``recorded_at`` and its ``updated_at``
+    alike — whatever the answering replica's clock says."""
+    waiting = await paused(client, concurrency_key="k")
+    async with app.state.sessions() as db:
+        running = await _start(db, now(), concurrency_key="k")
+        await db.commit()
+    answer = InterruptResolution.model_validate(resolution(waiting))
+    async with app.state.sessions() as db:
+        answerer = KeyInfo(key_id="key_dev", tenant_id="acme", principal="user_ada", role="service")
+        continued, _ = await RunStore(db).resume(
+            "acme",
+            waiting["run_id"],
+            answer,
+            answerer=answerer,
+            now=running.created_at - timedelta(seconds=5),
+        )
+        await db.commit()
+    [entry] = (await client.get(f"/v1/runs/{waiting['run_id']}/resolutions")).json()
+    assert continued.status.value == "RUNNING"
+    assert continued.updated_at == running.created_at + timedelta(microseconds=1)
+    assert entry["recorded_at"] == continued.updated_at.isoformat().replace("+00:00", "Z")
