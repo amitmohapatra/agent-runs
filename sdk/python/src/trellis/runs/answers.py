@@ -5,7 +5,9 @@ continues, and the harness makes for a run it keeps in its own process (no agent
   asked, so a malformed question fails where it was written, not when someone answers it).
 * :func:`answer_problem`: a resolution answers the interrupt, an ``ANSWER`` fits ``expects``
   (else picks among ``options``: one option's value, or with ``multiple`` a list of distinct
-  values), and the corrected value of an ``EDIT`` of a question fits ``expects``. An answer
+  values), and the corrected value of an ``EDIT`` of a question fits ``expects``: its
+  ``format`` too, as the schema draft's own format checker knows it (a ``date`` is an
+  ISO 8601 calendar date, ``YYYY-MM-DD``). An answer
   the asker's own screen (``component``) collected is held to the same. ``APPROVE``,
   ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered for the run
   (``remember="run"``) must be of a tool call. A tool call's edited arguments are checked
@@ -54,7 +56,9 @@ def _fit_problem(interrupt: Interrupt, value: Any, *, choosing: bool) -> str | N
     if expects is not None:
         if problem := schema_problem(expects):
             return problem
-        error = best_match(validator_for(expects)(expects).iter_errors(value))
+        validator = validator_for(expects)
+        checked = validator(expects, format_checker=validator.FORMAT_CHECKER)
+        error = best_match(checked.iter_errors(value))
         if error is None:
             return None
         where = "".join(f"[{part!r}]" for part in error.absolute_path)

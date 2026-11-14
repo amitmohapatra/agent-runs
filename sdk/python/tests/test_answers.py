@@ -50,6 +50,44 @@ def test_an_answer_must_fit_what_was_asked() -> None:
     )
 
 
+DATE = {"type": "string", "format": "date"}
+
+
+@pytest.mark.parametrize("value", ["2026-11-14", "2024-02-29"])
+def test_a_date_question_takes_an_iso_8601_calendar_date(value: str) -> None:
+    """F-DATE: a ``date`` answer is an ISO 8601 calendar date (``YYYY-MM-DD``)."""
+    asked = _asked(expects=DATE)
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=value)) is None
+
+
+@pytest.mark.parametrize("value", ["tomorrow", "2026-13-40", "", "2025-02-29", "20261114"])
+def test_a_date_question_refuses_an_answer_that_is_not_a_date(value: str) -> None:
+    """F-DATE: anything else is refused, as any misfit is (the format is checked, not only
+    the type)."""
+    asked = _asked(expects=DATE)
+    refused = answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=value))
+    assert refused == f"the answer does not fit what was asked: {value!r} is not a 'date'"
+
+
+def test_a_date_inside_a_form_is_checked_and_its_neighbours_keep_working() -> None:
+    """The format is checked wherever it sits; the other types are checked as before."""
+    form = {
+        "type": "object",
+        "properties": {"day": DATE, "note": {"type": "string"}, "count": {"type": "integer"}},
+    }
+    asked = _asked(ui="form", expects=form)
+    fits = {"day": "2026-11-14", "note": "tomorrow", "count": 3}
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=fits)) is None
+    late = _answer(asked, InterruptDecision.ANSWER, answer={**fits, "day": "next week"})
+    assert answer_problem(asked, late) == (
+        "the answer['day'] does not fit what was asked: 'next week' is not a 'date'"
+    )
+    wrong = _answer(asked, InterruptDecision.ANSWER, answer={**fits, "count": "3"})
+    assert answer_problem(asked, wrong) == (
+        "the answer['count'] does not fit what was asked: '3' is not of type 'integer'"
+    )
+
+
 @pytest.mark.parametrize(
     "decision", [InterruptDecision.APPROVE, InterruptDecision.REJECT, InterruptDecision.CANCEL]
 )
