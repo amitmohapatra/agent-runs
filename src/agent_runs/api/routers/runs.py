@@ -201,7 +201,9 @@ async def heartbeat(
     never queueing it. A hold fences none of the caller's writes and a pause lets go of it;
     another holder's hold in force is 409 ``LEASE_LOST``. Answered, a run held before it
     paused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the
-    ticker ends it ``ERROR`` (``holder_lost``) too."""
+    ticker ends it ``ERROR`` (``holder_lost``) too. Once the run's cancel was asked for, the
+    hold answers ``cancel_requested: true`` and is no longer extended: stop the run and
+    finish it ``CANCELLED`` (a hold that lapses then ends it ``CANCELLED``)."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
     lease = await _leasing(request, db).heartbeat(who.tenant_id, run_id, body, now=now())
     await db.commit()
@@ -328,7 +330,7 @@ async def resume(
     "/{run_id}/cancel",
     summary="Cancel a run, whatever its status",
     response_description="The run: `CANCELLED`, or `RUNNING` with its cancel asked of the "
-    "worker holding it; for a repeat, the run as it is.",
+    "worker or the process holding it; for a repeat, the run as it is.",
     responses={
         403: {
             "description": "AUTHORIZATION: the key may not cancel this run: the keys that may "
@@ -346,11 +348,13 @@ async def cancel(
     who: Who,
 ) -> RunRecord:
     """Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or
-    ``PAUSED`` run, and a ``RUNNING`` one no worker holds (kept in its caller's process),
-    ends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING`` run a worker
-    holds is asked to stop: the worker's next heartbeat answers ``cancel_requested: true``
-    and no longer extends its lease; the worker finishes the run ``CANCELLED``, and if it
-    has not when the lease runs out, the ticker cancels the run.
+    ``PAUSED`` run, and a ``RUNNING`` one nobody holds (kept in a caller's process that does
+    not hold it), ends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING``
+    run a worker holds, or its caller's process holds (``heartbeat``), is asked to stop: the
+    holder's next heartbeat answers ``cancel_requested: true`` and no longer extends its
+    lease or hold; the holder finishes the run ``CANCELLED`` (or lets go of it, ``release``),
+    and if it has not when the lease or the hold runs out, the ticker cancels the run. Until
+    then the run is ``RUNNING``: nothing waiting for it to end runs beside it.
 
     Who may cancel: the keys that may answer the run (``resume``), checked against its
     assignee now, before anything is written; 403 otherwise. A cancel already asked for, or

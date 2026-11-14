@@ -96,7 +96,7 @@ are grouped:
 | `runs.release` | `release(run_id, worker_id, *, checkpoint=None)` | `RunRecord` (`QUEUED` for another worker) |
 | `runs.pause` | `pause(interrupt, *, checkpoint=None, worker_id=None)` | `RunRecord` (`PAUSED`) |
 | `runs.resume` | `resume(resolution)` | `RunRecord` |
-| `runs.cancel` | `cancel(run_id, *, reason=None)` | `RunRecord` (`CANCELLED`, or `RUNNING` until its worker stops) |
+| `runs.cancel` | `cancel(run_id, *, reason=None)` | `RunRecord` (`CANCELLED`, or `RUNNING` until its worker, or the process holding it, stops) |
 | `runs.finish` | `finish(run_id, status, *, output=None, error=None, worker_id=None)` | `RunRecord` (`QUEUED` when a retryable `ERROR` is retried) |
 | `runs.get` | `get(run_id)` | `RunRecord`, or `None` |
 | `runs.list` | `list(*, status, assignee, agent_id, thread_id, parent_run_id, top_level=False, cursor, limit=50)` | `Page[RunSummary]` (`top_level=True`: no sub-agents) |

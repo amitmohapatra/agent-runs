@@ -111,6 +111,9 @@ _ENDED = tuple(status.value for status in RunStatus if status.final)
 #: placed when the clock would put it before (``_placed``): PostgreSQL keeps microseconds.
 _AFTER = timedelta(microseconds=1)
 
+#: The statuses of the runs in a key's line: running, or queued for a worker (``_placed``).
+_IN_LINE = (RunStatus.RUNNING.value, RunStatus.QUEUED.value)
+
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
 _UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
@@ -301,6 +304,31 @@ def _cancelled_instead(row: RunRow, now: datetime) -> bool:
     return True
 
 
+def _place(table: Any) -> Any:
+    """A run's place among the runs sharing its key (``table``'s row): when it was started, or
+    when its latest answer was recorded (it took its place again then)."""
+    answered = (
+        select(func.max(ResolutionRow.recorded_at))
+        .where(ResolutionRow.run_id == table.run_id)
+        .correlate(table)
+        .scalar_subquery()
+    )
+    return func.greatest(table.created_at, answered)
+
+
+def _holds_before(table: Any, place: Any, run_id: Any) -> Any:
+    """Whether ``table``'s running row holds its key ahead of a run placed at ``place``: it
+    runs on a worker, or it runs in its caller's process placed before it."""
+    return or_(
+        table.lease_owner.is_not(None), tuple_(_place(table), table.run_id) < tuple_(place, run_id)
+    )
+
+
+def _held(row: RunRow, now: datetime) -> bool:
+    """Whether a process holds the run kept in its caller's process now (:meth:`RunStore._hold`)."""
+    return row.holder is not None and row.held_until is not None and row.held_until >= now
+
+
 def _lock_id(*names: str) -> Any:
     """The transaction lock of a key's or a tenant's room (``names``), as one number."""
     return func.hashtextextended("\x1f".join(names), 0)
@@ -356,11 +384,11 @@ class RunStore:
         A run id held by another tenant is a ``Conflict`` that says nothing about who holds
         it, or that anyone does.
 
-        A run kept in its caller's process that shares a ``concurrency_key`` takes its place
-        among the runs sharing it (:meth:`_placed`): its ``created_at`` is after theirs.
+        A run that shares a ``concurrency_key`` takes its place among the runs sharing it
+        (:meth:`_placed`): its ``created_at`` is after theirs.
         """
         status = RunStatus.QUEUED if queue else RunStatus.RUNNING
-        if not queue and start.concurrency_key is not None:
+        if start.concurrency_key is not None:
             now = await self._placed(start.tenant_id, start.concurrency_key, now)
         record = RunRecord.from_start(start, status=status)
         input_ref = await self._put(record.tenant_id, record.input)
@@ -477,7 +505,7 @@ class RunStore:
         decision continues it as the next attempt: back on the queue when the run is durable
         (it was ever queued, so a worker resumes it), else ``RUNNING`` in the caller's
         process — which, when the run was held before it paused, must hold it again within
-        ``RESUME_GRACE`` (:meth:`end_abandoned`); one that shares a ``concurrency_key`` takes
+        ``RESUME_GRACE`` (:meth:`end_abandoned`). One that shares a ``concurrency_key`` takes
         its place again among the runs sharing it (:meth:`_placed`): the answer's
         ``recorded_at`` is after theirs.
 
@@ -500,7 +528,7 @@ class RunStore:
         if problem := answer_problem(asked, resolution):
             raise Unprocessable(problem)
         continues = resolution.decision is not InterruptDecision.CANCEL
-        if continues and row.queued_at is None and row.concurrency_key is not None:
+        if continues and row.concurrency_key is not None:
             now = await self._placed(tenant_id, row.concurrency_key, now)
         answer = await self._payloads.put(tenant_id, _json(resolution))
         question = await self._payloads.put(tenant_id, _json(asked))
@@ -558,11 +586,14 @@ class RunStore:
         it (``answering.py``, against its assignee now), checked before anything is
         written. Why and who asked are kept with the run.
 
-        A queued or waiting run, and a running one no worker holds (kept in its caller's
-        process), ends ``CANCELLED`` at once. A run a worker holds is asked to stop
-        (``cancel_requested_at``): from then on its heartbeats say ``cancel_requested`` and
-        no longer extend the lease, the worker finishes it ``CANCELLED``, and if it has not
-        when the lease runs out, the ticker cancels it (``requeue_lapsed``).
+        A queued or waiting run, and a running one nobody holds (kept in a caller's process
+        that never holds it), ends ``CANCELLED`` at once. A run a worker holds, or its caller's
+        process holds (:meth:`_hold`), is asked to stop (``cancel_requested_at``): from then
+        on its heartbeats say ``cancel_requested`` and no longer extend the lease or the hold,
+        its holder finishes it ``CANCELLED``, and if it has not when the lease or the hold runs
+        out, the ticker cancels it (``requeue_lapsed``, :meth:`end_abandoned`). Until then it
+        is ``RUNNING``: whoever waits for it to end (a conversation's next turn) never runs
+        beside it.
 
         Returns ``(run, changed)``: a cancel already asked for, or the run already cancelled
         by the same principal for the same reason (a retried request), answers the run as it
@@ -572,7 +603,7 @@ class RunStore:
         asked = (row.cancelled_by, row.cancel_reason) == (canceller.principal, cancel.reason)
         if row.cancel_requested_at is not None or (row.status == RunStatus.CANCELLED and asked):
             return await self._record(row, now), False
-        if row.status == RunStatus.RUNNING and row.lease_owner is not None:
+        if row.status == RunStatus.RUNNING and (row.lease_owner is not None or _held(row, now)):
             row.cancel_requested_at = row.updated_at = now
         else:
             _move(row, RunStatus.CANCELLED, now)
@@ -630,7 +661,8 @@ class RunStore:
         names no tenant) is every tenant's.
 
         The next run is available (no retry's backoff still holding it back) and has room:
-        fewer than ``concurrency_per_key`` RUNNING runs share its ``concurrency_key``, and
+        fewer than ``concurrency_per_key`` RUNNING runs hold its ``concurrency_key`` (a worker's,
+        or one kept in its caller's process placed before it: :meth:`_key_has_room`), and
         its tenant's workers hold fewer than ``max_running_per_tenant`` runs. Among those,
         the tenant whose workers hold the fewest runs of these agents comes first (the fair
         share: a tenant takes more of a shared fleet only while no tenant with fewer waits),
@@ -677,6 +709,7 @@ class RunStore:
                 sharing.status == RunStatus.RUNNING.value,
                 sharing.tenant_id == RunRow.tenant_id,
                 sharing.concurrency_key == RunRow.concurrency_key,
+                _holds_before(sharing, _place(RunRow), RunRow.run_id),
             )
             .scalar_subquery()
         )
@@ -708,19 +741,23 @@ class RunStore:
         return (held or 0) < self._per_tenant
 
     async def _key_has_room(self, row: RunRow) -> bool:
-        """Do fewer runs than allowed share the run's concurrency key (always, with none)?"""
+        """Do fewer runs than allowed hold the run's concurrency key (always, with none)? A
+        run holds it while it runs on a worker, or runs in its caller's process placed before
+        this one (:func:`_place`): one placed after it waits for it there, in its line."""
         if row.concurrency_key is None:
             return True
         if not await self._locked_for_claim("key", row.tenant_id, row.concurrency_key):
             return False
-        running = await self._session.scalar(
-            select(func.count()).where(
-                RunRow.status == RunStatus.RUNNING.value,
-                RunRow.tenant_id == row.tenant_id,
-                RunRow.concurrency_key == row.concurrency_key,
-            )
+        place = await self._session.scalar(
+            select(_place(RunRow)).where(RunRow.run_id == row.run_id)
         )
-        return (running or 0) < self._per_key
+        holding = select(func.count()).where(
+            RunRow.status == RunStatus.RUNNING.value,
+            RunRow.tenant_id == row.tenant_id,
+            RunRow.concurrency_key == row.concurrency_key,
+            _holds_before(RunRow, literal(place), literal(row.run_id)),
+        )
+        return (await self._session.scalar(holding) or 0) < self._per_key
 
     async def _locked_for_claim(self, *names: str) -> bool:
         """Take the transaction lock claims count a key's or a tenant's room under, unless
@@ -730,19 +767,20 @@ class RunStore:
         return bool(await self._session.scalar(select(lock)))
 
     async def _placed(self, tenant_id: str, key: str, now: datetime) -> datetime:
-        """When a run kept in its caller's process starts running among the runs sharing
-        ``key`` (it starts, or continues after its answer): ``now``, or just after the latest
-        change of one running now when that is later. Taken under the key's transaction lock
-        (a claim counts the key's room under it too), so of two runs starting at once the one
-        that commits second is placed after the first, whatever their clocks: once a caller
-        reads its run back, every run placed before it is there to read. A caller orders the
-        runs of one conversation by it (the harness answers a conversation's messages one at
-        a time, in this order, on whichever process each arrives)."""
+        """When a run takes its place among the runs sharing ``key`` (it starts, queued or
+        running, or continues after its answer): ``now``, or just after the latest change of
+        one of them running or queued when that is later. Taken under the key's transaction
+        lock (a claim counts the key's room under it too), so of two runs placed at once the
+        one that commits second is placed after the first, whatever their clocks: once a caller
+        reads its run back, every run placed before it is there to read. A run's place is
+        :func:`_place`; a caller orders the runs of one conversation by it (the harness answers
+        a conversation's messages one at a time, in this order, on whichever process each
+        arrives), and a claim respects it (:meth:`_key_has_room`)."""
         lock = func.pg_advisory_xact_lock(_lock_id("key", tenant_id, key))
         await self._session.execute(select(lock))
         latest = await self._session.scalar(
             select(func.max(RunRow.updated_at)).where(
-                RunRow.status == RunStatus.RUNNING.value,
+                RunRow.status.in_(_IN_LINE),
                 RunRow.tenant_id == tenant_id,
                 RunRow.concurrency_key == key,
             )
@@ -781,16 +819,21 @@ class RunStore:
         (:meth:`end_abandoned`), as nothing else can run it. Unlike a worker's lease it fences
         nothing (the caller writes to the run without a ``worker_id``, as before), takes no
         worker's place and never puts the run on the queue; a pause lets go of it. Another
-        holder's hold in force is ``LeaseLost``."""
+        holder's hold in force is ``LeaseLost``. Once the run's cancel was asked for
+        (:meth:`cancel`), the hold says ``cancel_requested`` and is no longer extended."""
         if row.holder not in (None, holder) and row.held_until and row.held_until >= now:
             raise LeaseLost(f"run {row.run_id} is held by {row.holder}")
-        expires_at = now + timedelta(seconds=seconds)
+        cancelling = row.cancel_requested_at
+        expires_at = (cancelling or now) + timedelta(seconds=seconds)
+        if cancelling is not None and row.held_until is not None:
+            expires_at = min(expires_at, row.held_until)  # asked to stop: never extended
         row.holder, row.held_until = holder, expires_at
         return Lease(
             run_id=row.run_id,
             worker_id=holder,
             expires_at=expires_at,
             remaining_seconds=self._remaining(row, now),
+            cancel_requested=cancelling is not None,
         )
 
     async def release(
@@ -812,6 +855,9 @@ class RunStore:
             # kept in its caller's process: its holder lets go of it, and it goes on unheld
             if row.holder != request.worker_id:
                 raise LeaseLost(f"{request.worker_id} does not hold run {run_id}")
+            if _cancelled_instead(row, now):  # asked to stop: let go of, it ends
+                await self._ended([row], now)
+                return await self._flushed(row, now), True
             if checkpoint is not None:
                 await self._keep_checkpoint(row, checkpoint)
             row.holder = row.held_until = None
@@ -948,8 +994,9 @@ class RunStore:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
         holding one stopped heartbeating — it crashed or was killed), and answered ones held
         before they paused that nobody took up within ``RESUME_GRACE`` (:meth:`resume`), end
-        as ``ERROR``: only that process could run them, so they are never put on the queue. A
-        run never held is never ended here. Returns every run ended."""
+        as ``ERROR``: only that process could run them, so they are never put on the queue
+        (one whose cancel was asked for ends ``CANCELLED``). A run never held is never ended
+        here. Returns every run ended."""
         rows = await self._sweep(
             RunRow.status == RunStatus.RUNNING.value,
             RunRow.held_until < now,
@@ -957,6 +1004,8 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
+            if _cancelled_instead(row, now):  # asked to stop, and its holder never ended it
+                continue
             holder, held_until = row.holder, row.held_until
             _move(row, RunStatus.ERROR, now)
             stopped = (

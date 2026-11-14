@@ -241,3 +241,36 @@ async def test_a_run_answered_in_its_callers_process_starts_after_its_keys_runni
     assert continued.status.value == "RUNNING"
     assert continued.updated_at == running.created_at + timedelta(microseconds=1)
     assert entry["recorded_at"] == continued.updated_at.isoformat().replace("+00:00", "Z")
+
+
+async def test_a_queued_run_of_a_key_is_claimed_before_the_runs_placed_after_it(
+    app, client
+) -> None:
+    """A queued run holds its place among its key's runs: a run kept in its caller's process
+    placed after it waits for it (its caller orders them so), so it does not hold the queued
+    run back; one placed before it, and a worker's running one, do."""
+    async with app.state.sessions() as db:
+        before = await _start(db, now(), concurrency_key="k")
+        await db.commit()
+    queued = await _queued(client, concurrency_key="k")
+    async with app.state.sessions() as db:
+        await _start(db, now(), concurrency_key="k")  # placed after the queued run
+        await db.commit()
+    assert await _claimed(client) is None, "the run placed before it holds the key"
+    await client.post(f"/v1/runs/{before.run_id}/finish", json={"status": "SUCCESS"})
+    assert await _claimed(client) == queued, "the one placed after it does not"
+    later = await _queued(client, concurrency_key="k")
+    assert await _claimed(client) is None, "a worker's running run holds the key"
+    await _finished(client, queued)
+    assert later  # (it waits for the run placed before it, kept in its caller's process)
+
+
+async def test_a_queued_run_of_a_key_is_placed_after_the_keys_runs_too(app) -> None:
+    clock = now()
+    async with app.state.sessions() as db:
+        running = await _start(db, clock, concurrency_key="k")
+        queued, _ = await RunStore(db).start(
+            RunStart(**started(concurrency_key="k")), queue=True, now=clock - timedelta(seconds=5)
+        )
+        await db.commit()
+    assert queued.created_at == running.created_at + timedelta(microseconds=1)

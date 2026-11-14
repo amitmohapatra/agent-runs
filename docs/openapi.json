@@ -5966,7 +5966,7 @@
     },
     "/v1/runs/{run_id}/cancel": {
       "post": {
-        "description": "Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or\n``PAUSED`` run, and a ``RUNNING`` one no worker holds (kept in its caller's process),\nends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING`` run a worker\nholds is asked to stop: the worker's next heartbeat answers ``cancel_requested: true``\nand no longer extends its lease; the worker finishes the run ``CANCELLED``, and if it\nhas not when the lease runs out, the ticker cancels the run.\n\nWho may cancel: the keys that may answer the run (``resume``), checked against its\nassignee now, before anything is written; 403 otherwise. A cancel already asked for, or\nrepeated after the run was cancelled by the same principal for the same reason, answers\nthe run as it is; an ended run is otherwise 409.",
+        "description": "Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or\n``PAUSED`` run, and a ``RUNNING`` one nobody holds (kept in a caller's process that does\nnot hold it), ends ``CANCELLED`` at once, announced as ``run.finished``. A ``RUNNING``\nrun a worker holds, or its caller's process holds (``heartbeat``), is asked to stop: the\nholder's next heartbeat answers ``cancel_requested: true`` and no longer extends its\nlease or hold; the holder finishes the run ``CANCELLED`` (or lets go of it, ``release``),\nand if it has not when the lease or the hold runs out, the ticker cancels the run. Until\nthen the run is ``RUNNING``: nothing waiting for it to end runs beside it.\n\nWho may cancel: the keys that may answer the run (``resume``), checked against its\nassignee now, before anything is written; 403 otherwise. A cancel already asked for, or\nrepeated after the run was cancelled by the same principal for the same reason, answers\nthe run as it is; an ended run is otherwise 409.",
         "operationId": "runs.cancel",
         "parameters": [
           {
@@ -6031,7 +6031,7 @@
                 }
               }
             },
-            "description": "The run: `CANCELLED`, or `RUNNING` with its cancel asked of the worker holding it; for a repeat, the run as it is.",
+            "description": "The run: `CANCELLED`, or `RUNNING` with its cancel asked of the worker or the process holding it; for a repeat, the run as it is.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -7910,7 +7910,7 @@
     },
     "/v1/runs/{run_id}/heartbeat": {
       "post": {
-        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. The lease says the working time the run has left\n(``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;\nstop working the run.\n\nA run kept in its caller's process (started ``RUNNING``, never queued) has no lease: the\nheartbeat holds it for ``worker_id`` (the process running it) until ``now +\nlease_seconds``. Once a hold lapses the ticker ends the run ``ERROR`` (``holder_lost``),\nnever queueing it. A hold fences none of the caller's writes and a pause lets go of it;\nanother holder's hold in force is 409 ``LEASE_LOST``. Answered, a run held before it\npaused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the\nticker ends it ``ERROR`` (``holder_lost``) too.",
+        "description": "Extend the lease to ``now + lease_seconds``; every third of the lease is a good\nrhythm. With ``checkpoint``, also save the executor's progress (its resume journal) on\nthe run, replacing the one there: the next attempt's claim gets it, so a worker crash\nrepeats no checkpointed side effect. The lease says the working time the run has left\n(``remaining_seconds``). 409 ``LEASE_LOST`` means the lease is no longer the worker's;\nstop working the run.\n\nA run kept in its caller's process (started ``RUNNING``, never queued) has no lease: the\nheartbeat holds it for ``worker_id`` (the process running it) until ``now +\nlease_seconds``. Once a hold lapses the ticker ends the run ``ERROR`` (``holder_lost``),\nnever queueing it. A hold fences none of the caller's writes and a pause lets go of it;\nanother holder's hold in force is 409 ``LEASE_LOST``. Answered, a run held before it\npaused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the\nticker ends it ``ERROR`` (``holder_lost``) too. Once the run's cancel was asked for, the\nhold answers ``cancel_requested: true`` and is no longer extended: stop the run and\nfinish it ``CANCELLED`` (a hold that lapses then ends it ``CANCELLED``).",
         "operationId": "runs.heartbeat",
         "parameters": [
           {

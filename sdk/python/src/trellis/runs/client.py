@@ -141,7 +141,8 @@ class RunsClient:
         replaces the run's checkpoint; without, the one there is kept). Any ``409`` raises
         :class:`LeaseLostError`: this worker does not hold a running lease on the run. On a
         run kept in the caller's process (started, never queued) it holds the run for
-        ``worker_id`` instead: agent-runs ends the run ``ERROR`` once the hold lapses."""
+        ``worker_id`` instead: agent-runs ends the run ``ERROR`` once the hold lapses (once its
+        cancel was asked for, the hold says ``cancel_requested``: finish it ``CANCELLED``)."""
         body: dict[str, Any] = {"worker_id": worker_id, "lease_seconds": lease_seconds}
         if checkpoint is not None:
             body["checkpoint"] = checkpoint
@@ -222,10 +223,11 @@ class RunsClient:
         self, run_id: str, *, reason: str | None = None, tenant: str | None = None
     ) -> RunRecord:
         """Cancel the run, whatever its status, keeping ``reason`` with it. A queued or
-        waiting run (or one in its caller's process) is ``CANCELLED`` at once; a run a worker
-        holds stays ``RUNNING`` until its worker stops (its next heartbeat says
-        ``cancel_requested``; :class:`Worker` cancels the handler and finishes the run
-        ``CANCELLED``), or agent-runs cancels it when the lease runs out. The keys that may
+        waiting run (or one in a caller's process that does not hold it) is ``CANCELLED`` at
+        once; a run a worker holds, or its caller's process holds (:meth:`heartbeat`), stays
+        ``RUNNING`` until its holder stops (its next heartbeat says ``cancel_requested``;
+        :class:`Worker` cancels the handler and finishes the run ``CANCELLED``), or agent-runs
+        cancels it when the lease or the hold runs out. The keys that may
         answer a run may cancel it (:class:`AuthorizationError` otherwise); an ended run
         raises :class:`ConflictError`. Safe to retry."""
         data = await self._transport.json(

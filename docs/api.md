@@ -242,9 +242,13 @@ still running a second later, its `WORKING_TIME_GRACE_SECONDS`, and finishes the
 `priority` (`-1000` to `1000`, default `0`) and `concurrency_key` (optional, 1–200
 characters) say how a queued run waits its turn ([the claim](#post-v1runsclaim--200-claimed-or-204)):
 higher priority first, and at most `RUNS__LIMITS__CONCURRENCY_PER_KEY` (default 1) of the
-tenant's runs sharing a key `RUNNING` at once, the others waiting `QUEUED`. A run recorded
-`RUNNING` in its caller's process takes its key's place too (it runs), but is never held
-back: only a claim waits.
+tenant's runs sharing a key `RUNNING` at once, the others waiting `QUEUED`. Every run of a
+key has a place among its runs: when it was started, or when its latest answer was recorded,
+placed after the key's runs already running or queued in the order the starts commit. A run
+recorded `RUNNING` in its caller's process takes its key's place too (it runs), and is never
+held back; a claim takes a queued run only while no run placed before it runs (one placed
+after it waits for it in its caller's process: the harness orders a conversation's turns by
+the places).
 
 ### `POST /v1/runs/claim` → `200 Claimed` or `204`
 
@@ -323,7 +327,10 @@ Answered (`resume`), a run that was held when it paused runs unheld until whoeve
 holds it again; if nobody does within `RESUME_GRACE` (60 s) — the process that ran it stopped
 while it waited — the ticker ends it `ERROR` (`holder_lost`, "nobody took the run up after its
 answer"). Its holder lets go of a hold without ending the run with `release` (the run stays
-`RUNNING`, unheld).
+`RUNNING`, unheld). A held run whose cancel was asked for: the heartbeat answers
+`cancel_requested: true` and no longer extends the hold; the holder stops and finishes the run
+`CANCELLED` (or lets go of it: it ends `CANCELLED`), and a hold that lapses then ends it
+`CANCELLED`, not `holder_lost`.
 
 The answer is the `Lease`:
 
@@ -476,9 +483,15 @@ every run, lists every inbox (`assignee` is a filter, not a lock) and works the 
 Cancels the run, whatever its status, keeping `reason` (optional, at most 1000 characters)
 and the principal of the key that asked with it:
 
-- `QUEUED` or `PAUSED`, or `RUNNING` with no worker holding it (a run kept in its caller's
-  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared and
-  the artifacts' retention starts. The caller's process gets `409` on its next write.
+- `QUEUED` or `PAUSED`, or `RUNNING` with nobody holding it (a run kept in a caller's
+  process that does not hold it): `CANCELLED` at once, announced as `run.finished`; the
+  checkpoint is cleared and the artifacts' retention starts. The caller's process gets `409`
+  on its next write.
+- `RUNNING` and held by its caller's process (a heartbeat holds it): asked to stop, as a
+  worker's run is below. The holder's next heartbeat answers `cancel_requested: true`; it
+  stops the run and finishes it `CANCELLED`; a hold that lapses first ends it `CANCELLED`.
+  Until then the run is `RUNNING`, so whatever waits for it to end (the conversation's next
+  turn) never runs beside it.
 - `RUNNING` and held by a worker: the run stays `RUNNING` with its cancel asked. The
   worker's next heartbeat answers `cancel_requested: true` and no longer extends the lease;
   the worker stops and finishes the run `CANCELLED` (the SDK's `Worker` cancels the handler
