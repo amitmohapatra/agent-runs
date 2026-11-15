@@ -316,6 +316,32 @@ async def test_finishing_clears_the_checkpoint(client) -> None:
     assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] is None
 
 
+async def test_a_finish_that_keeps_the_checkpoint_keeps_the_last_one_sent(client) -> None:
+    """A caller that rewinds ended runs keeps the checkpoint past the end: the one it sends
+    with the finish (its last), else the one it had; nothing else about the ending changes."""
+    paused = await _claimed_and_paused(client)
+    rid = paused["run_id"]
+    await client.post(f"/v1/runs/{rid}/resume", json=resolution(paused))
+    await client.post("/v1/runs/claim", json=claim("w2"))
+    last = {"asks": {"ask_1": "yes"}, "done": True}
+    done = await client.post(
+        f"/v1/runs/{rid}/finish",
+        params={"worker_id": "w2"},
+        json={"status": "SUCCESS", "keep_checkpoint": True, "checkpoint": last},
+    )
+    assert done.status_code == 200, done.text
+    assert (done.json()["status"], done.json()["checkpoint"]) == ("SUCCESS", last)
+    assert (await client.get(f"/v1/runs/{rid}")).json()["checkpoint"] == last
+
+
+async def test_a_cancel_that_keeps_the_checkpoint_keeps_it(client) -> None:
+    paused = await _claimed_and_paused(client)
+    rid = paused["run_id"]
+    cancelled = await client.post(f"/v1/runs/{rid}/cancel", json={"keep_checkpoint": True})
+    assert cancelled.status_code == 200, cancelled.text
+    assert (cancelled.json()["status"], cancelled.json()["checkpoint"]) == ("CANCELLED", _JOURNAL)
+
+
 async def test_cancelling_a_paused_run_clears_the_checkpoint(client) -> None:
     paused = await _claimed_and_paused(client)
     cancelled = await client.post(

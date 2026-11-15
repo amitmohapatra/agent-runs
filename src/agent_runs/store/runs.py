@@ -230,11 +230,12 @@ def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: boo
     return [*differing, "queue"] if queue != queued else differing
 
 
-def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
+def _move(row: RunRow, to: RunStatus, now: datetime, *, keep_checkpoint: bool = False) -> None:
     """The one transition check. Leaving RUNNING adds the stretch to the working time and
     clears the lease and the hold (a pause keeps who held it: ``resume``); leaving PAUSED
     clears what it waited on; an ending clears the checkpoint, which only a run that may still
-    continue needs. Whoever settled the old state did not settle the new one."""
+    continue needs — unless its caller keeps it (``keep_checkpoint``: it rewinds ended runs).
+    Whoever settled the old state did not settle the new one."""
     if not RunStatus(row.status).can_become(to):
         raise Conflict(f"run {row.run_id} cannot move from {row.status} to {to.value}")
     row.worked_seconds = _worked(row, now)
@@ -251,7 +252,7 @@ def _move(row: RunRow, to: RunStatus, now: datetime) -> None:
             row.holder = None
     if to is not RunStatus.PAUSED:
         row.awaiting = row.awaiting_ref = row.assignee = row.awaiting_deadline = None
-    if to.final:
+    if to.final and not keep_checkpoint:
         row.checkpoint_ref = row.checkpoint_segments = None
 
 
@@ -669,7 +670,7 @@ class RunStore:
         if row.status == RunStatus.RUNNING and row.lease_owner is not None:
             row.cancel_requested_at = row.updated_at = now
         else:
-            _move(row, RunStatus.CANCELLED, now)
+            _move(row, RunStatus.CANCELLED, now, keep_checkpoint=cancel.keep_checkpoint)
             await self._ended([row], now)
         row.cancel_reason, row.cancelled_by = cancel.reason, canceller.principal
         return await self._flushed(row, now), True
@@ -692,6 +693,9 @@ class RunStore:
         ``MAX_ERROR_RETRIES``-th such error stands, saying how often the run was retried. A
         worker's repeat of that finish answers the requeued run."""
         output_ref = await self._put(tenant_id, ending.output)
+        kept = (
+            await self._checkpoint(tenant_id, ending.checkpoint) if ending.keep_checkpoint else None
+        )
         row = await self._locked(tenant_id, run_id, worker_id=None)
         requeued = (
             ending.status is RunStatus.ERROR
@@ -707,7 +711,9 @@ class RunStore:
             _requeue(row, now, wait=jittered(wait))
             row.settled_by = worker_id
             return await self._flushed(row, now), True
-        _move(row, ending.status, now)
+        _move(row, ending.status, now, keep_checkpoint=ending.keep_checkpoint)
+        if kept is not None:
+            await self._keep_checkpoint(row, kept)
         row.output_ref = _dumped(output_ref)
         await self._link(run_id, _OUTPUT, output_ref)
         row.error = _json(_counted(ending.error, row.error_retries))

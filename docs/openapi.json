@@ -1220,6 +1220,12 @@
         "additionalProperties": false,
         "description": "Why a run is cancelled: kept with the run, with the principal of the key that asked.",
         "properties": {
+          "keep_checkpoint": {
+            "default": false,
+            "description": "Keep the run's checkpoint past the cancel (its caller rewinds ended runs).",
+            "title": "Keep Checkpoint",
+            "type": "boolean"
+          },
           "reason": {
             "anyOf": [
               {
@@ -1612,6 +1618,19 @@
         "additionalProperties": false,
         "description": "How a run ended. The contracts decide which endings may carry an ``error``.",
         "properties": {
+          "checkpoint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The run's last checkpoint, kept with keep_checkpoint (ignored without).",
+            "title": "Checkpoint"
+          },
           "error": {
             "anyOf": [
               {
@@ -1622,6 +1641,12 @@
               }
             ],
             "description": "Why it failed; only with ERROR, TIMEOUT or REJECTED."
+          },
+          "keep_checkpoint": {
+            "default": false,
+            "description": "Keep the run's checkpoint past its end (its caller rewinds ended runs); it is cleared with the ending otherwise.",
+            "title": "Keep Checkpoint",
+            "type": "boolean"
           },
           "output": {
             "description": "What the run produced, at most 1 MiB of compact JSON.",

@@ -219,7 +219,12 @@ class RunsClient:
         return RunRecord.model_validate(data)
 
     async def cancel(
-        self, run_id: str, *, reason: str | None = None, tenant: str | None = None
+        self,
+        run_id: str,
+        *,
+        reason: str | None = None,
+        tenant: str | None = None,
+        keep_checkpoint: bool = False,
     ) -> RunRecord:
         """Cancel the run, whatever its status, keeping ``reason`` with it. A queued or
         waiting run (or one in its caller's process) is ``CANCELLED`` at once; a run a worker
@@ -227,9 +232,13 @@ class RunsClient:
         ``cancel_requested``; :class:`Worker` cancels the handler and finishes the run
         ``CANCELLED``), or agent-runs cancels it when the lease runs out. The keys that may
         answer a run may cancel it (:class:`AuthorizationError` otherwise); an ended run
-        raises :class:`ConflictError`. Safe to retry."""
+        raises :class:`ConflictError`. Safe to retry. ``keep_checkpoint`` keeps the run's
+        checkpoint past the cancel (for a caller that rewinds ended runs)."""
+        body: dict[str, Any] = {"reason": reason}
+        if keep_checkpoint:
+            body["keep_checkpoint"] = True
         data = await self._transport.json(
-            "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json={"reason": reason}
+            "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json=body
         )
         return RunRecord.model_validate(data)
 
@@ -242,12 +251,20 @@ class RunsClient:
         error: AgentError | None = None,
         worker_id: str | None = None,
         tenant: str | None = None,
+        keep_checkpoint: bool = False,
+        checkpoint: dict[str, Any] | None = None,
     ) -> RunRecord:
         """End the run with ``status`` (an ending). The same finish repeated answers the
-        stored run. ``worker_id`` fences the write to the lease holder."""
+        stored run. ``worker_id`` fences the write to the lease holder. ``keep_checkpoint``
+        keeps the run's checkpoint past its end — ``checkpoint``, its last, when given — for
+        a caller that rewinds ended runs; it is cleared with the ending otherwise."""
         body: dict[str, Any] = {"status": status.value, "output": output}
         if error is not None:
             body["error"] = error.model_dump(mode="json")
+        if keep_checkpoint:
+            body["keep_checkpoint"] = True
+            if checkpoint is not None:
+                body["checkpoint"] = checkpoint
         data = await self._transport.json(
             "POST",
             f"/v1/runs/{run_id}/finish",

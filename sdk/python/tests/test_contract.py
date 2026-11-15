@@ -214,6 +214,19 @@ class Service:
         return httpx.Response(status, json=body, headers=headers)
 
 
+async def test_keeping_a_checkpoint_past_the_end_is_what_the_document_describes(
+    contract: OpenAPI,
+) -> None:
+    """A caller that rewinds ended runs keeps the checkpoint with a finish or a cancel."""
+    service = Service(contract)
+    async with service.client() as runs:
+        await runs.cancel("run_1", keep_checkpoint=True)
+        await runs.finish("run_1", RunStatus.SUCCESS, keep_checkpoint=True)
+        await runs.finish(
+            "run_1", RunStatus.SUCCESS, keep_checkpoint=True, checkpoint={"tools": {}}
+        )
+
+
 async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> None:
     service = Service(contract)
     async with service.client() as runs:

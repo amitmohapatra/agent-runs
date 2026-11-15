@@ -88,6 +88,17 @@ class RunFinish(BaseModel):
     error: AgentError | None = Field(
         default=None, description="Why it failed; only with ERROR, TIMEOUT or REJECTED."
     )
+    keep_checkpoint: bool = Field(
+        default=False,
+        description=(
+            "Keep the run's checkpoint past its end (its caller rewinds ended runs); it is "
+            "cleared with the ending otherwise."
+        ),
+    )
+    checkpoint: dict[str, Any] | None = Field(
+        default=None,
+        description="The run's last checkpoint, kept with keep_checkpoint (ignored without).",
+    )
 
     @model_validator(mode="after")
     def _is_an_ending(self) -> Self:
@@ -104,6 +115,10 @@ class RunCancel(BaseModel):
 
     reason: str | None = Field(
         default=None, max_length=1000, description="Why the run is cancelled (optional)."
+    )
+    keep_checkpoint: bool = Field(
+        default=False,
+        description="Keep the run's checkpoint past the cancel (its caller rewinds ended runs).",
     )
 
 
