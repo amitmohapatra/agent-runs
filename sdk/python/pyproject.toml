@@ -25,3 +25,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # ``trellis`` is a namespace package shared by every trellis-* distribution: no __init__.py.
 packages = ["src/trellis"]
+
+[tool.hatch.build.targets.sdist]
+# only the package source and its metadata: no tests, examples, benchmarks, docs or data
+# (`make dist-check` fails on anything else in the wheel or the sdist)
+only-include = ["src/trellis", "README.md"]
