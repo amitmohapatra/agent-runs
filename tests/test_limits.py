@@ -247,7 +247,8 @@ async def test_a_304_is_only_for_the_tenants_own_artifact(client, other_tenant) 
 
 @pytest.fixture
 async def limited(migrated, memory, blobs) -> AsyncIterator[Any]:
-    settings = _settings(rate_limit=RateLimitSettings(per_minute=60, burst=2))
+    # a token every 10 s: a slow machine's requests never earn one back between them
+    settings = _settings(rate_limit=RateLimitSettings(per_minute=6, burst=2))
     async with serving(settings, memory, blobs) as application:
         yield application
 
@@ -256,14 +257,14 @@ async def test_a_tenant_past_its_budget_is_told_when_to_come_back(limited) -> No
     async with client_of(limited) as acme, client_of(limited, "other-key") as globex:
         first = await acme.get("/v1/runs")
         assert (first.headers["x-ratelimit-limit"], first.headers["x-ratelimit-remaining"]) == (
-            "60",
+            "6",
             "1",
         )
         await acme.get("/v1/runs")
         refused = await acme.get("/v1/runs")
         assert (refused.status_code, refused.json()["code"]) == (429, "RATE_LIMIT")
         assert refused.json()["retryable"] is True
-        assert refused.headers["retry-after"] == "1"
+        assert 1 <= int(refused.headers["retry-after"]) <= 10
         assert refused.headers["x-ratelimit-remaining"] == "0"
         assert (await globex.get("/v1/runs")).status_code == 200, "a bucket per tenant"
         assert (await acme.get("/health/live")).status_code == 200, "ops routes are not counted"
