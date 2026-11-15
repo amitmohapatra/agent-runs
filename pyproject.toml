@@ -53,6 +53,11 @@ members = ["sdk/python"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_runs"]
 
+[tool.hatch.build.targets.sdist]
+# only the package source and its metadata: no tests, examples, benchmarks, docs or data
+# (`make dist-check` fails on anything else in the wheel or the sdist)
+only-include = ["src/agent_runs", "README.md", "CHANGELOG.md"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

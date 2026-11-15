@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint typecheck test sdk coverage examples links openapi migrate image up down
+.PHONY: help install lint typecheck test sdk coverage examples links openapi migrate image up down dist-check
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -28,6 +28,13 @@ examples: ## Run every numbered example in process (the local PostgreSQL, as for
 	@for f in examples/[0-9]*.py; do \
 		echo "== $$f"; uv run python "$$f" || exit 1; \
 	done
+
+dist-check:  ## The wheel and sdist hold only the package source: no tests, examples, docs or data
+	rm -rf build/dist
+	uv build -q --out-dir build/dist/main .
+	python3 scripts/check_dist.py build/dist/main agent_runs
+	uv build -q --out-dir build/dist/sdk sdk/python
+	python3 scripts/check_dist.py build/dist/sdk trellis
 
 links: ## Fail on a broken relative link or anchor in any Markdown file
 	python3 scripts/check_links.py .

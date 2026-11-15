@@ -58,6 +58,8 @@ jobs:
       - run: make examples
       # every relative Markdown link and anchor resolves
       - run: make links
+      # the wheel and sdist hold only the package source: no tests, examples, docs or data
+      - run: make dist-check
       # the committed OpenAPI document is the one the code generates (`make openapi`)
       - name: OpenAPI document is current
         run: |
