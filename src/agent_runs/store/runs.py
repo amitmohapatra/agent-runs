@@ -77,6 +77,7 @@ from agent_runs.store.tables import (
     RunPayloadRow,
     RunRow,
 )
+from agent_runs.store.webhooks import WebhookStore
 
 #: A record's columns; its payloads are read by reference (``_REFS``).
 _RECORD_FIELDS = (
@@ -429,7 +430,8 @@ def _counted(error: AgentError | None, retries: int) -> AgentError | None:
 
 
 class RunStore:
-    """Every run operation, in one place. The caller commits. ``limits`` are the
+    """Every run operation, in one place. The caller commits, the run's change and the
+    webhook event it causes (written to the outbox with it) together. ``limits`` are the
     deployment's (``RUNS__LIMITS__*``), which every store is built with: ``max_run_seconds``
     is the service's maximum working time (a run's own ``timeout_seconds`` may only be
     shorter); ``concurrency_per_key`` and ``max_running_per_tenant`` bound what a claim may
@@ -438,6 +440,7 @@ class RunStore:
     def __init__(self, session: AsyncSession, limits: LimitsSettings) -> None:
         self._session = session
         self._payloads = payloads_of(session)
+        self._webhooks = WebhookStore(session)
         self.limits = limits
         self._max_run_seconds = limits.max_run_seconds
         self._per_key = limits.concurrency_per_key
@@ -1201,13 +1204,16 @@ class RunStore:
         return len(gone)
 
     async def _swept(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
-        """What every sweep ends with: the rows it moved, written, as records without their
-        payloads (input, output, answer, checkpoint, the question's payload). A sweep's runs
-        are announced, which takes none of them: a batch is not read from the blob store."""
+        """What every sweep ends with: the rows it moved, written and announced (one a
+        sweep leaves ``PAUSED`` was escalated; a requeue announces nothing), as records
+        without their payloads (input, output, answer, checkpoint, the question's payload).
+        Announcing takes none of them: a batch is not read from the blob store."""
         await self._ended(rows, now)
         await self._session.flush()
         places = await self._places(rows)
-        return [RunRecord.model_validate(_fields(row, now, places)) for row in rows]
+        moved = [RunRecord.model_validate(_fields(row, now, places)) for row in rows]
+        await self._webhooks.announce(*moved, escalated=True, now=now)
+        return moved
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (
@@ -1512,6 +1518,9 @@ class RunStore:
         return row
 
     async def _flushed(self, row: RunRow, now: datetime) -> RunRecord:
+        """What every change of one run ends with: the row written, and what its status now
+        announces (a pause, an ending; nothing otherwise) written to the outbox of its
+        tenant's subscriptions, in the change's own transaction. Its record."""
         if row.awaiting_ref is None:  # not paused (any more): its question's payload let go
             await self._session.execute(
                 delete(RunPayloadRow).where(
@@ -1519,7 +1528,9 @@ class RunStore:
                 )
             )
         await self._session.flush()
-        return await self._record(row, now)
+        record = await self._record(row, now)
+        await self._webhooks.announce(record, now=now)
+        return record
 
     async def _record(self, row: RunRow, now: datetime) -> RunRecord:
         return (await self._records([row], now))[0]

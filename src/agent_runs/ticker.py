@@ -198,12 +198,10 @@ class Ticker:
         return fired
 
     async def _sweep_runs(self, sweep: RunSweep, now: datetime) -> int:
-        """One run sweep and the webhook events of the runs it moved, in one transaction. A
-        run a sweep leaves ``PAUSED`` was escalated; any other announces what its new status
-        does (an ending ``run.finished``, a requeue nothing)."""
+        """One run sweep, committed with the webhook events of the runs it moved (the store
+        writes them: ``RunStore._swept``)."""
         async with self._sessions() as db:
             moved = await sweep(self._runs(db), now=now, limit=SWEEP_BATCH)
-            await WebhookStore(db).announce(*moved, escalated=True, now=now)
             await db.commit()
         return len(moved)
 

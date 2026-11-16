@@ -6,6 +6,11 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **The run store announces the changes it makes.** Whether a run change was announced to
+  webhooks was decided outside the store, at six call sites (five routes and the ticker),
+  each of which had to remember it. `RunStore` now writes the outbox row at the end of the
+  transition itself (`_flushed` for one run, `_swept` for a sweep's), in the same
+  transaction as before. The events delivered are unchanged. Nothing to do.
 * **A tenant's claim no longer reads its whole queue.** Every claim read all the queued runs
   of the worker's agents and sorted them to take one: `ix_runs_queue` held them by age, and
   the claim's order starts with the fair share between tenants. Measured with

@@ -50,7 +50,6 @@ from agent_runs.domain.runs import (
     bounded_payload,
 )
 from agent_runs.observability.metrics import claims_total
-from agent_runs.store.webhooks import WebhookStore
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
@@ -222,10 +221,7 @@ async def release(
     answers the run as it is. A run kept in its caller's process (never queued) is not
     queued: its holder lets go of the hold, and it goes on ``RUNNING``, unheld."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    at = now()
-    run, released = await store.release(who.tenant_id, run_id, body, caller=who.credential, now=at)
-    if released:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.release(who.tenant_id, run_id, body, caller=who.credential, now=now())
     await db.commit()
     return run
 
@@ -251,10 +247,7 @@ async def pause(
     The lease ends. Repeated by the same caller on the same interrupt, it answers the stored
     run and changes nothing."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    at = now()
-    run, paused = await store.pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    if paused:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.pause(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
     await db.commit()
     return run
 
@@ -304,10 +297,7 @@ async def resume(
     Repeated with the very same resolution (its ``resolved_at`` included), as a client
     retries it after losing the answer, it answers the run as it is now and changes nothing.
     Any other answer to an interrupt already answered is 409."""
-    at = now()
-    run, resumed = await store.resume(who.tenant_id, run_id, body, answerer=who.credential, now=at)
-    if resumed:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.resume(who.tenant_id, run_id, body, answerer=who.credential, now=now())
     await db.commit()
     return run
 
@@ -345,10 +335,7 @@ async def cancel(
     assignee now, before anything is written; 403 otherwise. A cancel already asked for, or
     repeated after the run was cancelled by the same principal for the same reason, answers
     the run as it is; an ended run is otherwise 409."""
-    at = now()
-    run, changed = await store.cancel(who.tenant_id, run_id, body, canceller=who.credential, now=at)
-    if changed:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.cancel(who.tenant_id, run_id, body, canceller=who.credential, now=now())
     await db.commit()
     return run
 
@@ -373,10 +360,7 @@ async def finish(
     caller with the same status, it answers the stored run and changes nothing. ``output``
     is at most ``RUNS__SERVICE__MAX_PAYLOAD_BYTES`` (1 MiB) of compact JSON."""
     bounded_payload(body.output, name="output", limit=_payload_limit(request))
-    at = now()
-    run, ended = await store.finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    if ended:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.finish(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
     await db.commit()
     return run
 

@@ -1,10 +1,12 @@
 """Webhook subscriptions and the delivery outbox.
 
 A run event is written to the outbox in the same transaction as the run change that caused
-it, one row per subscription of the tenant that wants that event, so an event is never lost
-to a crash between the commit and the send and never sent for a change that rolled back. The
-ticker delivers from the outbox (``claim_due`` / ``settle``). A delivery given up on stays in
-it, dead, for the tenant to list and redeliver, until the ticker drops it (``drop_dead``).
+it, by the store that makes the change (``RunStore._flushed`` and ``_swept`` call
+``announce``: no caller of a transition can leave it out), one row per subscription of the
+tenant that wants that event, so an event is never lost to a crash between the commit and
+the send and never sent for a change that rolled back. The ticker delivers from the outbox
+(``claim_due`` / ``settle``). A delivery given up on stays in it, dead, for the tenant to
+list and redeliver, until the ticker drops it (``drop_dead``).
 """
 
 from __future__ import annotations
