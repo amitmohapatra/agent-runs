@@ -24,6 +24,7 @@ from typing import Any, Final
 
 import zstandard
 from pydantic import BaseModel, ConfigDict
+from trellis.runs.blob import sha256_hex
 
 #: What a payload object is: JSON, zstd-compressed.
 MEDIA_TYPE: Final = "application/vnd.trellis.payload+json+zstd"
@@ -128,7 +129,7 @@ def key_of(tenant_id: str, sha256: str) -> str:
 
 def ref_of(tenant_id: str, data: bytes) -> PayloadRef:
     """The reference ``data`` is stored under for ``tenant_id``: its content's address."""
-    digest = hashlib.sha256(data).hexdigest()
+    digest = sha256_hex(data)
     return PayloadRef(ref=key_of(tenant_id, digest), size=len(data), sha256=digest)
 
 

@@ -4,12 +4,12 @@ diff, a report) is uploaded beside the run, and the run carries the ``ArtifactRe
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from typing import Final
 
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.runs._transport import Transport, worker_params
+from trellis.runs.blob import sha256_hex
 from trellis.runs.errors import NotFoundError
 from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, frames
 
@@ -39,7 +39,7 @@ class ArtifactsAPI:
         ``worker_id``; a paused one only from a ``service`` key."""
         params = {
             **worker_params(worker_id),
-            "checksum": f"sha256:{hashlib.sha256(data).hexdigest()}",
+            "checksum": f"sha256:{sha256_hex(data)}",
         }
         body = await self._transport.json(
             "POST",
@@ -104,6 +104,6 @@ class ArtifactsAPI:
 
 
 def _whole(ref: PayloadRef, data: bytes) -> bytes:
-    if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256:
+    if len(data) != ref.size or sha256_hex(data) != ref.sha256:
         raise ValueError(f"payload {ref.sha256} did not arrive whole")
     return data

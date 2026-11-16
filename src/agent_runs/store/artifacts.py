@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.artifacts import ArtifactRef
 
 from agent_runs.blob import StoredBlob
-from agent_runs.domain.errors import NotFound
+from agent_runs.domain.errors import Conflict, NotFound
 from agent_runs.store.tables import ArtifactRow
 
 ARTIFACTS_PATH = "/v1/artifacts"
@@ -79,7 +79,8 @@ class ArtifactStore:
                 ArtifactRow.run_id == run_id, ArtifactRow.checksum == checksum
             )
         )
-        assert existing is not None  # the conflict was on exactly this row
+        if existing is None:  # the row the insert met was deleted before this read
+            raise Conflict(f"run {run_id} had these bytes as an artifact that is now gone")
         return existing, False
 
     async def get(self, tenant_id: str, artifact_id: str) -> ArtifactRow:

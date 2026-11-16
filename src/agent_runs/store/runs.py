@@ -124,7 +124,7 @@ _IN_LINE = (RunStatus.RUNNING.value, RunStatus.QUEUED.value)
 
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
-_UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
+_UNENDED = tuple(status.value for status in RunStatus if not status.final)
 
 #: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
 #: same key with a different request is a client bug to surface, not a run to hand back.
@@ -222,6 +222,21 @@ def _json(model: Any) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True) if model is not None else None
 
 
+def _timed_out(code: str, message: str) -> dict[str, Any] | None:
+    """The error of a run a ticker's sweep ended, as its row keeps it. ``retryable`` is false
+    as a directly built ``AgentError``'s is anyway, said here because ``TIMEOUT`` is a
+    category callers otherwise take for retryable."""
+    return _json(
+        AgentError(
+            code=code,
+            category=ErrorCategory.TIMEOUT,
+            message=message,
+            retryable=False,
+            source="agent-runs",
+        )
+    )
+
+
 def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: bool) -> list[str]:
     """The fields in which a repeated start asks for something other than the run it found."""
     asked = start.model_dump(mode="json", include=set(_START_FIELDS))
@@ -303,7 +318,7 @@ def _retried(row: RunRow, ending: RunFinish) -> bool:
         and error is not None
         and error.retryable
         and row.status == RunStatus.RUNNING
-        and row.queued_at is not None
+        and _durable(row)
         and row.error_retries < MAX_ERROR_RETRIES
         and row.cancel_requested_at is None
     )
@@ -363,10 +378,16 @@ def _after_the_line(tenant_id: str, key: str, now: datetime, *, but: str = "") -
     return func.greatest(clock, latest + _AFTER, type_=RunRow.updated_at.type)
 
 
+def _durable(row: RunRow) -> bool:
+    """Whether the run is a durable one: it went through the queue, so a worker runs it and
+    it can go back on the queue."""
+    return row.queued_at is not None
+
+
 def _in_callers_process(row: RunRow) -> bool:
     """Whether the run is kept in its caller's process: never queued, so no worker leases it
     and its caller may hold it instead."""
-    return row.lease_owner is None and row.queued_at is None
+    return row.lease_owner is None and not _durable(row)
 
 
 def _lock_id(*names: str) -> Any:
@@ -614,7 +635,7 @@ class RunStore:
         )
         if resolution.decision is InterruptDecision.CANCEL:
             _move(row, RunStatus.CANCELLED, now)
-        elif row.queued_at is not None:
+        elif _durable(row):
             _requeue(row, now)
         else:
             _move(row, RunStatus.RUNNING, now)
@@ -1006,19 +1027,11 @@ class RunStore:
         )
         for row in rows:
             _move(row, RunStatus.TIMEOUT, now)
-            row.error = _json(
-                AgentError(
-                    code="run_deadline",
-                    category=ErrorCategory.TIMEOUT,
-                    message=f"the run did not end by its deadline, {row.deadline}",
-                    # the category alone would say retryable; a retry would only be later
-                    retryable=False,
-                    source="agent-runs",
-                )
+            # not retryable: a retry would only be later
+            row.error = _timed_out(
+                "run_deadline", f"the run did not end by its deadline, {row.deadline}"
             )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def time_out_overworked(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Running runs whose working time passed their limit (``_limit``: their own
@@ -1039,20 +1052,13 @@ class RunStore:
         )
         for row in rows:
             _move(row, RunStatus.TIMEOUT, now)
-            row.error = _json(
-                AgentError(
-                    code="run_timeout",
-                    category=ErrorCategory.TIMEOUT,
-                    message=f"the run worked {row.worked_seconds:.0f} s, past its limit of "
-                    f"{self._limit(row):g} s",
-                    # the category alone would say retryable; a retry would only run as long
-                    retryable=False,
-                    source="agent-runs",
-                )
+            # not retryable: a retry would only run as long
+            row.error = _timed_out(
+                "run_timeout",
+                f"the run worked {row.worked_seconds:.0f} s, past its limit of "
+                f"{self._limit(row):g} s",
             )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
@@ -1072,21 +1078,15 @@ class RunStore:
             row.lease_lapses += 1
             if row.lease_lapses >= MAX_LEASE_LAPSES:
                 _move(row, RunStatus.ERROR, now)
-                row.error = _json(
-                    AgentError(
-                        code="lease_expired",
-                        category=ErrorCategory.TIMEOUT,
-                        message=f"the lease lapsed {row.lease_lapses} times: every worker "
-                        "that claimed the run stopped heartbeating",
-                        source="agent-runs",
-                    )
+                row.error = _timed_out(
+                    "lease_expired",
+                    f"the lease lapsed {row.lease_lapses} times: every worker "
+                    "that claimed the run stopped heartbeating",
                 )
             else:
                 wait = backoff(LAPSE_RETRY_BASE, row.lease_lapses, cap=LAPSE_RETRY_CAP)
                 _requeue(row, now, wait=jittered(wait))
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def end_abandoned(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
@@ -1111,19 +1111,9 @@ class RunStore:
                 f"and nothing held it by {held_until} (the process that ran it before it paused "
                 "stopped while it waited)"
             )
-            row.error = _json(
-                AgentError(
-                    code="holder_lost",
-                    category=ErrorCategory.TIMEOUT,
-                    message=stopped,
-                    # nothing could retry it: the work was in the process that stopped
-                    retryable=False,
-                    source="agent-runs",
-                )
-            )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+            # nothing could retry it: the work was in the process that stopped
+            row.error = _timed_out("holder_lost", stopped)
+        return await self._swept(rows, now)
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
@@ -1150,17 +1140,10 @@ class RunStore:
                 row.updated_at = now
             else:
                 _move(row, RunStatus.TIMEOUT, now)
-                row.error = _json(
-                    AgentError(
-                        code="interrupt_deadline",
-                        category=ErrorCategory.TIMEOUT,
-                        message=f"nobody answered by {interrupt.deadline}",
-                        source="agent-runs",
-                    )
+                row.error = _timed_out(
+                    "interrupt_deadline", f"nobody answered by {interrupt.deadline}"
                 )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def purge_ended(self, *, before: datetime, limit: int) -> int:
         """Delete the runs that ended before ``before``, with their resolutions and their
@@ -1180,6 +1163,12 @@ class RunStore:
             await self._session.execute(delete(ResolutionRow).where(ResolutionRow.run_id.in_(gone)))
             await self._session.execute(delete(RunRow).where(RunRow.run_id.in_(gone)))
         return len(gone)
+
+    async def _swept(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
+        """What every sweep ends with: the rows it moved, written, as records."""
+        await self._ended(rows, now)
+        await self._session.flush()
+        return await self._records(rows, now)
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (
