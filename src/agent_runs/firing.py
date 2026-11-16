@@ -24,6 +24,7 @@ from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import RunStart, RunStatus, Schedule
 
 from agent_runs.config.constants import MAX_FIRE_SKEW
+from agent_runs.domain.errors import Unavailable
 from agent_runs.domain.schedules import (
     FireFailed,
     FireResult,
@@ -109,12 +110,13 @@ class Firing:
         try:
             async with self._session.begin_nested():
                 run, _ = await self._runs.start(start, queue=True, now=now, strict=False)
-        except DBAPIError as exc:
+        except (DBAPIError, Unavailable) as exc:
+            # the database refused the run, or the blob store did not take its input
             error = AgentError.of(
                 exc,
                 category=ErrorCategory.DEPENDENCY,
                 source="agent-runs",
-                retryable=isinstance(exc, OperationalError),
+                retryable=isinstance(exc, OperationalError | Unavailable),
             )
             left = await self._schedules.record_failure(schedule.schedule_id, error=error, now=now)
             log.warning(

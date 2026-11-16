@@ -6,6 +6,14 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A fire the blob store cannot take is recorded on its schedule.** Only a database error
+  failed a fire; a blob store that did not answer when the run's input was written escaped,
+  nothing was recorded, and the same schedule was tried first, and failed, on every tick
+  while the schedules due after it never fired. It is now a failed fire like any other:
+  `last_error` (`Unavailable`, category `DEPENDENCY`, retryable), `consecutive_failures`,
+  the backoff, the auto-pause after three, and `503` with the schedule's state in `details`
+  from `POST /v1/schedules/{id}/fire` (it was a `503` naming the payload store). Nothing to
+  do.
 * **What a payload route holds is bounded.** `POST /v1/payloads/read` took up to 256 SHA-256s,
   the same one as often as sent, read every object whole and copied them into one answer:
   256 names of one 50 MiB object made one replica hold about 12.8 GB, twice. Now an object

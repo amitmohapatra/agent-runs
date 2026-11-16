@@ -487,7 +487,7 @@ sequenceDiagram
       T->>DB: SAVEPOINT, then INSERT agent_runs QUEUED, idempotency_key "schedule_id@fire_time",<br/>on_behalf_of, input, timeout_seconds, agent_version, priority, concurrency_key copied,<br/>metadata = the schedule's, then schedule_id, schedule_name, fire_time, created_by (these win)
       alt the run is queued (or already was for this tick)
         T->>DB: record_success: last_fired_at, last_run_id, failures 0,<br/>next_fire_at = next occurrence after max(fire_time, now)
-      else the database refuses it (DBAPIError)
+      else the database refuses it (DBAPIError), or the blob store does not take its input (Unavailable)
         T->>DB: ROLLBACK TO SAVEPOINT, then record_failure: consecutive_failures + 1, last_error
         Note over T,DB: permanent error, or MAX_CONSECUTIVE_FAILURES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h
       end

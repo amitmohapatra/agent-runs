@@ -342,6 +342,39 @@ async def test_a_retryable_failure_backs_off_on_the_schedules_clock(
     assert later.fired == 1
 
 
+async def test_a_fire_the_blob_store_cannot_take_is_recorded_and_backs_off(
+    app, client, blobs, ticker, monkeypatch
+) -> None:
+    """A blob store that does not answer fails the fire as the database does: recorded on
+    the schedule, which backs off, so the schedules due after it are tried in the same tick
+    and it is not the first one tried, and failed, on every tick after."""
+    sids = [
+        (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()["schedule_id"]
+        for _ in range(2)
+    ]
+    for sid in sids:
+        await _make_due(app, sid)
+
+    async def unreachable(*_: object, **__: object) -> None:
+        raise OSError("no route to the store")
+
+    with monkeypatch.context() as down:
+        down.setattr(blobs, "put", unreachable)
+        assert (await ticker.tick()).fired == 0
+        failed = await client.post(f"/v1/schedules/{sids[0]}/fire")
+    assert failed.status_code == 503 and failed.json()["retryable"] is True
+    for sid, failures in zip(sids, (2, 1), strict=True):
+        recorded = (await client.get(f"/v1/schedules/{sid}")).json()
+        assert recorded["consecutive_failures"] == failures
+        assert recorded["retry_after"] is not None and recorded["enabled"] is True
+        error = recorded["last_error"]
+        assert (error["code"], error["category"]) == ("Unavailable", "DEPENDENCY")
+        assert error["retryable"] is True
+
+    later = await ticker.tick(now=datetime.now(UTC) + timedelta(hours=2))
+    assert later.fired == 2
+
+
 # ------------------------------------------------------------------ timing
 
 
