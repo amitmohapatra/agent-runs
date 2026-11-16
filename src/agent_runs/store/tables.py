@@ -121,11 +121,13 @@ class RunRow(Base):
         Index("ix_runs_thread", "tenant_id", "thread_id", "created_at"),
         # the inbox: this tenant's PAUSED runs for an assignee, newest first
         Index("ix_runs_inbox", "tenant_id", "status", "assignee", "created_at"),
-        # the claim: the oldest QUEUED run of the worker's agents
+        # the claim: a tenant's QUEUED runs of the worker's agent, in claim order (the
+        # highest priority, then the oldest)
         Index(
             "ix_runs_queue",
             "tenant_id",
             "agent_id",
+            text("priority DESC"),
             "queued_at",
             postgresql_where=text("status = 'QUEUED'"),
         ),

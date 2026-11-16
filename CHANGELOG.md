@@ -6,6 +6,20 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A tenant's claim no longer reads its whole queue.** Every claim read all the queued runs
+  of the worker's agents and sorted them to take one: `ix_runs_queue` held them by age, and
+  the claim's order starts with the fair share between tenants. Measured with
+  `EXPLAIN ANALYZE` on one tenant's queue (PostgreSQL 16, JIT off): 37 ms a claim at 10,000
+  queued runs and 400 ms at 100,000 (790 ms when every run has a `concurrency_key`), a sort
+  spilling to disk. `ix_runs_queue` now holds the queue in claim order (`priority`
+  descending, then `queued_at`; migration `d0f5a6b7c8e9`), and a claim for one tenant, among
+  whose runs the fair share decides nothing, is ordered by priority and age alone: it reads
+  the first run with room and stops, 0.1 ms at either depth. The order runs are claimed in
+  is unchanged. A platform key's claim across tenants (no `X-Trellis-Tenant`) still sorts
+  every queued run of its agents (470 ms at 100,000), and so does a tenant's claim for
+  several `agent_ids` at once (80 ms). Run `alembic upgrade head` (`make migrate`) before starting
+  this version; the index is rebuilt in the migration's transaction, which blocks writes to
+  `agent_runs` while it runs.
 * **One way to build a `RunStore`.** `RunStore(session, limits)` takes the deployment's
   `RUNS__LIMITS__*` (`Settings.limits`) and has no defaults: most routes, the ticker's
   retention and compaction steps and `Firing` built one without them, which no method read

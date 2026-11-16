@@ -821,7 +821,7 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_tenant_created` | `agent_runs (tenant_id, created_at)` | `GET /v1/runs`, newest first |
 | `ix_runs_parent` | `agent_runs (parent_run_id)` | `GET /v1/runs?parent_run_id=` |
 | `ix_runs_inbox` | `agent_runs (tenant_id, status, assignee, created_at)` | the inbox, `status=PAUSED&assignee=` |
-| `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
+| `ix_runs_queue` | `agent_runs (tenant_id, agent_id, priority DESC, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim`: a tenant's claim reads it in claim order and stops at the first run with room |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
 | `ix_runs_held` | `agent_runs (held_until) WHERE status = 'RUNNING' AND held_until IS NOT NULL` | `RunStore.end_abandoned` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
@@ -848,7 +848,7 @@ and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run 
 `3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation,
 `5e1f6a7b8c9d` schedules' run limits, `6a2b7c8d9e0f` run priority and concurrency key,
 `7b3c8d9e0f1a` shared rate-limit budgets, `8c4d9e0f1a2b` run events, `9d5e0f1a2b3c` run
-retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key, `c9e4f5a6b7d8` a key's line (`ix_runs_concurrency` with the queued runs). Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
+retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key, `c9e4f5a6b7d8` a key's line (`ix_runs_concurrency` with the queued runs), `d0f5a6b7c8e9` the queue in claim order (`ix_runs_queue` by priority, then age). Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 

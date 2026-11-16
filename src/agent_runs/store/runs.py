@@ -805,13 +805,11 @@ class RunStore:
     def _next_queued(
         self, tenant_id: str | None, request: ClaimRequest, now: datetime, passed: list[Any]
     ) -> Select[tuple[RunRow]]:
-        """The query for the next run a claim may take, in claim order, locked."""
-        held = (
-            select(RunRow.tenant_id, func.count().label("runs"))
-            .where(*_LEASED, RunRow.agent_id.in_(request.agent_ids))
-            .group_by(RunRow.tenant_id)
-            .subquery()
-        )
+        """The query for the next run a claim may take, in claim order, locked. A tenant's
+        claim is ordered by priority and age alone (the fair share is between tenants), which
+        is the order ``ix_runs_queue`` holds: for one agent it reads the first run with room
+        and stops, whatever the queue's depth. A claim across tenants, or for several agents,
+        sorts every queued run it may take."""
         sharing = aliased(RunRow)
         running_with_key = (
             select(func.count())
@@ -823,21 +821,27 @@ class RunStore:
             )
             .scalar_subquery()
         )
-        query = (
-            select(RunRow)
-            .outerjoin(held, held.c.tenant_id == RunRow.tenant_id)
-            .where(
-                RunRow.status == RunStatus.QUEUED.value,
-                RunRow.agent_id.in_(request.agent_ids),
-                or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
-                or_(RunRow.concurrency_key.is_(None), running_with_key < self._per_key),
-                *passed,
-            )
-            .order_by(func.coalesce(held.c.runs, 0), RunRow.priority.desc(), RunRow.queued_at)
-            .limit(1)
-            .with_for_update(of=RunRow, skip_locked=True)
+        query = select(RunRow).where(
+            RunRow.status == RunStatus.QUEUED.value,
+            RunRow.agent_id.in_(request.agent_ids),
+            or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
+            or_(RunRow.concurrency_key.is_(None), running_with_key < self._per_key),
+            *passed,
         )
-        return query if tenant_id is None else query.where(RunRow.tenant_id == tenant_id)
+        order = (RunRow.priority.desc(), RunRow.queued_at)
+        if tenant_id is not None:
+            query = query.where(RunRow.tenant_id == tenant_id).order_by(*order)
+        else:
+            held = (
+                select(RunRow.tenant_id, func.count().label("runs"))
+                .where(*_LEASED, RunRow.agent_id.in_(request.agent_ids))
+                .group_by(RunRow.tenant_id)
+                .subquery()
+            )
+            query = query.outerjoin(held, held.c.tenant_id == RunRow.tenant_id).order_by(
+                func.coalesce(held.c.runs, 0), *order
+            )
+        return query.limit(1).with_for_update(of=RunRow, skip_locked=True)
 
     async def _tenant_has_room(self, row: RunRow) -> bool:
         """Do the run's tenant's workers hold fewer runs than the cap (always, uncapped)?"""
