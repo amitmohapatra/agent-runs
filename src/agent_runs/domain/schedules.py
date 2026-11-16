@@ -10,7 +10,7 @@ as comes from the stored row.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from hashlib import sha256
 from typing import Any
 
@@ -144,12 +144,6 @@ class FireFailed(Unavailable):
             # worth repeating only while the schedule still fires and the cause may pass
             retryable=error.retryable and schedule.enabled,
         )
-
-
-def idempotency_key(schedule_id: str, fire_time: datetime) -> str:
-    """One schedule, one instant, one run. UTC first, so one instant spelled in two zones is
-    one key."""
-    return f"{schedule_id}@{fire_time.astimezone(UTC).isoformat()}"
 
 
 def input_sha256(value: Any) -> str:

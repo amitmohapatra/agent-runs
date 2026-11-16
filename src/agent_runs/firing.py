@@ -1,14 +1,15 @@
 """Firing a schedule: queue one run for one tick, in the same transaction that advances the
 schedule, idempotent on ``(schedule_id, fire_time)``.
 
-The run is built from the stored schedule and nothing else (tenant, agent, input, its
-working-time limit, agent version, priority, concurrency key and metadata, and above all
-``on_behalf_of``), so no request can make a schedule fire as someone it was not made for, and
-a scheduled run carries everything a started one can. The schedule's metadata goes under the
-fire's own keys (``schedule_id``, ``schedule_name``, ``fire_time``, ``created_by``), which win
-on conflict: a schedule cannot pass its run off as another's fire. A schedule whose metadata
-names a ``thread_id`` fires its runs into that conversation. A repeated fire for the same tick
-finds the run the first one queued.
+The run is built from the stored schedule and nothing else, by the contracts'
+``Schedule.run_start`` (tenant, agent, input, its working-time limit, agent version, priority,
+concurrency key and metadata, and above all ``on_behalf_of``), so no request can make a
+schedule fire as someone it was not made for, and a scheduled run carries everything a started
+one can. The schedule's metadata goes under the fire's own keys (``schedule_id``,
+``schedule_name``, ``fire_time``, ``created_by``), which win on conflict: a schedule cannot
+pass its run off as another's fire. A schedule whose metadata names a ``thread_id`` fires its
+runs into that conversation. A repeated fire for the same tick finds the run the first one
+queued.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.errors import AgentError, ErrorCategory
-from trellis.contracts.runs import RunStart, RunStatus, Schedule
+from trellis.contracts.runs import RunStatus, Schedule
 
 from agent_runs.config.constants import MAX_FIRE_SKEW
 from agent_runs.domain.errors import Unavailable
@@ -31,7 +32,6 @@ from agent_runs.domain.schedules import (
     FireSkipped,
     FireTimeOutOfRange,
     ScheduleNotFiring,
-    idempotency_key,
 )
 from agent_runs.store.runs import RunStore
 from agent_runs.store.schedules import ScheduleStore
@@ -87,27 +87,8 @@ class Firing:
         return schedule.last_run_id if status and not RunStatus(status).final else None
 
     async def _fire(self, schedule: Schedule, *, fire_time: datetime, now: datetime) -> FireResult:
-        key = idempotency_key(schedule.schedule_id, fire_time)
-        start = RunStart(
-            tenant_id=schedule.tenant_id,
-            agent_id=schedule.agent_id,
-            workspace_id=schedule.workspace_id,
-            thread_id=_thread(schedule),
-            on_behalf_of=schedule.on_behalf_of,
-            input=schedule.input,
-            timeout_seconds=schedule.timeout_seconds,
-            agent_version=schedule.agent_version,
-            priority=schedule.priority,
-            concurrency_key=schedule.concurrency_key,
-            idempotency_key=key,
-            metadata={
-                **schedule.metadata,
-                "schedule_id": schedule.schedule_id,
-                "schedule_name": schedule.name,
-                "fire_time": fire_time.isoformat(),
-                "created_by": schedule.created_by,
-            },
-        )
+        start = schedule.run_start(fire_time=fire_time, thread_id=_thread(schedule))
+        assert start.idempotency_key is not None
         try:
             async with self._session.begin_nested():
                 run, _ = await self._runs.start(start, queue=True, now=now, strict=False)
@@ -135,7 +116,7 @@ class Firing:
             schedule_id=schedule.schedule_id,
             run_id=run.run_id,
             fire_time=fire_time,
-            idempotency_key=key,
+            idempotency_key=start.idempotency_key,
             schedule=fired,
         )
 
