@@ -8,11 +8,16 @@ the contracts' rule shows up as a failing row instead of a silently redrawn diag
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from httpx import AsyncClient
+from trellis.contracts.runs import Interrupt, RunRecord, RunStatus
 
+from agent_runs.domain.errors import Conflict
+from agent_runs.store.runs import _move
+from agent_runs.store.tables import RunRow
 from tests.conftest import pause, paused, resolution, started
 
 LIVE = ("QUEUED", "RUNNING", "PAUSED")
@@ -187,3 +192,46 @@ async def test_every_verb_on_an_unknown_run_is_404(client, method, path, body) -
     response = await client.request(method, path, json=body)
     assert response.status_code == 404
     assert "run_nope" in response.json()["detail"]
+
+
+# ------------------------------------------------------------------ the store's move
+
+
+@pytest.mark.parametrize("keep", [False, True])
+@pytest.mark.parametrize("to", RunStatus)
+@pytest.mark.parametrize("start", RunStatus)
+def test_the_stores_move_follows_the_contracts_move(
+    start: RunStatus, to: RunStatus, keep: bool
+) -> None:
+    """The store moves rows (``_move``), the contracts move records (``RunRecord.moved``):
+    one rule in two places. For every pair of statuses, both handed an interrupt and a
+    checkpoint, they refuse the same moves and leave the same of the two behind."""
+    asked = Interrupt(tenant_id="acme", run_id="run_1", question="ok?")
+    record = RunRecord(
+        run_id="run_1",
+        tenant_id="acme",
+        agent_id="triage",
+        status=start,
+        awaiting=asked if start is RunStatus.PAUSED else None,
+        checkpoint={"step": 1},
+    )
+    row = RunRow(
+        run_id="run_1",
+        status=start.value,
+        worked_seconds=0.0,
+        awaiting=asked.model_dump(mode="json"),
+        checkpoint_ref={"key": "k"},
+    )
+    now = datetime(2026, 10, 1, 8, tzinfo=UTC)
+    try:
+        moved = record.moved(to, keep_checkpoint=keep, awaiting=asked)
+    except ValueError as refused:
+        assert "cannot become" in str(refused)
+        with pytest.raises(Conflict, match="cannot move"):
+            _move(row, to, now, keep_checkpoint=keep)
+        assert row.status == start.value and row.awaiting and row.checkpoint_ref
+        return
+    _move(row, to, now, keep_checkpoint=keep)
+    assert row.status == moved.status.value
+    assert (row.awaiting is None) == (moved.awaiting is None)
+    assert (row.checkpoint_ref is None) == (moved.checkpoint is None)
