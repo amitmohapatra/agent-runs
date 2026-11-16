@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A checkpoint kept past a run's end stays readable.** A run finished or cancelled with
+  `keep_checkpoint` lost its link to the checkpoint's object when it ended, so the sweep
+  deleted the object after 24 hours while the record still named it. The link is now kept
+  for such a run. Nothing to do.
+* An artifact row deleted between a duplicate upload's insert and its read answers
+  `409 CONFLICT` instead of failing an assertion.
+
 * **An answer is held to its question's `format`s.** `trellis.runs.answers.answer_problem` (what
   `POST /v1/runs/{id}/resume` checks, and the harness for a run it keeps in its process) now
   validates `expects` with the schema draft's own format checker (`jsonschema`, already a

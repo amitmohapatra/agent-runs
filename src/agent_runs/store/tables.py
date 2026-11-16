@@ -430,7 +430,7 @@ class RunPayloadRow(Base):
         String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
     )
     key: Mapped[str] = mapped_column(String(512), primary_key=True)
-    #: what the object is to the run (``PayloadKind``)
+    #: what the object is to the run (``store.runs``' kinds: its input, output, checkpoint, ...)
     kind: Mapped[str] = mapped_column(String(16), primary_key=True)
 
     __table_args__ = (Index("ix_run_payloads_key", "key"),)

@@ -119,8 +119,8 @@ sections after the table have the bodies and the exact semantics.
 | `POST /v1/runs/{id}/release` | `{worker_id, checkpoint?}` | `200 RunRecord` (`QUEUED`; a repeat answers the run) | `404`, `409 LEASE_LOST` not the lease holder or run not `RUNNING`, `413`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `403` the key may not answer this run ([who may](#who-may-answer-a-paused-run)), `404`, `409` not `PAUSED` or another interrupt, `422` another run |
-| `POST /v1/runs/{id}/cancel` | `{reason?}` | `200 RunRecord` (`CANCELLED`, or `RUNNING` with the cancel asked; a repeat answers the run) | `403` the key may not cancel it, `404`, `409` ended, `422` |
-| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
+| `POST /v1/runs/{id}/cancel` | `{reason?, keep_checkpoint?}` | `200 RunRecord` (`CANCELLED`, or `RUNNING` with the cancel asked; a repeat answers the run) | `403` the key may not cancel it, `404`, `409` ended, `422` |
+| `POST /v1/runs/{id}/finish` | `{status, output, error, keep_checkpoint?, checkpoint?}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
 | `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
 | `POST /v1/runs/{id}/events` | `{events: [RunEvent]}` (1–500), `?worker_id=` | `200 {appended, position}` | `404`, `409` not `RUNNING` or leased (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` an event of another run |
@@ -391,7 +391,10 @@ interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.chec
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, `cancel`, a `CANCEL`
 answer, a `TIMEOUT`, a run past its deadline or its working-time limit, a run failed on its
-`MAX_LEASE_LAPSES`-th lapsed lease) clears it; a requeue (a lapse, a release, a retried
+`MAX_LEASE_LAPSES`-th lapsed lease) clears it — unless the caller keeps it past the end
+(`keep_checkpoint` on `finish` or `cancel`: a caller that rewinds ended runs; `finish` may
+send its last `checkpoint` with it), and then the run still holds its checkpoint's object,
+which the sweep leaves alone; a requeue (a lapse, a release, a retried
 error) keeps it for the next attempt. Larger than `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB)
 as compact JSON is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
@@ -493,8 +496,8 @@ Cancels the run, whatever its status, keeping `reason` (optional, at most 1000 c
 and the principal of the key that asked with it:
 
 - `QUEUED` or `PAUSED`, or `RUNNING` with no worker holding it (a run kept in its caller's
-  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared and
-  the artifacts' retention starts. The caller's process gets `409` on its next write.
+  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared (kept with
+  `keep_checkpoint`) and the artifacts' retention starts. The caller's process gets `409` on its next write.
 - `RUNNING` and held by a worker: the run stays `RUNNING` with its cancel asked. The
   worker's next heartbeat answers `cancel_requested: true` and no longer extends the lease;
   the worker stops and finishes the run `CANCELLED` (the SDK's `Worker` cancels the handler
