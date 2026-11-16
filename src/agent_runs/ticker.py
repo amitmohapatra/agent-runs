@@ -23,7 +23,9 @@ Steps 2 to 6 write the webhook events they cause into the outbox in their own tr
 Every step is bounded per tick and safe to run in several replicas at once: a row one
 ticker holds is skipped by the others, and a fire repeated for one tick finds the same run.
 A tick that fails as a whole (the database is down) counts against a breaker, so an outage
-does not become a tight retry loop. A heartbeat file, touched after every tick, is the
+does not become a tight retry loop. A step that fails on anything else (a row it cannot
+handle, a lost payload) is logged and counted (``runs_ticker_step_failures_total``), and the
+steps after it still run. A heartbeat file, touched after every tick, is the
 liveness probe (``python -m agent_runs.heartbeat``), one file per ticker (see ``heartbeat``).
 """
 
@@ -32,14 +34,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 import structlog
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from trellis.contracts.ids import now as clock
 from trellis.contracts.runs import RunRecord, RunStatus
@@ -70,6 +73,10 @@ from agent_runs.webhooks import WebhookSender
 log = structlog.get_logger(__name__)
 
 Sessions = Callable[[], AsyncSession]
+
+#: What an outage raises (the database or its pool not answering, the disk): the whole tick
+#: fails and counts against the breaker. Anything else is one step's failure (``_step``).
+_OUTAGE = (OperationalError, InterfaceError, PoolTimeout, OSError)
 
 
 class RunSweep(Protocol):
@@ -120,28 +127,28 @@ class Ticker:
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
     async def tick(self, *, now: datetime | None = None) -> TickReport:
-        """One pass. Raises nothing the loop could not survive: a database failure is
-        recorded on the breaker and reported as an empty tick."""
+        """One pass. Raises nothing the loop could not survive: an outage is recorded on the
+        breaker and reported as an empty tick; any other failure costs only its own step."""
         now = now or clock()
         if not self.breaker.allows(now):
             metrics.ticks_total.labels("skipped").inc()
             return TickReport()
         try:
             report = TickReport(
-                fired=await self._fire_due(now),
-                timed_out=await self._sweep_runs(RunStore.time_out_past_deadline, now),
-                overworked=await self._sweep_runs(RunStore.time_out_overworked, now),
-                requeued=await self._sweep_runs(RunStore.requeue_lapsed, now),
-                abandoned=await self._sweep_runs(RunStore.end_abandoned, now),
-                escalated=await self._sweep_runs(RunStore.escalate_overdue, now),
-                sent=await self._send_webhooks(now),
-                dropped=await self._drop_dead(now),
-                purged=await self._purge_artifacts(now),
-                runs_purged=await self._purge_runs(now),
-                compacted=await self._compact_events(),
-                orphans=await self._sweep_orphans(now),
+                fired=await self._step("fired", self._fire_due(now)),
+                timed_out=await self._swept("timed_out", RunStore.time_out_past_deadline, now),
+                overworked=await self._swept("overworked", RunStore.time_out_overworked, now),
+                requeued=await self._swept("requeued", RunStore.requeue_lapsed, now),
+                abandoned=await self._swept("abandoned", RunStore.end_abandoned, now),
+                escalated=await self._swept("escalated", RunStore.escalate_overdue, now),
+                sent=await self._step("sent", self._send_webhooks(now)),
+                dropped=await self._step("dropped", self._drop_dead(now)),
+                purged=await self._step("purged", self._purge_artifacts(now)),
+                runs_purged=await self._step("runs_purged", self._purge_runs(now)),
+                compacted=await self._step("compacted", self._compact_events()),
+                orphans=await self._step("orphans", self._sweep_orphans(now)),
             )
-        except (DBAPIError, OSError) as exc:
+        except _OUTAGE as exc:
             self.breaker.record_failure(now)
             metrics.ticks_total.labels("failed").inc()
             log.warning("ticker.tick_failed", error=str(exc), failures=self.breaker.failures)
@@ -153,6 +160,23 @@ class Ticker:
         if report != TickReport():
             log.info("ticker.tick", **report.__dict__)
         return report
+
+    async def _step(self, step: str, work: Awaitable[int]) -> int:
+        """One step of a tick, on its own: what it raises that is no outage (a row it cannot
+        handle, a payload lost, the blob store not answering) is logged and counted, and the
+        steps after it still run. Its transaction rolled back, so the same rows come first
+        next tick: without this, one such row would stop every later step for good."""
+        try:
+            return await work
+        except _OUTAGE:
+            raise
+        except Exception:
+            metrics.step_failures_total.labels(step).inc()
+            log.exception("ticker.step_failed", step=step)
+            return 0
+
+    async def _swept(self, step: str, sweep: RunSweep, now: datetime) -> int:
+        return await self._step(step, self._sweep_runs(sweep, now))
 
     async def _fire_due(self, now: datetime) -> int:
         fired = 0

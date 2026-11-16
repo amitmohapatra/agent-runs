@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import Select, case, delete, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1117,7 +1118,10 @@ class RunStore:
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
-        interrupt has no deadline), or end as ``TIMEOUT`` when nobody is named."""
+        interrupt has no deadline), or end as ``TIMEOUT`` when nobody is named. One whose
+        stored interrupt cannot be read (a newer build wrote it) ends ``TIMEOUT`` too,
+        ``interrupt_unreadable``: there is nobody to read ``escalate_to`` from, and it must
+        not fail the sweep for the runs after it."""
         rows = await self._sweep(
             RunRow.status == RunStatus.PAUSED.value,
             RunRow.awaiting_deadline < now,
@@ -1125,7 +1129,16 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
-            interrupt = Interrupt.model_validate(row.awaiting)
+            try:
+                interrupt = Interrupt.model_validate(row.awaiting)
+            except ValidationError as exc:
+                _move(row, RunStatus.TIMEOUT, now)
+                row.error = _timed_out(
+                    "interrupt_unreadable",
+                    "nobody answered by the interrupt's deadline, and the stored interrupt "
+                    f"cannot be read to escalate it ({exc.error_count()} validation errors)",
+                )
+                continue
             if interrupt.escalate_to:
                 escalated = interrupt.model_copy(
                     update={

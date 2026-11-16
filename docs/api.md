@@ -845,6 +845,8 @@ is kept, dead, to be redelivered (above). At least once: receivers drop repeats 
 outcome, `runs_rate_limited_total`, `runs_db_pool_connections` by state). The ticker serves
 `runs_ticker_ticks_total` (by outcome), `runs_ticker_swept_total` (by step: `fired`,
 `timed_out`, `overworked`, `requeued`, `escalated`, `sent`, `dropped`, `purged`),
+`runs_ticker_step_failures_total` (by step: a step that failed on something other than an
+outage, while the steps after it still ran; alert on any increase),
 `runs_webhook_dead_total` (deliveries given up on) and the pool gauges on `RUNS__TICKER__METRICS_PORT` when it is set. Each process has its own registry: with
 several workers a scrape sees one worker's share. The ticker's probe is
 `python -m agent_runs.heartbeat`, which reads

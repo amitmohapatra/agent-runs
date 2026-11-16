@@ -15,9 +15,12 @@ from trellis.runs.blob import FilesystemBlobStore
 
 from agent_runs.config.constants import BREAKER_COOLDOWN, BREAKER_THRESHOLD
 from agent_runs.heartbeat import alive
+from agent_runs.observability import metrics
 from agent_runs.retry import Breaker, backoff
+from agent_runs.store.runs import RunStore
 from agent_runs.ticker import Ticker
 from tests.conftest import Receiver, arm, at, pause, queued_runs, scheduled, sender, started
+from tests.test_webhooks import subscribe
 
 NOW = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
 
@@ -243,3 +246,82 @@ async def test_a_tick_fires_at_most_a_batch_of_schedules(app, client, ticker, mo
     assert len(await queued_runs(app)) == 1
     assert (await ticker.tick()).fired == 1
     assert len(await queued_runs(app)) == 2
+
+
+# ------------------------------------------------------------------ one step failing
+
+
+def _step_failures(step: str) -> float:
+    return metrics.step_failures_total.labels(step)._value.get()
+
+
+async def test_a_step_that_fails_does_not_stop_the_steps_after_it(
+    client, ticker, receiver, monkeypatch
+) -> None:
+    """A sweep that raises (a row it cannot handle) is counted and logged; the tick goes on
+    to deliver the webhooks that are due, and the breaker, which is for an outage, stays
+    shut."""
+    await subscribe(client, ["run.finished"])
+    run_id = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    await client.post(f"/v1/runs/{run_id}/finish", json={"status": "SUCCESS"})
+
+    async def poisoned(*_: object, **__: object) -> None:
+        raise ValueError("a row this sweep cannot handle")
+
+    monkeypatch.setattr(RunStore, "requeue_lapsed", poisoned)
+    before = _step_failures("requeued")
+    report = await ticker.tick()
+    assert (report.requeued, report.sent) == (0, 1)
+    assert [e["type"] for e in receiver.events()] == ["run.finished"]
+    assert _step_failures("requeued") == before + 1
+    assert ticker.breaker.failures == 0
+
+
+async def test_a_delivery_whose_payload_is_lost_goes_dead_and_the_others_are_sent(
+    app, client, ticker, receiver
+) -> None:
+    """One outbox row whose interrupt payload is gone from the blob store must not hold back
+    every other delivery: it is kept dead, saying why, and the rest go out in the same tick."""
+    await subscribe(client, ["run.paused", "run.finished"])
+    waiting = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    asked = pause(waiting, payload={"table": [1, 2, 3]})
+    assert (await client.post(f"/v1/runs/{waiting}/pause", json=asked)).status_code == 200
+    done = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    await client.post(f"/v1/runs/{done}/finish", json={"status": "SUCCESS"})
+    async with app.state.engine.connect() as conn:
+        lost = await conn.scalar(
+            text("SELECT payload_ref->>'ref' FROM webhook_deliveries WHERE payload_ref IS NOT NULL")
+        )
+    await app.state.blobs.delete(lost)
+
+    assert (await ticker.tick()).sent == 1
+    assert [e["data"]["run"]["run_id"] for e in receiver.events()] == [done]
+    [dead] = (await client.get("/v1/webhooks/deliveries", params={"state": "dead"})).json()
+    assert (dead["run_id"], dead["type"]) == (waiting, "run.paused")
+    assert "missing or corrupt" in dead["last_error"]
+    assert (await ticker.tick()).sent == 0, "a dead delivery is not tried again"
+
+
+async def test_an_overdue_interrupt_that_cannot_be_read_ends_its_run(app, client, ticker) -> None:
+    """A stored interrupt this build cannot read (a field it does not know) cannot be
+    escalated: its run ends ``TIMEOUT`` saying so (a paused run cannot become ``ERROR``),
+    and the overdue runs after it are handled."""
+    unreadable = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    overdue = at(1).isoformat()
+    await client.post(f"/v1/runs/{unreadable}/pause", json=pause(unreadable, deadline=overdue))
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE agent_runs SET awaiting = awaiting || '{\"from_the_future\": 1}' "
+                "WHERE run_id = :r"
+            ),
+            {"r": unreadable},
+        )
+    readable = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    await client.post(f"/v1/runs/{readable}/pause", json=pause(readable, deadline=overdue))
+
+    assert (await ticker.tick(now=at(2))).escalated == 2
+    ended = (await client.get(f"/v1/runs/{unreadable}")).json()
+    assert (ended["status"], ended["error"]["code"]) == ("TIMEOUT", "interrupt_unreadable")
+    plain = (await client.get(f"/v1/runs/{readable}")).json()
+    assert (plain["status"], plain["error"]["code"]) == ("TIMEOUT", "interrupt_deadline")

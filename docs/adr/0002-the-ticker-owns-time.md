@@ -24,7 +24,8 @@ restart, and mix slow sweeps into request latency.
   `deadline`, `next_fire_at`) and the ticker acts on them.
 - **A tick takes "now" as an argument** (`Ticker.tick(now=)`), so tests and examples move the
   clock instead of sleeping.
-- A failing tick counts against a breaker, and a heartbeat file
+- A tick failing on an outage (the database, its pool) counts against a breaker; a step failing
+  on anything else costs only that step (`runs_ticker_step_failures_total`). A heartbeat file
   (`RUNS__TICKER__HEARTBEAT_FILE`) is the liveness probe.
 
 ## Consequences

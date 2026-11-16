@@ -60,8 +60,13 @@ class WebhookSender:
         """One attempt: accepted, or why not and whether another is worth making. Refused
         for good: any answer but a 2xx, 408, 429 or 5xx (a redirect too: it is never
         followed), a URL scheme this deployment refuses, a host that resolves to a private
-        address here. Worth another: a 408, 429 or 5xx, a receiver or a host name that
-        cannot be reached."""
+        address here, a delivery whose payload is lost. Worth another: a 408, 429 or 5xx, a
+        receiver or a host name that cannot be reached."""
+        if delivery.lost is not None:
+            return Attempt(f"refused: {delivery.lost}")
+        return await self._attempt(delivery)
+
+    async def _attempt(self, delivery: Delivery) -> Attempt:
         payload = delivery.payload
         if urlparse(delivery.url).scheme not in self._schemes:
             log.warning("webhook.refused_scheme", url=delivery.url)

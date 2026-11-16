@@ -6,6 +6,18 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **One failing ticker step no longer stops the others.** Every step of a tick ran in one
+  `try` that caught only database and OS errors, so anything else one step raised (a webhook
+  delivery whose payload object was lost, a stored interrupt this build cannot read) ended the
+  tick there, and, the same rows coming first again, every later step for every tenant, for
+  good. Each step now runs on its own: what it raises that is no outage is logged
+  (`ticker.step_failed`) and counted in the new `runs_ticker_step_failures_total{step}`, and
+  the steps after it run. Only an outage (the database or its pool not answering, an OS
+  error) fails the tick as a whole and counts against the breaker. A delivery whose payload
+  is lost is kept dead (`last_error` says "missing or corrupt") instead of failing the claim
+  of the others, and a paused run past its interrupt's deadline whose stored interrupt cannot
+  be read ends `TIMEOUT` with code `interrupt_unreadable`. Alert on any increase of the new
+  counter.
 * **A checkpoint kept past a run's end stays readable.** A run finished or cancelled with
   `keep_checkpoint` lost its link to the checkpoint's object when it ended, so the sweep
   deleted the object after 24 hours while the record still named it. The link is now kept

@@ -122,6 +122,20 @@ class PayloadStore:
 
         return list(await asyncio.gather(*(one(ref) for ref in refs)))
 
+    async def get_each(self, refs: Iterable[PayloadRef | dict[str, Any]]) -> list[Any]:
+        """As :meth:`get_many`, but a missing or corrupt object is its :class:`PayloadLost`,
+        in its place: one lost object does not fail the read of the others."""
+        gate = asyncio.Semaphore(PARALLEL_READS)
+
+        async def one(ref: PayloadRef | dict[str, Any]) -> Any:
+            async with gate:
+                try:
+                    return await self.get(ref)
+                except PayloadLost as lost:
+                    return lost
+
+        return list(await asyncio.gather(*(one(ref) for ref in refs)))
+
     # ------------------------------------------------------------------ the sweep
     async def sweep(self, *, now: datetime, limit: int) -> int:
         """Delete up to ``limit`` objects no run and no webhook delivery refers to, registered

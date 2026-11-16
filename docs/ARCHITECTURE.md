@@ -539,7 +539,7 @@ sequenceDiagram
       T->>DB: settle: delete the row
     else 408, 429, 5xx or unreachable, attempts left (7 in all)
       T->>DB: next_attempt_at = now + 15 s doubling (at most 10 min)
-    else any other answer (a 3xx too), a private address, or the 7th attempt
+    else any other answer (a 3xx too), a private address, a lost payload, or the 7th attempt
       T->>DB: dead: dead_at, last_error (kept RUNS__WEBHOOKS__DEAD_RETENTION_DAYS, 7)
     end
   end
@@ -653,7 +653,12 @@ a run's events.
    still kept after them. Unset, every run is kept.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
-(the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
+(the database or its pool does not answer) counts against a breaker. A step that fails on
+anything else (a row it cannot handle, a payload lost from the blob store) is logged
+(`ticker.step_failed`) and counted (`runs_ticker_step_failures_total`), and the steps after it
+still run: one bad row never stops the rest of the tick. A delivery whose payload is lost is
+kept dead, and a paused run past its deadline whose stored interrupt cannot be read ends
+`TIMEOUT` (`interrupt_unreadable`). `python -m agent_runs.heartbeat` is the liveness
 check (a heartbeat file touched after every tick, `RUNS__TICKER__HEARTBEAT_FILE`, one per
 ticker; unset, each ticker process beats into its own file in the temp directory).
 

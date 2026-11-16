@@ -56,7 +56,13 @@ waiting time count), or past its working-time limit (`timeout_seconds`, or
 `RUNS__LIMITS__MAX_RUN_SECONDS`; only time `RUNNING` counts).
 
 **A paused run timed out or changed assignee.** The interrupt's `deadline` passed: the ticker
-moves it to `escalate_to` once, or ends it `TIMEOUT` when there is none.
+moves it to `escalate_to` once, or ends it `TIMEOUT` when there is none. With
+`interrupt_unreadable`: this build could not read the stored interrupt (a newer one wrote it),
+so there was nobody to escalate to.
+
+**`runs_ticker_step_failures_total` grows.** One ticker step fails every tick on something
+that is no outage; the other steps keep running. The ticker logs `ticker.step_failed` with the
+step and the traceback: fix or remove what that step cannot handle.
 
 **A cancelled run is still `RUNNING`.** A worker holds it: the cancel is delivered through its
 next heartbeat (`cancel_requested`), and the SDK's `Worker` ends it `CANCELLED`. If the worker

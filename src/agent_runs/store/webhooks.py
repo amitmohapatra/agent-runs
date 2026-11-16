@@ -22,7 +22,7 @@ from trellis.contracts.ids import new_id, stable_id
 from trellis.contracts.runs import RunRecord
 from trellis.runs.payloads import jsonb_order
 
-from agent_runs.blob.payloads import payloads_of
+from agent_runs.blob.payloads import PayloadLost, payloads_of
 from agent_runs.config.constants import (
     DEFAULT_PAGE,
     MAX_WEBHOOKS_PER_TENANT,
@@ -117,7 +117,8 @@ def _with_payload(body: dict[str, Any], payload: Any) -> dict[str, Any]:
 @dataclass(frozen=True)
 class Delivery:
     """One outbox row the ticker holds, with where it goes and what signs it: the
-    subscription's secret, and the one a rotation replaced while it still signs too."""
+    subscription's secret, and the one a rotation replaced while it still signs too. ``lost``:
+    why it can never be sent (its payload is gone from the blob store)."""
 
     delivery_id: str
     url: str
@@ -125,6 +126,7 @@ class Delivery:
     payload: dict[str, Any]
     attempts: int
     previous_secret: str | None = None
+    lost: str | None = None
 
 
 class WebhookStore:
@@ -258,7 +260,8 @@ class WebhookStore:
     async def claim_due(self, *, now: datetime, limit: int) -> list[Delivery]:
         """Deliveries still owed and due now, held for ``WEBHOOK_LEASE`` (another ticker
         skips them; a ticker that dies holding them lets them come due again) and counted as
-        attempted."""
+        attempted. One whose payload is lost from the blob store says so (``Delivery.lost``):
+        its attempt is refused for good, so it does not fail the claim of the others."""
         rows = (
             await self._session.execute(
                 select(WebhookDeliveryRow, WebhookRow)
@@ -273,10 +276,14 @@ class WebhookStore:
             )
         ).all()
         referred = [row for row, _ in rows if row.payload_ref is not None]
-        payloads = await payloads_of(self._session).get_many(r.payload_ref for r in referred)
+        payloads = await payloads_of(self._session).get_each(r.payload_ref for r in referred)
         bodies = {row.delivery_id: row.payload for row, _ in rows}
+        lost: dict[str, str] = {}
         for row, payload in zip(referred, payloads, strict=True):
-            bodies[row.delivery_id] = _with_payload(row.payload, payload)
+            if isinstance(payload, PayloadLost):
+                lost[row.delivery_id] = str(payload)
+            else:
+                bodies[row.delivery_id] = _with_payload(row.payload, payload)
         held: list[Delivery] = []
         for row, hook in rows:
             row.attempts += 1
@@ -291,6 +298,7 @@ class WebhookStore:
                     bodies[row.delivery_id],
                     row.attempts,
                     previous,
+                    lost.get(row.delivery_id),
                 )
             )
         await self._session.flush()
