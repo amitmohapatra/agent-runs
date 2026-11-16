@@ -198,6 +198,24 @@ async def test_a_save_that_never_commits_leaves_an_orphan_the_sweep_deletes(
     assert await _objects(app) == 0, "nothing referred to it"
 
 
+async def test_a_checkpoint_kept_past_the_end_outlives_the_sweep(
+    app: Any, client: Any, ticker: Any
+) -> None:
+    """A run finished with ``keep_checkpoint`` still refers to its checkpoint's object: the
+    sweep, which deletes what nothing refers to, leaves it, and it reads back a day later."""
+    run_id, worker = await _claimed(client)
+    kept = {"asks": {"ask_1": "yes"}, "done": True}
+    done = await client.post(
+        f"/v1/runs/{run_id}/finish",
+        params={"worker_id": worker},
+        json={"status": "SUCCESS", "keep_checkpoint": True, "checkpoint": kept},
+    )
+    assert done.status_code == 200, done.text
+    assert (await _links(app, run_id)).get("checkpoint") == 1
+    await ticker.tick(now=now() + ORPHAN_AGE + timedelta(minutes=1))
+    assert (await client.get(f"/v1/runs/{run_id}")).json()["checkpoint"] == kept
+
+
 async def test_a_store_that_does_not_answer_refuses_the_save_and_keeps_the_last(
     app: Any, client: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

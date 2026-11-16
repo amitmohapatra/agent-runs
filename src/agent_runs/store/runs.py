@@ -1308,14 +1308,20 @@ class RunStore:
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
         """Runs that just ended start their artifacts' retention, and let go of their
-        checkpoints (the sweep deletes what nothing else refers to)."""
-        ended = [row.run_id for row in rows if RunStatus(row.status).final]
+        checkpoints (the sweep deletes what nothing else refers to) — except one its caller
+        kept past the end (``_move``'s ``keep_checkpoint``): the run still refers to it."""
+        over = [row for row in rows if RunStatus(row.status).final]
         retention = self._payloads.retention
-        await ArtifactStore(self._session).expire_with(ended, at=now + retention)
-        if ended:
+        await ArtifactStore(self._session).expire_with(
+            [row.run_id for row in over], at=now + retention
+        )
+        let_go = [
+            row.run_id for row in over if row.checkpoint_ref is None and not row.checkpoint_segments
+        ]
+        if let_go:
             await self._session.execute(
                 delete(RunPayloadRow).where(
-                    RunPayloadRow.run_id.in_(ended), RunPayloadRow.kind == _CHECKPOINT
+                    RunPayloadRow.run_id.in_(let_go), RunPayloadRow.kind == _CHECKPOINT
                 )
             )
 
