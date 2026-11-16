@@ -51,7 +51,7 @@ filesystem blob store is for one machine.
 | Variable | Default | Automatic? | Read by | What it does | Example |
 |---|---|---|---|---|---|
 | `RUNS__DATABASE__URL` | `postgresql+psycopg://memory:memory@localhost:5432/agent_runs` | **set it** | API, ticker, alembic | the database; both processes refuse to start on one that is not at the head revision (`make migrate`) | `postgresql+psycopg://runs:…@db:5432/agent_runs` |
-| `RUNS__DATABASE__CONNECTION_BUDGET` | unset: 20 per process | yes | API, ticker | connections one container may open, all its processes together (at least 2): each process (an API worker; the ticker is one) takes `budget // processes`, half kept open and half for a burst | `40` |
+| `RUNS__DATABASE__CONNECTION_BUDGET` | unset: 20 per process | yes | API, ticker | connections one container may open, all its processes together (at least 2): each process (an API worker; the ticker is one) takes `budget // processes`: a tenth (at least one) for the payload registry's own pool, the rest half kept open and half for a burst (unset: 9 + 9 and 2) | `40` |
 
 The pool's protections are not settings: every pooled connection is pre-pinged on checkout (a
 dead one is replaced, not handed to a request) and replaced after 300 s, a request waits at

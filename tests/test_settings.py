@@ -22,7 +22,7 @@ from agent_runs.config.settings import (
     get_settings,
 )
 from agent_runs.keys import KeyRegistry
-from agent_runs.store.database import connect
+from agent_runs.store.database import connect, registry_engine
 from tests.conftest import SETTINGS
 
 
@@ -69,7 +69,7 @@ def test_settings_that_were_removed_are_ignored_when_left_set(fresh_settings, mo
         "RUNS__DATABASE__STATEMENT_TIMEOUT_MS": "100",
     }.items():
         monkeypatch.setenv(name, value)
-    assert get_settings().database.pool_plan(1) == PoolPlan(size=10, overflow=10)
+    assert get_settings().database.pool_plan(1) == PoolPlan(size=9, overflow=9, registry=2)
 
 
 def test_the_limits_group_is_read_and_its_old_name_still_works_with_a_warning(
@@ -125,12 +125,12 @@ def test_one_old_limit_name_moves_that_limit_only(fresh_settings, monkeypatch, c
 @pytest.mark.parametrize(
     ("budget", "processes", "plan"),
     [
-        (None, 1, PoolPlan(10, 10)),
-        (None, 8, PoolPlan(10, 10)),
-        (40, 4, PoolPlan(5, 5)),
-        (25, 2, PoolPlan(6, 6)),
-        (9, 1, PoolPlan(5, 4)),
-        (2, 8, PoolPlan(1, 1)),
+        (None, 1, PoolPlan(9, 9, registry=2)),
+        (None, 8, PoolPlan(9, 9, registry=2)),
+        (40, 4, PoolPlan(5, 4, registry=1)),
+        (25, 2, PoolPlan(6, 5, registry=1)),
+        (9, 1, PoolPlan(4, 4, registry=1)),
+        (2, 8, PoolPlan(1, 0, registry=1)),
     ],
 )
 def test_the_connection_budget_is_split_between_the_processes(budget, processes, plan) -> None:
@@ -147,7 +147,19 @@ async def test_the_engine_carries_its_pool_and_timeout_protections(migrated) -> 
     try:
         pool = engine.pool
         assert (pool.timeout(), pool._recycle, pool._pre_ping) == (5.0, 300, True)  # type: ignore[attr-defined]
-        assert (pool.size(), pool._max_overflow) == (3, 3)  # type: ignore[attr-defined]
+        assert (pool.size(), pool._max_overflow) == (3, 2)  # type: ignore[attr-defined]
+        async with engine.connect() as conn:
+            assert await conn.scalar(text("SHOW statement_timeout")) == "15s"
+    finally:
+        await engine.dispose()
+
+
+async def test_the_registry_has_a_pool_of_its_own_with_the_same_protections(migrated) -> None:
+    engine = registry_engine(SETTINGS.database.model_copy(update={"connection_budget": 12}), 2)
+    try:
+        pool = engine.pool
+        assert (pool.timeout(), pool._recycle, pool._pre_ping) == (5.0, 300, True)  # type: ignore[attr-defined]
+        assert (pool.size(), pool._max_overflow) == (1, 0)  # type: ignore[attr-defined]
         async with engine.connect() as conn:
             assert await conn.scalar(text("SHOW statement_timeout")) == "15s"
     finally:

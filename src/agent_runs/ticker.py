@@ -65,7 +65,7 @@ from agent_runs.observability import metrics
 from agent_runs.observability.logging import configure_logging
 from agent_runs.retry import Breaker
 from agent_runs.store.artifacts import ArtifactStore
-from agent_runs.store.database import connect
+from agent_runs.store.database import connect, registry_engine
 from agent_runs.store.runs import RunStore
 from agent_runs.store.webhooks import WebhookStore
 from agent_runs.webhooks import WebhookSender
@@ -314,6 +314,7 @@ async def run() -> None:
         level=settings.observability.log_level, json_output=settings.observability.log_json
     )
     engine = await connect(settings.database)
+    registry = registry_engine(settings.database)
     if settings.ticker.metrics_port is not None:
         metrics.serve(settings.ticker.metrics_port, engine)
         log.info("ticker.metrics", port=settings.ticker.metrics_port)
@@ -329,7 +330,12 @@ async def run() -> None:
         beat = heartbeat.path_for(settings.ticker.heartbeat_file)
         log.info("ticker.heartbeat", path=str(beat))
         sessions = async_sessionmaker(engine, expire_on_commit=False)
-        bind(sessions, blobs, retention=settings.blob.retention)
+        bind(
+            sessions,
+            blobs,
+            registry=async_sessionmaker(registry, expire_on_commit=False),
+            retention=settings.blob.retention,
+        )
         ticker = Ticker(
             sessions,
             webhooks,
@@ -343,6 +349,7 @@ async def run() -> None:
     finally:
         await webhooks.aclose()
         await blobs.aclose()
+        await registry.dispose()
         await engine.dispose()
 
 

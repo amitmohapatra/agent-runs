@@ -1,4 +1,4 @@
-"""The engine both processes (API and ticker) share, and the schema check they start with.
+"""The engines both processes (API and ticker) open, and the schema check they start with.
 
 Startup verifies rather than migrates: two replicas racing to apply one migration is worse
 than a clear refusal. The one-shot ``migrate`` service (``alembic upgrade head``) moves the
@@ -32,15 +32,13 @@ ALEMBIC_INI = Path(__file__).resolve().parents[3] / "alembic.ini"
 _HEAD = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
 
 
-async def connect(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
-    """An engine on a database at the schema this build was written against, its pool this
-    process's share of the budget (one of ``processes`` in the container), with the
-    protections ``DatabaseSettings`` describes."""
-    plan = config.pool_plan(processes)
-    engine = create_async_engine(
+def _engine(config: DatabaseSettings, *, size: int, overflow: int) -> AsyncEngine:
+    """An engine with the protections ``DatabaseSettings`` describes; it connects when first
+    used."""
+    return create_async_engine(
         config.url,
-        pool_size=plan.size,
-        max_overflow=plan.overflow,
+        pool_size=size,
+        max_overflow=overflow,
         pool_timeout=DB_POOL_TIMEOUT_SECONDS,
         pool_recycle=DB_POOL_RECYCLE_SECONDS,
         pool_pre_ping=True,
@@ -49,6 +47,14 @@ async def connect(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
             "options": f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
         },
     )
+
+
+async def connect(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
+    """An engine on a database at the schema this build was written against, its pool this
+    process's share of the budget (one of ``processes`` in the container), with the
+    protections ``DatabaseSettings`` describes."""
+    plan = config.pool_plan(processes)
+    engine = _engine(config, size=plan.size, overflow=plan.overflow)
     async with engine.connect() as conn:
         current = await conn.run_sync(
             lambda sync: MigrationContext.configure(sync).get_current_revision()
@@ -60,6 +66,15 @@ async def connect(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
             "run `alembic upgrade head` (make migrate) first"
         )
     return engine
+
+
+def registry_engine(config: DatabaseSettings, processes: int = 1) -> AsyncEngine:
+    """The engine the payload registry is written through (``blob.payloads.bind``): a small
+    pool of its own, out of the same budget. A write registers its object in a short
+    transaction while the session of the request that makes it may hold a connection and a
+    row lock; from one pool, a burst of such requests would hold every connection while each
+    waits for one more."""
+    return _engine(config, size=config.pool_plan(processes).registry, overflow=0)
 
 
 async def ping(engine: AsyncEngine, *, within: float = READY_TIMEOUT_SECONDS) -> bool:

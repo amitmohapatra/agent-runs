@@ -1,6 +1,7 @@
 """Run payloads in the blob store, by reference (``trellis.runs.payloads`` is the format).
 
-A write registers the object's key (``payload_blobs``, in its own short transaction) before
+A write registers the object's key (``payload_blobs``, in its own short transaction on the
+registry's own pool: the writer's session may hold a connection and a row lock) before
 it writes the bytes, and returns the :class:`PayloadRef` the caller's row then holds: the
 bytes are durable before any row refers to them, and an object whose row never committed
 (a crash, a lost lease) is an orphan the ticker deletes a day later (:meth:`sweep`). Writes
@@ -173,10 +174,16 @@ class PayloadStore:
 
 
 def bind(
-    sessions: Sessions, blobs: BlobStore, *, retention: timedelta = ARTIFACT_RETENTION
+    sessions: Sessions,
+    blobs: BlobStore,
+    *,
+    registry: Sessions,
+    retention: timedelta = ARTIFACT_RETENTION,
 ) -> PayloadStore:
-    """The payload store over ``blobs``, carried by every session ``sessions`` opens."""
-    store = PayloadStore(blobs, sessions, retention=retention)
+    """The payload store over ``blobs``, carried by every session ``sessions`` opens. Its
+    registry is written through ``registry``, sessions on a pool of their own
+    (``store.database.registry_engine``), never one of ``sessions``'s connections."""
+    store = PayloadStore(blobs, registry, retention=retention)
     sessions.configure(info={_PAYLOADS: store})
     return store
 

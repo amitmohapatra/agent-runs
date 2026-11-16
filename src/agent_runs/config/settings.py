@@ -20,6 +20,7 @@ from agent_runs.config.constants import (
     ARTIFACT_RETENTION,
     CONCURRENCY_PER_KEY,
     DB_CONNECTIONS_PER_PROCESS,
+    DB_REGISTRY_SHARE,
     WEBHOOK_DEAD_RETENTION,
 )
 
@@ -33,7 +34,8 @@ MEMORY_URL_ENV: Final = "MEMORY_URL"
 #: Uvicorn processes when ``RUNS__SERVICE__WORKERS`` is unset: one per CPU, within these.
 MIN_WORKERS: Final = 1
 MAX_WORKERS: Final = 8
-#: The smallest pool a process may have: one connection kept, one for a burst.
+#: The fewest connections a process may have: one for its sessions, one for the payload
+#: registry.
 MIN_CONNECTIONS_PER_PROCESS: Final = 2
 
 log = logging.getLogger(__name__)
@@ -92,6 +94,8 @@ class PoolPlan:
     size: int
     #: SQLAlchemy ``max_overflow``: opened past ``size`` under a burst, closed when returned.
     overflow: int
+    #: The payload registry's own pool (``registry_engine``): connections kept open.
+    registry: int
 
 
 class DatabaseSettings(BaseModel):
@@ -112,11 +116,13 @@ class DatabaseSettings(BaseModel):
         """One process's pool, from the container's budget::
 
             per_process = connection_budget // processes   (unset: 20; at least 2)
-            size        = ceil(per_process / 2)
-            overflow    = floor(per_process / 2)
+            registry    = per_process // 10                (at least 1)
+            size        = ceil((per_process - registry) / 2)
+            overflow    = floor((per_process - registry) / 2)
 
         The overflow is the burst a pool may open past its steady size and closes again; the
-        budget counts both, because a burst is when the budget matters.
+        budget counts both, because a burst is when the budget matters. The registry's
+        connections are a pool of their own (``DB_REGISTRY_SHARE``).
         """
         if self.connection_budget is None:
             per_process = DB_CONNECTIONS_PER_PROCESS
@@ -124,7 +130,9 @@ class DatabaseSettings(BaseModel):
             per_process = max(
                 MIN_CONNECTIONS_PER_PROCESS, self.connection_budget // max(1, processes)
             )
-        return PoolPlan(size=-(-per_process // 2), overflow=per_process // 2)
+        registry = max(1, per_process // DB_REGISTRY_SHARE)
+        sessions = per_process - registry
+        return PoolPlan(size=-(-sessions // 2), overflow=sessions // 2, registry=registry)
 
 
 class BlobSettings(BaseModel):

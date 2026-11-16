@@ -18,7 +18,16 @@ from trellis.runs.blob import FilesystemBlobStore
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
 from agent_runs.observability import metrics
-from tests.conftest import SETTINGS, client_of, pause, serving, started
+from tests.conftest import (
+    SETTINGS,
+    client_of,
+    pause,
+    paused,
+    resolution,
+    scheduled,
+    serving,
+    started,
+)
 
 
 def _settings(**over: Any) -> Any:
@@ -406,3 +415,27 @@ def test_the_payload_cap_defaults_are_the_documented_ones() -> None:
     assert (service.max_body_bytes, service.max_payload_bytes) == (4 * 1024 * 1024, 1024 * 1024)
     limits = RateLimitSettings()
     assert (limits.per_minute, limits.burst) == (3000, 500)
+
+
+# ------------------------------------------------------------------ the connection pool
+
+
+async def test_an_answer_and_a_fire_need_no_second_connection_of_the_pool(
+    migrated, memory, blobs
+) -> None:
+    """A resume and a fire write payloads while their session holds a connection and a row
+    lock. On the smallest budget (one connection for sessions, none for a burst) both still
+    go through: the payload registry is written on a pool of its own, so a burst of them
+    cannot hold every connection while each waits for one more."""
+    one = SETTINGS.database.model_copy(update={"connection_budget": 2})
+    settings = _settings(database=one)
+    async with serving(settings, memory, blobs) as app, client_of(app) as client:
+        pool = app.state.engine.pool
+        assert (pool.size(), pool._max_overflow) == (1, 0)
+        waiting = await paused(client)
+        answer = resolution(waiting, reviewer="user_ada")
+        answered = await client.post(f"/v1/runs/{waiting['run_id']}/resume", json=answer)
+        assert answered.status_code == 200, answered.text
+        sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
+        fired = await client.post(f"/v1/schedules/{sid}/fire")
+        assert fired.status_code == 200, fired.text

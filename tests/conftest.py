@@ -209,7 +209,9 @@ async def serving(
         await application.state.keys.aclose()
         application.state.keys = memory.registry()
         application.state.blobs = blobs
-        application.state.payloads = bind(application.state.sessions, blobs)
+        application.state.payloads = bind(
+            application.state.sessions, blobs, registry=application.state.registry
+        )
         async with application.state.engine.begin() as conn:
             await conn.execute(
                 text(

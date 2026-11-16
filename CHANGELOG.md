@@ -6,6 +6,15 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A burst of answers or fires no longer runs the pool dry.** `POST /v1/runs/{id}/resume` and
+  a schedule's fire register their payloads while their session holds a connection and a row
+  lock, and the registry took a second connection from the same pool: about 20 at once (the
+  default pool) each held one connection, waited 5 s for another and answered `503`. The
+  payload registry now has a pool of its own (`store/database.py` `registry_engine`), taken
+  out of the same budget: of a process's connections a tenth (at least one) are the
+  registry's, so the default is 9 kept + 9 burst for sessions and 2 for the registry (was
+  10 + 10), and `RUNS__DATABASE__CONNECTION_BUDGET` still bounds everything the container
+  opens. Nothing to do; `runs_db_pool_connections` reports the sessions' pool.
 * **One failing ticker step no longer stops the others.** Every step of a tick ran in one
   `try` that caught only database and OS errors, so anything else one step raised (a webhook
   delivery whose payload object was lost, a stored interrupt this build cannot read) ended the

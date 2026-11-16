@@ -47,8 +47,14 @@ MAX_PAGE: Final = 500
 # --------------------------------------------------------------------------- the database
 
 #: Connections one process (an API worker, the ticker) opens when no budget is set
-#: (``RUNS__DATABASE__CONNECTION_BUDGET``): 10 kept and 10 more under a burst.
+#: (``RUNS__DATABASE__CONNECTION_BUDGET``): 9 kept, 9 more under a burst and 2 for the
+#: payload registry.
 DB_CONNECTIONS_PER_PROCESS: Final = 20
+#: The share of a process's connections kept for the payload registry's own pool (one in
+#: ten, at least one): a payload is registered, in a short transaction of its own, while the
+#: request that writes it may hold a connection and a row lock, so it must never wait for a
+#: second connection of the pool the requests hold theirs from.
+DB_REGISTRY_SHARE: Final = 10
 #: Seconds a request waits for a pooled connection before a 503.
 DB_POOL_TIMEOUT_SECONDS: Final = 5.0
 #: Seconds after which a pooled connection is replaced rather than reused: under the idle
