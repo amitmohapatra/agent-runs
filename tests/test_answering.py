@@ -14,7 +14,7 @@ from agent_runs.answering import as_principal, require_may_answer
 from agent_runs.domain.errors import Forbidden
 from agent_runs.keys import KeyInfo
 from agent_runs.store.runs import RunStore
-from tests.conftest import KEYS, at, client_of, pause, resolution, started
+from tests.conftest import KEYS, SETTINGS, at, client_of, pause, resolution, started
 from tests.test_errors import assert_problem
 
 PRIYA = KeyInfo.model_validate(KEYS["priya-key"])
@@ -181,7 +181,7 @@ async def test_the_assignee_that_counts_is_the_one_after_escalation(app, client)
     )
     assert (await _answer(app, "priya-key", run, reviewer="priya")).status_code == 403
     async with app.state.sessions() as db:
-        await RunStore(db).escalate_overdue(now=at(11), limit=10)
+        await RunStore(db, SETTINGS.limits).escalate_overdue(now=at(11), limit=10)
         await db.commit()
     assert (await _answer(app, "priya-key", run, reviewer="priya")).status_code == 200
 

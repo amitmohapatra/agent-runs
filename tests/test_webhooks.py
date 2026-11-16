@@ -20,7 +20,7 @@ from agent_runs.domain.webhooks import Attempt, WebhookEvent, event_of
 from agent_runs.store.webhooks import Delivery, WebhookStore, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
-from tests.conftest import at, pause, started
+from tests.conftest import SETTINGS, at, pause, started
 
 HOOK = "https://ui.example/h"
 
@@ -233,7 +233,13 @@ async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
         allow_private=True,
         client=httpx.AsyncClient(transport=httpx.MockTransport(failing)),
     )
-    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
+    )
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "ERROR"})
@@ -260,7 +266,13 @@ async def test_a_receiver_that_recovers_is_told_once(app, client, tmp_path) -> N
             transport=httpx.MockTransport(lambda _: httpx.Response(next(answers)))
         ),
     )
-    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
+    )
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})

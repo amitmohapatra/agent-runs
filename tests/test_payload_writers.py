@@ -27,7 +27,7 @@ from agent_runs.store.tables import (
     RunRow,
     WebhookDeliveryRow,
 )
-from tests.conftest import client_of, pause, resolution, started
+from tests.conftest import SETTINGS, client_of, pause, resolution, started
 from tests.test_events import _event
 
 TENANT = "acme"
@@ -322,10 +322,10 @@ async def test_compaction_another_ticker_won_changes_nothing(app: Any, client: A
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})
     async with app.state.sessions() as db:
-        assert await RunStore(db).compact_events(TENANT, run["run_id"])
+        assert await RunStore(db, SETTINGS.limits).compact_events(TENANT, run["run_id"])
         await db.commit()
     async with app.state.sessions() as db:
-        assert not await RunStore(db).compact_events(TENANT, run["run_id"])
+        assert not await RunStore(db, SETTINGS.limits).compact_events(TENANT, run["run_id"])
 
 
 # ------------------------------------------------------------------ retention

@@ -13,7 +13,7 @@ from sqlalchemy import text
 from trellis.contracts.runs import RunStart
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import interrupt, pause, paused, resolution, started
+from tests.conftest import SETTINGS, interrupt, pause, paused, resolution, started
 
 
 async def test_a_run_starts_running_and_comes_back_by_id(client) -> None:
@@ -108,9 +108,11 @@ async def test_concurrent_starts_on_one_key_make_one_run_and_no_error(app) -> No
     from trellis.contracts.ids import now
 
     async with app.state.sessions() as winner_db, app.state.sessions() as loser_db:
-        winner, created = await RunStore(winner_db).start(spec, queue=False, now=now())
+        winner, created = await RunStore(winner_db, SETTINGS.limits).start(
+            spec, queue=False, now=now()
+        )
         loser = asyncio.create_task(
-            RunStore(loser_db).start(
+            RunStore(loser_db, SETTINGS.limits).start(
                 spec.model_copy(update={"run_id": "run_x"}), queue=False, now=now()
             )
         )

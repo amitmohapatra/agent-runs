@@ -41,13 +41,14 @@ log = structlog.get_logger(__name__)
 
 
 class Firing:
-    """Fires schedules within the caller's transaction; the caller commits, also after a
-    :class:`FireFailed` (the failure is recorded on the schedule)."""
+    """Fires schedules within the caller's transaction, queueing their runs through ``runs``
+    (the store on ``session``); the caller commits, also after a :class:`FireFailed` (the
+    failure is recorded on the schedule)."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, runs: RunStore) -> None:
         self._session = session
         self._schedules = ScheduleStore(session)
-        self._runs = RunStore(session)
+        self._runs = runs
 
     async def fire(
         self, tenant_id: str, schedule_id: str, *, at: datetime | None, now: datetime

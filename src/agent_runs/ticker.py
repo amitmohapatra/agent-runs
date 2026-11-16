@@ -57,7 +57,7 @@ from agent_runs.config.constants import (
     TICK_SECONDS,
     WEBHOOK_DEAD_RETENTION,
 )
-from agent_runs.config.settings import get_settings
+from agent_runs.config.settings import LimitsSettings, get_settings
 from agent_runs.domain.schedules import FireFailed, FireSkipped
 from agent_runs.firing import Firing
 from agent_runs.observability import metrics
@@ -111,20 +111,22 @@ class Ticker:
         blobs: BlobStore,
         *,
         heartbeat_path: Path,
+        limits: LimitsSettings,
         interval: float = TICK_SECONDS,
-        max_run_seconds: float | None = None,
         dead_retention: timedelta = WEBHOOK_DEAD_RETENTION,
-        run_retention: timedelta | None = None,
     ) -> None:
         self._sessions = sessions
         self._webhooks = webhooks
         self._blobs = blobs
         self._heartbeat = heartbeat_path
         self._interval = interval
-        self._max_run_seconds = max_run_seconds
+        self._limits = limits
         self._dead_retention = dead_retention
-        self._run_retention = run_retention
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
+
+    def _runs(self, db: AsyncSession) -> RunStore:
+        """The run store on ``db``, within the deployment's limits."""
+        return RunStore(db, self._limits)
 
     async def tick(self, *, now: datetime | None = None) -> TickReport:
         """One pass. Raises nothing the loop could not survive: an outage is recorded on the
@@ -183,7 +185,7 @@ class Ticker:
         for _ in range(SWEEP_BATCH):
             async with self._sessions() as db:
                 try:
-                    result = await Firing(db).fire_due(now=now)
+                    result = await Firing(db, self._runs(db)).fire_due(now=now)
                 except (FireFailed, FireSkipped):
                     # recorded on the schedule, which now backs off, is paused or waits for
                     # its next occurrence
@@ -200,8 +202,7 @@ class Ticker:
         run a sweep leaves ``PAUSED`` was escalated; any other announces what its new status
         does (an ending ``run.finished``, a requeue nothing)."""
         async with self._sessions() as db:
-            store = RunStore(db, max_run_seconds=self._max_run_seconds)
-            moved = await sweep(store, now=now, limit=SWEEP_BATCH)
+            moved = await sweep(self._runs(db), now=now, limit=SWEEP_BATCH)
             await WebhookStore(db).announce(*moved, escalated=True, now=now)
             await db.commit()
         return len(moved)
@@ -257,12 +258,11 @@ class Ticker:
 
     async def _purge_runs(self, now: datetime) -> int:
         """Delete the runs that ended before the retention window; none without one."""
-        if self._run_retention is None:
+        retention = self._limits.retention
+        if retention is None:
             return 0
         async with self._sessions() as db:
-            purged = await RunStore(db).purge_ended(
-                before=now - self._run_retention, limit=SWEEP_BATCH
-            )
+            purged = await self._runs(db).purge_ended(before=now - retention, limit=SWEEP_BATCH)
             await db.commit()
         return purged
 
@@ -270,11 +270,11 @@ class Ticker:
         """Move ended runs' event logs from rows to objects (``RunStore.compact_events``), a
         batch per tick."""
         async with self._sessions() as db:
-            ended = await RunStore(db).ended_uncompacted(limit=SWEEP_BATCH)
+            ended = await self._runs(db).ended_uncompacted(limit=SWEEP_BATCH)
         compacted = 0
         for tenant_id, run_id in ended:
             async with self._sessions() as db:
-                compacted += await RunStore(db).compact_events(tenant_id, run_id)
+                compacted += await self._runs(db).compact_events(tenant_id, run_id)
                 await db.commit()
         return compacted
 
@@ -339,9 +339,8 @@ async def run() -> None:
             webhooks,
             blobs,
             heartbeat_path=beat,
-            max_run_seconds=settings.limits.max_run_seconds,
+            limits=settings.limits,
             dead_retention=settings.webhooks.dead_retention,
-            run_retention=settings.limits.retention,
         )
         await ticker.run_forever(stop)
     finally:

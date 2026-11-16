@@ -335,7 +335,13 @@ def scheduled(**over: Any) -> dict[str, Any]:
 async def ticker(app: Any, receiver: Receiver, tmp_path: Any) -> AsyncIterator[Ticker]:
     """The real ticker over the app's database, sending webhooks to ``receiver``."""
     hooks = sender(receiver)
-    yield Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
+    yield Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
+    )
     await hooks.aclose()
 
 

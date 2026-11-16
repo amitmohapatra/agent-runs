@@ -20,7 +20,17 @@ from agent_runs.observability import metrics
 from agent_runs.retry import Breaker, backoff
 from agent_runs.store.runs import RunStore
 from agent_runs.ticker import Ticker
-from tests.conftest import Receiver, arm, at, pause, queued_runs, scheduled, sender, started
+from tests.conftest import (
+    SETTINGS,
+    Receiver,
+    arm,
+    at,
+    pause,
+    queued_runs,
+    scheduled,
+    sender,
+    started,
+)
 from tests.test_webhooks import subscribe
 
 NOW = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
@@ -91,6 +101,7 @@ def _dead_ticker(tmp_path: Path, **kwargs) -> tuple[Ticker, DeadDatabase]:
         sender(Receiver()),
         FilesystemBlobStore(tmp_path),
         heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
         **kwargs,
     )
     return ticker, dead
@@ -157,11 +168,15 @@ async def test_two_tickers_on_one_tick_queue_one_run(app, client, tmp_path) -> N
         "schedule_id"
     ]
     await arm(app, sid, datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5))
-    one = Ticker(
-        app.state.sessions, sender(Receiver()), app.state.blobs, heartbeat_path=tmp_path / "a"
-    )
-    two = Ticker(
-        app.state.sessions, sender(Receiver()), app.state.blobs, heartbeat_path=tmp_path / "b"
+    one, two = (
+        Ticker(
+            app.state.sessions,
+            sender(Receiver()),
+            app.state.blobs,
+            heartbeat_path=tmp_path / name,
+            limits=SETTINGS.limits,
+        )
+        for name in "ab"
     )
     reports = await asyncio.gather(one.tick(), two.tick())
     assert sum(r.fired for r in reports) == 1

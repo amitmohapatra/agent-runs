@@ -17,7 +17,7 @@ from trellis.contracts.ids import now
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
 from agent_runs.api import examples
-from agent_runs.api.deps import Session, Who
+from agent_runs.api.deps import Runs, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
@@ -181,6 +181,7 @@ async def delete(schedule_id: ScheduleId, db: Session, who: Who) -> Response:
 async def fire(
     schedule_id: ScheduleId,
     db: Session,
+    runs: Runs,
     who: Who,
     body: Annotated[FireRequest | None, Body(openapi_examples=examples.FIRE)] = None,
 ) -> FireResult:
@@ -190,7 +191,7 @@ async def fire(
     await _administered(schedule_id, db, who)
     at = body.at if body is not None else None
     try:
-        result = await Firing(db).fire(who.tenant_id, schedule_id, at=at, now=now())
+        result = await Firing(db, runs).fire(who.tenant_id, schedule_id, at=at, now=now())
     except FireFailed:
         await db.commit()
         raise

@@ -13,7 +13,7 @@ from trellis.contracts.runs import RunStatus
 
 from agent_runs.domain.runs import ClaimRequest
 from agent_runs.store.runs import RunStore, _after_the_line
-from tests.conftest import started
+from tests.conftest import SETTINGS, started
 
 
 async def _plan(db: Any, statement: Any) -> str:
@@ -38,7 +38,9 @@ async def test_a_claim_scans_no_table_whole(app, client) -> None:
     await client.post("/v1/runs", json=started(queue=True, concurrency_key="thread:1"))
     request = ClaimRequest(worker_id="w1", agent_ids=["triage"], lease_seconds=30)
     async with app.state.sessions() as db:
-        plan = await _plan(db, RunStore(db)._next_queued("acme", request, now(), []))
+        plan = await _plan(
+            db, RunStore(db, SETTINGS.limits)._next_queued("acme", request, now(), [])
+        )
     assert "Seq Scan" not in plan and "ix_run_resolutions_run" in plan, plan
 
 
@@ -58,7 +60,7 @@ async def test_listing_a_keys_line_reads_the_index_and_each_place_from_its_answe
         )
         await db.commit()
         await db.execute(text("ANALYZE agent_runs"))
-        listing = RunStore(db)._listing(
+        listing = RunStore(db, SETTINGS.limits)._listing(
             "acme", status=RunStatus.RUNNING, concurrency_key="thread:1"
         )
         plan = await _plan(db, listing)

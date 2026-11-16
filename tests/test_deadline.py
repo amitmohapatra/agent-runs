@@ -7,14 +7,16 @@ from __future__ import annotations
 from trellis.contracts.errors import ErrorCategory
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import at, pause, started
+from tests.conftest import SETTINGS, at, pause, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 600}
 
 
 async def _sweep(app, minutes: float, limit: int = 10):
     async with app.state.sessions() as db:
-        ended = await RunStore(db).time_out_past_deadline(now=at(minutes), limit=limit)
+        ended = await RunStore(db, SETTINGS.limits).time_out_past_deadline(
+            now=at(minutes), limit=limit
+        )
         await db.commit()
     return ended
 
@@ -55,7 +57,7 @@ async def test_a_deadline_counts_the_time_spent_waiting_for_a_person(app, client
     [ended] = await _sweep(app, 11)
     assert (ended.run_id, ended.status.value) == (run_id, "TIMEOUT")
     async with app.state.sessions() as db:
-        assert await RunStore(db).escalate_overdue(now=at(61), limit=10) == []
+        assert await RunStore(db, SETTINGS.limits).escalate_overdue(now=at(61), limit=10) == []
 
 
 async def test_a_worker_running_a_timed_out_run_is_fenced_off(app, client) -> None:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import gzip
 import json
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,9 +16,11 @@ from sqlalchemy import text
 from trellis.contracts.ids import now
 from trellis.runs.blob import FilesystemBlobStore
 
+from agent_runs.api.deps import run_store
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
 from agent_runs.observability import metrics
+from agent_runs.store.runs import RunStore
 from tests.conftest import (
     SETTINGS,
     client_of,
@@ -439,3 +442,23 @@ async def test_an_answer_and_a_fire_need_no_second_connection_of_the_pool(
         sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
         fired = await client.post(f"/v1/schedules/{sid}/fire")
         assert fired.status_code == 200, fired.text
+
+
+# ------------------------------------------------------------------ the deployment's limits
+
+
+async def test_a_run_store_is_built_with_the_deployments_limits_or_not_at_all(
+    migrated, memory, blobs
+) -> None:
+    """One way to build a ``RunStore``: with the limits it works within. A store built
+    without them (which silently ran on the defaults) does not exist, and the store every
+    route gets is the one on the request's session with the configured limits."""
+    limits = SETTINGS.limits.model_copy(update={"max_run_seconds": 30.0})
+    async with (
+        serving(_settings(limits=limits), memory, blobs) as app,
+        app.state.sessions() as db,
+    ):
+        with pytest.raises(TypeError):
+            RunStore(db)  # pyright: ignore[reportCallIssue]
+        store = run_store(SimpleNamespace(app=app), db)  # pyright: ignore[reportArgumentType]
+        assert store.limits is limits

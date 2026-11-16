@@ -25,7 +25,7 @@ from trellis.runs.payloads import (
     key_of,
 )
 
-from agent_runs.api.deps import Session, Who
+from agent_runs.api.deps import Runs, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.routers.runs import RunId, WorkerId
 from agent_runs.blob import BlobCorrupt, BlobNotFound, BlobStore, read
@@ -38,7 +38,6 @@ from agent_runs.store.artifacts import (
     artifact_ref,
     sha256_of,
 )
-from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import PayloadBlobRow
 
 router = APIRouter(tags=["artifacts"])
@@ -147,6 +146,7 @@ async def upload(
     run_id: RunId,
     request: Request,
     db: Session,
+    runs: Runs,
     who: Who,
     response: Response,
     worker_id: WorkerId = None,
@@ -157,7 +157,6 @@ async def upload(
     while ``PAUSED`` only a service key may add one (403); never after (409). The same bytes
     uploaded to the same run again answer 200 with the first artifact. At most 50 MiB,
     streamed to the blob store as it arrives (413 past it); an empty body is 422."""
-    runs = RunStore(db)
     # fail fast, before the bytes are read and stored; checked again, locked, below
     await runs.check_artifact_writer(
         who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
@@ -305,7 +304,12 @@ Sha256 = Annotated[
     },
 )
 async def put_payload(
-    run_id: RunId, request: Request, db: Session, who: Who, worker_id: WorkerId = None
+    run_id: RunId,
+    request: Request,
+    db: Session,
+    runs: Runs,
+    who: Who,
+    worker_id: WorkerId = None,
 ) -> PayloadRef:
     """Store the body, a payload object, for the run's tenant and return its reference: a
     checkpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may
@@ -313,7 +317,7 @@ async def put_payload(
     stored once however often it is sent (its key is its SHA-256). At most 50 MiB, and at
     most 64 MiB decompressed, which its header says before anything is decoded (413). An
     object no checkpoint names is deleted a day later."""
-    await RunStore(db).check_artifact_writer(
+    await runs.check_artifact_writer(
         who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
     )
     await db.close()  # no connection held while the body arrives

@@ -36,7 +36,6 @@ from trellis.runs.payloads import SEGMENTS, PayloadRef, owned_by
 from agent_runs.answering import require_may_answer, require_may_cancel, require_may_hold
 from agent_runs.blob.payloads import PayloadStore, payloads_of
 from agent_runs.config.constants import (
-    CONCURRENCY_PER_KEY,
     DEFAULT_LEASE_SECONDS,
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
@@ -49,6 +48,7 @@ from agent_runs.config.constants import (
     PAUSED_ARTIFACT_ROLE,
     RESUME_GRACE,
 )
+from agent_runs.config.settings import LimitsSettings
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
 from agent_runs.domain.runs import (
     Claimed,
@@ -429,24 +429,19 @@ def _counted(error: AgentError | None, retries: int) -> AgentError | None:
 
 
 class RunStore:
-    """Every run operation, in one place. The caller commits. ``max_run_seconds`` is the
-    service's maximum working time (``RUNS__LIMITS__MAX_RUN_SECONDS``): a run's own
-    ``timeout_seconds`` may only be shorter. ``concurrency_per_key`` and
-    ``max_running_per_tenant`` bound what a claim may take (``RUNS__LIMITS__*``)."""
+    """Every run operation, in one place. The caller commits. ``limits`` are the
+    deployment's (``RUNS__LIMITS__*``), which every store is built with: ``max_run_seconds``
+    is the service's maximum working time (a run's own ``timeout_seconds`` may only be
+    shorter); ``concurrency_per_key`` and ``max_running_per_tenant`` bound what a claim may
+    take."""
 
-    def __init__(
-        self,
-        session: AsyncSession,
-        *,
-        max_run_seconds: float | None = None,
-        concurrency_per_key: int = CONCURRENCY_PER_KEY,
-        max_running_per_tenant: int | None = None,
-    ) -> None:
+    def __init__(self, session: AsyncSession, limits: LimitsSettings) -> None:
         self._session = session
         self._payloads = payloads_of(session)
-        self._max_run_seconds = max_run_seconds
-        self._per_key = concurrency_per_key
-        self._per_tenant = max_running_per_tenant
+        self.limits = limits
+        self._max_run_seconds = limits.max_run_seconds
+        self._per_key = limits.concurrency_per_key
+        self._per_tenant = limits.max_running_per_tenant
 
     def _limit(self, row: RunRow) -> float | None:
         """The most working time the run may take: its own limit or the service's, the

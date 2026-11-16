@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **One way to build a `RunStore`.** `RunStore(session, limits)` takes the deployment's
+  `RUNS__LIMITS__*` (`Settings.limits`) and has no defaults: most routes, the ticker's
+  retention and compaction steps and `Firing` built one without them, which no method read
+  yet, so the next one that did would have ignored the configured limits. Routes get the
+  store from one dependency (`api/deps.py` `Runs`), `Firing` is handed it, and `Ticker` takes
+  `limits=` (was `max_run_seconds=` and `run_retention=`). Nothing to do: no route or setting
+  changes.
 * **A page of an ended run's events reads a page's worth, not the whole log.** The ticker
   compacted an ended run's event log into one object, so every page of
   `GET /v1/runs/{id}/events`, and every 500 events of its stream, downloaded and decoded the

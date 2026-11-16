@@ -16,7 +16,7 @@ from trellis.contracts.runs import RunStart
 from agent_runs.api.pagination import decode_cursor, encode_cursor
 from agent_runs.domain.errors import Unprocessable
 from agent_runs.store.runs import RunStore
-from tests.conftest import pause, resolution, scheduled, started
+from tests.conftest import SETTINGS, pause, resolution, scheduled, started
 
 
 def next_url(response: Any) -> str | None:
@@ -62,7 +62,7 @@ async def test_runs_started_in_the_same_instant_still_page_exactly(app, client) 
     instant = now()
     async with app.state.sessions() as db:
         for n in range(4):
-            await RunStore(db).start(
+            await RunStore(db, SETTINGS.limits).start(
                 RunStart(**started(run_id=f"run_tie{n}")), queue=False, now=instant
             )
         await db.commit()

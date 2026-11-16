@@ -12,7 +12,7 @@ from sqlalchemy import text
 from trellis.contracts.ids import now
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import client_of, pause, paused, started
+from tests.conftest import SETTINGS, client_of, pause, paused, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 60}
 _WHY = {"reason": "the customer withdrew the request"}
@@ -100,7 +100,7 @@ async def test_a_worker_that_ignores_the_cancel_loses_the_run_when_its_lease_run
     run_id = await _held(client)
     await _cancel(client, run_id)
     async with app.state.sessions() as db:
-        store = RunStore(db)
+        store = RunStore(db, SETTINGS.limits)
         assert await store.requeue_lapsed(now=now() + timedelta(seconds=30), limit=10) == []
         [ended] = await store.requeue_lapsed(now=now() + timedelta(seconds=61), limit=10)
         await db.commit()

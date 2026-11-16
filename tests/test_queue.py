@@ -68,9 +68,9 @@ async def test_a_claim_skips_a_run_another_claim_holds(app, client) -> None:
     one, two = await queued(client), await queued(client)
     request = ClaimRequest(**claim())
     async with app.state.sessions() as a, app.state.sessions() as b:
-        first = await RunStore(a).claim("acme", request, now=now())
-        second = await RunStore(b).claim("acme", request, now=now())
-        third = await RunStore(b).claim("acme", request, now=now())
+        first = await RunStore(a, SETTINGS.limits).claim("acme", request, now=now())
+        second = await RunStore(b, SETTINGS.limits).claim("acme", request, now=now())
+        third = await RunStore(b, SETTINGS.limits).claim("acme", request, now=now())
         await a.commit()
         await b.commit()
     assert first is not None and second is not None and third is None
@@ -147,8 +147,10 @@ async def test_a_lapsed_lease_puts_the_run_back_on_the_queue_as_the_next_attempt
 
     lapsed_at = now() + timedelta(seconds=11)
     async with app.state.sessions() as db:
-        assert await RunStore(db).requeue_lapsed(now=now(), limit=10) == [], "not lapsed yet"
-        moved = await RunStore(db).requeue_lapsed(now=lapsed_at, limit=10)
+        assert await RunStore(db, SETTINGS.limits).requeue_lapsed(now=now(), limit=10) == [], (
+            "not lapsed yet"
+        )
+        moved = await RunStore(db, SETTINGS.limits).requeue_lapsed(now=lapsed_at, limit=10)
         await db.commit()
     assert [(r.run_id, r.status.value, r.attempt) for r in moved] == [(rid, "QUEUED", 2)]
 
@@ -164,7 +166,7 @@ async def test_a_lapsed_lease_puts_the_run_back_on_the_queue_as_the_next_attempt
     assert (await client.post("/v1/runs/claim", json=claim("w2"))).status_code == 204
     async with app.state.sessions() as db:
         request = ClaimRequest(**claim("w2"))
-        again = await RunStore(db).claim("acme", request, now=available_at)
+        again = await RunStore(db, SETTINGS.limits).claim("acme", request, now=available_at)
         await db.commit()
     assert again is not None and (again.run.run_id, again.run.attempt) == (rid, 2)
     assert again.run.status.value == "RUNNING"
@@ -173,7 +175,9 @@ async def test_a_lapsed_lease_puts_the_run_back_on_the_queue_as_the_next_attempt
 async def _lapse(app) -> list:
     """The ticker's lease sweep, past every lease a test hands out, and the backoff after."""
     async with app.state.sessions() as db:
-        moved = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=10)
+        moved = await RunStore(db, SETTINGS.limits).requeue_lapsed(
+            now=now() + timedelta(seconds=6), limit=10
+        )
         await db.commit()
     await backoff_passed(app)
     return moved
@@ -186,7 +190,7 @@ async def test_the_backoff_after_each_lapse_doubles(app, client) -> None:
     for lapses in range(1, MAX_LEASE_LAPSES):
         lapsed_at = now() + timedelta(seconds=6)
         async with app.state.sessions() as db:
-            await RunStore(db).requeue_lapsed(now=lapsed_at, limit=10)
+            await RunStore(db, SETTINGS.limits).requeue_lapsed(now=lapsed_at, limit=10)
             await db.commit()
         async with app.state.engine.begin() as conn:
             available_at = await conn.scalar(

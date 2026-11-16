@@ -20,6 +20,7 @@ from agent_runs.store.runs import RunStore
 from tests.conftest import SETTINGS, client_of, paused, resolution, serving, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 30}
+_CAPPED = LimitsSettings(max_running_per_tenant=1)
 
 
 async def _queued(client, **over: Any) -> str:
@@ -144,14 +145,14 @@ async def test_two_claims_at_once_never_both_take_a_keys_last_place(app, client)
     keyless = await _queued(client)
     request = ClaimRequest(**_CLAIM)
     async with app.state.sessions() as a, app.state.sessions() as b:
-        taken = await RunStore(a).claim("acme", request, now=now())
-        passed = await RunStore(b).claim("acme", request, now=now())
+        taken = await RunStore(a, SETTINGS.limits).claim("acme", request, now=now())
+        passed = await RunStore(b, SETTINGS.limits).claim("acme", request, now=now())
         await a.commit()
         await b.commit()
     assert taken is not None and taken.run.run_id == first
     assert passed is not None and passed.run.run_id == keyless
     async with app.state.sessions() as c:
-        assert await RunStore(c).claim("acme", request, now=now()) is None
+        assert await RunStore(c, SETTINGS.limits).claim("acme", request, now=now()) is None
 
 
 async def test_two_claims_at_once_never_both_take_a_tenants_last_place(app, client) -> None:
@@ -159,13 +160,13 @@ async def test_two_claims_at_once_never_both_take_a_tenants_last_place(app, clie
         await _queued(client)
     request = ClaimRequest(**_CLAIM)
     async with app.state.sessions() as a, app.state.sessions() as b:
-        taken = await RunStore(a, max_running_per_tenant=1).claim("acme", request, now=now())
-        passed = await RunStore(b, max_running_per_tenant=1).claim("acme", request, now=now())
+        taken = await RunStore(a, _CAPPED).claim("acme", request, now=now())
+        passed = await RunStore(b, _CAPPED).claim("acme", request, now=now())
         await a.commit()
         await b.commit()
     assert taken is not None and passed is None
     async with app.state.sessions() as c:
-        capped = RunStore(c, max_running_per_tenant=1)
+        capped = RunStore(c, _CAPPED)
         assert await capped.claim("acme", request, now=now()) is None
 
 
@@ -179,7 +180,9 @@ async def test_a_repeated_start_asking_another_priority_or_key_is_a_conflict(cli
 
 # ------------------------------------------------------------------ a key's runs in process
 async def _start(db: Any, at: datetime, **over: Any) -> Any:
-    record, _ = await RunStore(db).start(RunStart(**started(**over)), queue=False, now=at)
+    record, _ = await RunStore(db, SETTINGS.limits).start(
+        RunStart(**started(**over)), queue=False, now=at
+    )
     return record
 
 
@@ -229,7 +232,7 @@ async def test_a_run_answered_in_its_callers_process_starts_after_its_keys_runni
     answer = InterruptResolution.model_validate(resolution(waiting))
     async with app.state.sessions() as db:
         answerer = KeyInfo(key_id="key_dev", tenant_id="acme", principal="user_ada", role="service")
-        continued, _ = await RunStore(db).resume(
+        continued, _ = await RunStore(db, SETTINGS.limits).resume(
             "acme",
             waiting["run_id"],
             answer,
@@ -269,7 +272,7 @@ async def test_a_queued_run_of_a_key_is_placed_after_the_keys_runs_too(app) -> N
     clock = now()
     async with app.state.sessions() as db:
         running = await _start(db, clock, concurrency_key="k")
-        queued, _ = await RunStore(db).start(
+        queued, _ = await RunStore(db, SETTINGS.limits).start(
             RunStart(**started(concurrency_key="k")), queue=True, now=clock - timedelta(seconds=5)
         )
         await db.commit()
