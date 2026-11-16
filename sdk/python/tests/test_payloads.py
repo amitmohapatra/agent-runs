@@ -3,9 +3,11 @@ large payloads (de)compressed off the event loop, references by content under a 
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
+import zstandard
 from trellis.runs import payloads
 from trellis.runs.payloads import (
     MEDIA_TYPE,
@@ -14,6 +16,7 @@ from trellis.runs.payloads import (
     adecode,
     aencode,
     decode,
+    decoded_size,
     encode,
     jsonb_order,
     owned_by,
@@ -53,6 +56,21 @@ def test_a_frame_declaring_more_than_the_bound_is_refused(monkeypatch: pytest.Mo
     monkeypatch.setattr(payloads, "MAX_DECODED_BYTES", 8)
     with pytest.raises(ValueError, match="at most 8 bytes"):
         decode(data)
+
+
+def test_a_payloads_decoded_size_is_read_from_its_header_alone() -> None:
+    """What an object decompresses to is known before any of it is decompressed; a frame
+    that does not say (a streamed one) is no payload object, nor is one cut short."""
+    value = "0" * 4096
+    data = encode(value)
+    assert decoded_size(data) == len(json.dumps(value)) and len(data) < 100
+    assert decoded_size(data[:10]) == decoded_size(data), "the header is enough"
+    with pytest.raises(ValueError, match="not a payload object"):
+        decode(data[:-4])
+    streamed = zstandard.ZstdCompressor().compressobj()
+    unsized = streamed.compress(b'"x"') + streamed.flush()
+    with pytest.raises(ValueError, match="does not say"):
+        decoded_size(unsized)
 
 
 def test_a_reference_names_its_content_under_its_tenant() -> None:

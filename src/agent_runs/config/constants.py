@@ -83,6 +83,10 @@ EVENT_STREAM_SECONDS: Final = 300.0
 
 #: The largest artifact one upload may carry (an ``ask`` table, a diff, a report).
 MAX_ARTIFACT_BYTES: Final = 50 * 1024 * 1024
+#: The most an uploaded payload object (a checkpoint's segment) may decompress to, read from
+#: its header before it is decoded to be checked: a few compressed bytes cannot make the
+#: service hold what they claim to expand to.
+MAX_PAYLOAD_DECODED_BYTES: Final = 64 * 1024 * 1024
 #: How long a run's artifacts outlive the run: a reviewer can still open what a finished run
 #: asked about; after that the ticker deletes them.
 ARTIFACT_RETENTION: Final = timedelta(days=7)

@@ -6,6 +6,18 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **What a payload route holds is bounded.** `POST /v1/payloads/read` took up to 256 SHA-256s,
+  the same one as often as sent, read every object whole and copied them into one answer:
+  256 names of one 50 MiB object made one replica hold about 12.8 GB, twice. Now an object
+  named twice is read once (and still answered at each place asked), the bytes asked for are
+  at most 64 MiB together (`413 PAYLOAD_TOO_LARGE` past it, before anything is read from the
+  store), and the answer is written frame by frame, not copied into one body.
+  `POST /v1/runs/{id}/payloads` refuses (`413`) an object whose header says it decompresses
+  to more than 64 MiB (`MAX_PAYLOAD_DECODED_BYTES`) before decoding it to check it; it was
+  decoded up to 512 MiB. The SDK's `artifacts.get_payloads` asks for more than one read
+  answers (`trellis.runs.payloads.MAX_READ_OBJECTS`, `MAX_READ_BYTES`) in several requests,
+  so a caller of it has nothing to do; a client that posts to `/v1/payloads/read` itself
+  must split a read past 64 MiB. `payloads.decoded_size` is new.
 * **A burst of answers or fires no longer runs the pool dry.** `POST /v1/runs/{id}/resume` and
   a schedule's fire register their payloads while their session holds a connection and a row
   lock, and the registry took a second connection from the same pool: about 20 at once (the

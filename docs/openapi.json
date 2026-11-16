@@ -1052,7 +1052,7 @@
         "description": "Payload objects to read at once, by SHA-256: a checkpoint's segments.",
         "properties": {
           "sha256": {
-            "description": "The objects' SHA-256s, in the order their bytes are answered.",
+            "description": "The objects' SHA-256s, in the order their bytes are answered (a resume's segments: a journal keeps at most 64). One named twice is answered twice.",
             "items": {
               "pattern": "^[0-9a-f]{64}$",
               "type": "string"
@@ -3386,7 +3386,7 @@
     },
     "/v1/payloads/read": {
       "post": {
-        "description": "The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one\nanswer, read from the store in parallel: a resume is one round trip, not one per\nsegment. 404 when any is not this tenant's.",
+        "description": "The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one\nanswer, read from the store in parallel: a resume is one round trip, not one per\nsegment. 404 when any is not this tenant's. What one answer holds is bounded: the bytes\nasked for are at most 64 MiB together (413 past it, before any is read), and an object\nasked for twice is read once.",
         "operationId": "artifacts.get_payloads",
         "parameters": [
           {
@@ -3570,7 +3570,7 @@
                 }
               }
             },
-            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "description": "PAYLOAD_TOO_LARGE: the objects asked for are more than 64 MiB together (one asked for twice counts twice): ask for them in several requests. Or the body itself is too large.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -8824,7 +8824,7 @@
     },
     "/v1/runs/{run_id}/payloads": {
       "post": {
-        "description": "Store the body, a payload object, for the run's tenant and return its reference: a\ncheckpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may\nwrite is who may add an artifact; the object is checked to decode before it is stored, and\nstored once however often it is sent (its key is its SHA-256). At most 50 MiB (413). An\nobject no checkpoint names is deleted a day later.",
+        "description": "Store the body, a payload object, for the run's tenant and return its reference: a\ncheckpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may\nwrite is who may add an artifact; the object is checked to decode before it is stored, and\nstored once however often it is sent (its key is its SHA-256). At most 50 MiB, and at\nmost 64 MiB decompressed, which its header says before anything is decoded (413). An\nobject no checkpoint names is deleted a day later.",
         "operationId": "artifacts.put_payload",
         "parameters": [
           {
@@ -9113,7 +9113,7 @@
                 }
               }
             },
-            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "description": "PAYLOAD_TOO_LARGE: the body is more than 50 MiB, or decompresses to more than 64 MiB.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
