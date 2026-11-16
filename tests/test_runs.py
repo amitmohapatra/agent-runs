@@ -443,6 +443,23 @@ async def _asked(client, **question) -> dict:
     return response.json()
 
 
+async def test_a_run_whose_interrupt_a_newer_version_wrote_is_read(app, client) -> None:
+    """During a rolling deploy a newer replica may store an interrupt with a field this one
+    does not know; the run is read without it, not refused."""
+    run = await paused(client)
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text(
+                """UPDATE agent_runs SET awaiting = awaiting || '{"added_later": true}'
+                   WHERE run_id = :run_id"""
+            ),
+            {"run_id": run["run_id"]},
+        )
+    response = await client.get(f"/v1/runs/{run['run_id']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["awaiting"] == run["awaiting"]
+
+
 async def _refused(client, run: dict, body: dict, why: str) -> None:
     """Refused with 422 saying ``why``, and nothing written: the run still waits, unanswered."""
     response = await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)

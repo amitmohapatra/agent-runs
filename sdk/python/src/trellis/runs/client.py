@@ -107,7 +107,7 @@ class RunsClient:
         answers the run that exists."""
         body = {**start.model_dump(mode="json"), "queue": queue}
         data = await self._transport.json("POST", "/v1/runs", tenant=start.tenant_id, json=body)
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def claim(
         self,
@@ -178,7 +178,7 @@ class RunsClient:
         data = await self._transport.json(
             "POST", f"/v1/runs/{run_id}/release", tenant=tenant, json=body
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def pause(
         self,
@@ -197,7 +197,7 @@ class RunsClient:
             json=body,
             params=worker_params(worker_id),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def resume(
         self, resolution: InterruptResolution, *, tenant: str | None = None
@@ -216,7 +216,7 @@ class RunsClient:
             tenant=tenant,
             json=resolution.model_dump(mode="json"),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def cancel(
         self,
@@ -240,7 +240,7 @@ class RunsClient:
         data = await self._transport.json(
             "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json=body
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def finish(
         self,
@@ -272,12 +272,12 @@ class RunsClient:
             json=body,
             params=worker_params(worker_id),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def get(self, run_id: str, *, tenant: str | None = None) -> RunRecord | None:
         """The full record (input, output, error, checkpoint), or None when there is none."""
         data = await self._transport.found("GET", f"/v1/runs/{run_id}", tenant=tenant)
-        return None if data is None else RunRecord.model_validate(data)
+        return None if data is None else RunRecord.read(data)
 
     async def list(
         self,

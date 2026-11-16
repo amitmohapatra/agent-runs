@@ -234,6 +234,27 @@ async def test_get_answers_the_record_or_none(runs: RunsClient) -> None:
     assert await runs.get("run_1") is None
 
 
+@respx.mock
+async def test_a_record_a_newer_server_wrote_is_read(runs: RunsClient) -> None:
+    """A later patch of the contracts may add a field to an interrupt; the client reads the
+    record without it instead of refusing the run."""
+    newer = record(status="PAUSED")
+    newer["awaiting"]["added_later"] = {"any": "value"}
+    respx.get(f"{URL}/v1/runs/run_1").respond(200, json=newer)
+    found = await runs.get("run_1")
+    assert found is not None and found.awaiting == interrupt()
+    running = record()
+    running["last_resolution"] = {
+        "interrupt_id": "int_1",
+        "run_id": "run_1",
+        "decision": "APPROVE",
+        "added_later": True,
+    }
+    respx.post(f"{URL}/v1/runs/claim").respond(200, json={"run": running, "lease": lease()})
+    claimed = await runs.claim("w-1", ["triage"])
+    assert claimed is not None and claimed.run.last_resolution is not None
+
+
 # --------------------------------------------------------------------------- listings
 NEXT = '<http://runs.test/v1/runs?status=PAUSED&limit=2&cursor=c2>; rel="next"'
 

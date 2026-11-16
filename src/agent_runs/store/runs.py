@@ -204,7 +204,7 @@ async def _records(
     values = await payloads.get_many(ref for _, _, ref in wanted)
     for (into, name, _), value in zip(wanted, values, strict=True):
         into[name] = value
-    return [RunRecord.model_validate(fields) for fields in records]
+    return [RunRecord.read(fields) for fields in records]
 
 
 #: What a payload object is to a run (``run_payloads.kind``).
@@ -1211,7 +1211,7 @@ class RunStore:
         await self._ended(rows, now)
         await self._session.flush()
         places = await self._places(rows)
-        moved = [RunRecord.model_validate(_fields(row, now, places)) for row in rows]
+        moved = [RunRecord.read(_fields(row, now, places)) for row in rows]
         await self._webhooks.announce(*moved, escalated=True, now=now)
         return moved
 
