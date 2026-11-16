@@ -3,16 +3,17 @@ continues, and the harness makes for a run it keeps in its own process (no agent
 
 * :func:`schema_problem`: ``expects`` is a JSON Schema at all (checked when the question is
   asked, so a malformed question fails where it was written, not when someone answers it).
-* :func:`answer_problem`: a resolution answers the interrupt, an ``ANSWER`` fits ``expects``
+* :func:`answer_problem`: a resolution answers the interrupt
+  (``InterruptResolution.problem_with``, the contracts' half), an ``ANSWER`` fits ``expects``
   (else picks among ``options``: one option's value, or with ``multiple`` a list of distinct
   values), and the corrected value of an ``EDIT`` of a question fits ``expects``: its
   ``format`` too when it is one of :data:`ANSWER_FORMATS` (a ``date`` is an ISO 8601
   calendar date, ``YYYY-MM-DD``); any other format is not checked. An answer
   the asker's own screen (``component``) collected is held to the same. ``APPROVE``,
-  ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered for the run
-  (``remember="run"``) must be of a tool call. A tool call's edited arguments are checked
-  against the tool's own schema by whoever knows the tool (the harness), since the
-  interrupt does not carry it.
+  ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered beyond
+  its call (``remember="run"`` or ``"always"``) must be of a tool call. A tool call's
+  edited arguments are checked against the tool's own schema by whoever knows the tool
+  (the harness), since the interrupt does not carry it.
 
 Both return why, in words, or ``None``.
 """
@@ -50,14 +51,12 @@ def schema_problem(expects: dict[str, Any] | None) -> str | None:
 
 def answer_problem(interrupt: Interrupt, resolution: InterruptResolution) -> str | None:
     """Why ``resolution`` cannot answer ``interrupt``, or ``None`` when it can."""
-    if not resolution.resolves(interrupt):
-        return f"it answers {resolution.interrupt_id}, not {interrupt.interrupt_id}"
+    if problem := resolution.problem_with(interrupt):
+        return problem
     if resolution.decision is InterruptDecision.ANSWER:
         return _fit_problem(interrupt, resolution.answer, choosing=True)
     if resolution.decision is InterruptDecision.EDIT and interrupt.tool_call is None:
         return _fit_problem(interrupt, resolution.payload, choosing=False)
-    if resolution.remember == "run" and interrupt.tool_call is None:
-        return "only an approval of a tool call is remembered for the run"
     return None
 
 

@@ -168,7 +168,7 @@ A question's options are plain strings or `Option(value, label, description)`
 values. `component` and `props` name the asker's own screen (render `ui` when you have none),
 and `ui_schema` gives form widget hints for `expects`. A resolution may carry a `comment`,
 and an approval of a tool call `remember="run"` (approve calls like it for the rest of the
-run). `trellis.runs.answers.answer_problem(interrupt, resolution)` says, before you send it,
+conversation) or `"always"` (for this user, in every conversation). `trellis.runs.answers.answer_problem(interrupt, resolution)` says, before you send it,
 whether agent-runs will take the answer (it answers `422` otherwise).
 
 ## A run's events, from any replica

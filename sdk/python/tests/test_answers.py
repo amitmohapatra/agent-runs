@@ -144,6 +144,10 @@ def test_an_answer_to_another_interrupt_is_refused() -> None:
         interrupt_id="int_other", run_id=asked.run_id, decision=InterruptDecision.ANSWER
     )
     assert answer_problem(asked, other) == f"it answers int_other, not {asked.interrupt_id}"
+    elsewhere = InterruptResolution(
+        interrupt_id=asked.interrupt_id, run_id="run_other", decision=InterruptDecision.ANSWER
+    )
+    assert answer_problem(asked, elsewhere) == "it answers run run_other, not run_1"
 
 
 def test_expects_must_be_a_json_schema() -> None:
@@ -208,14 +212,15 @@ def test_an_answer_from_the_askers_own_screen_still_fits_expects() -> None:
     assert answer_problem(free, _answer(free, InterruptDecision.ANSWER, answer={"x": 1})) is None
 
 
-def test_only_an_approval_of_a_tool_call_is_remembered_for_the_run() -> None:
+@pytest.mark.parametrize("remember", ["run", "always"])
+def test_only_an_approval_of_a_tool_call_is_remembered_beyond_its_call(remember: str) -> None:
     call = _asked(reason=InterruptReason.APPROVAL, tool_call=ToolCall(tool="refund"))
-    remembered = _answer(call, InterruptDecision.APPROVE, remember="run", comment="ok today")
+    remembered = _answer(call, InterruptDecision.APPROVE, remember=remember, comment="ok today")
     assert answer_problem(call, remembered) is None
     question = _asked()
     assert answer_problem(
-        question, _answer(question, InterruptDecision.APPROVE, remember="run")
-    ) == ("only an approval of a tool call is remembered for the run")
+        question, _answer(question, InterruptDecision.APPROVE, remember=remember)
+    ) == ("only an approval of a tool call is remembered beyond its call")
 
 
 #: Each enforced format: a value it takes, and one it refuses.

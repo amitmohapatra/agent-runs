@@ -478,6 +478,7 @@ async def test_several_picks_are_option_values_and_the_comment_is_kept(client) -
     await _refused(client, run, resolution(run, "ANSWER", answer="eu"), "is not a list")
     await _refused(client, run, resolution(run, "ANSWER", answer=["Europe"]), "not among")
     await _refused(client, run, resolution(run, "APPROVE", remember="run"), "remembered")
+    await _refused(client, run, resolution(run, "APPROVE", remember="always"), "remembered")
     picked = resolution(run, "ANSWER", answer=["us", "eu"], comment="both regions")
     resumed = await client.post(f"/v1/runs/{run['run_id']}/resume", json=picked)
     assert resumed.status_code == 200, resumed.text
