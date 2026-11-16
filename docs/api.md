@@ -428,9 +428,10 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
 
 `decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`).
 `comment` (optional, any decision) is the reviewer's remark, kept with the resolution.
-`remember` is `once` (default) or `run`: an `APPROVE` of a tool call that also approves calls
-like it for the rest of the run; the harness, which sees the calls, keeps that promise, and
-this service keeps the record.
+`remember` is `once` (default), `run` or `always`: an `APPROVE` of a tool call that also
+approves calls like it for the rest of the conversation (`run`) or for this user in every
+conversation (`always`); the harness, which sees the calls, keeps that promise, and this
+service keeps the record.
 **The answer must fit the question** (`trellis.runs.answers`, checked before anything is
 written): an `ANSWER` fits the interrupt's `expects` — its `format` too when it is one of
 `trellis.runs.answers.ANSWER_FORMATS`: `date` (an ISO 8601 calendar date, `YYYY-MM-DD`),
@@ -441,8 +442,9 @@ server enforces the same set whatever else is installed. Any other format (`date
 `options` when it has some: one option's `value` (never its `label`), or with `multiple` a
 list of distinct values. An answer the asker's own screen (`component`) collected is held to
 the same. An `EDIT` of a question (no `tool_call`) carries a `payload` that fits `expects`;
-`APPROVE`, `REJECT` and `CANCEL` carry nothing to check, and `remember: "run"` is refused for
-an interrupt that has no tool call. A misfit is `422
+`APPROVE`, `REJECT` and `CANCEL` carry nothing to check, and `remember: "run"` or `"always"`
+is refused for an interrupt that has no tool call (the contracts'
+`InterruptResolution.problem_with`). A misfit is `422
 VALIDATION` whose detail says what does not fit, and the run keeps waiting. The
 resolution is kept as `last_resolution`, appended to the run's resolution history in the
 same transaction (`GET /v1/runs/{id}/resolutions`), and:
@@ -713,8 +715,9 @@ Body (optional): `{"at": "2026-10-01T06:00:00Z"}`, an instant that has arrived (
 more than a minute ahead, or without an offset). Without it, the fire is for the tick the
 schedule is due for, else for now. Queues the run (`QUEUED`, `idempotency_key =
 "<schedule_id>@<fire_time UTC ISO>"`, the schedule's limits, version, priority and
-concurrency key, and its metadata under `schedule_id`, `schedule_name`, `fire_time`,
-`created_by`) and advances the schedule:
+concurrency key, and its metadata under `schedule_id`, `schedule_name`, `fire_time` (in UTC,
+as in the key) and `created_by`: the run the contracts' `Schedule.run_start` builds) and
+advances the schedule:
 
 ```json
 {"schedule_id": "sch_…", "run_id": "run_…", "fire_time": "…",

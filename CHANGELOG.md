@@ -6,6 +6,37 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Built on the contracts' own helpers; `docs/openapi.json` follows them.** Four rules
+  this repo kept a copy of are now read from `trellis-contracts` (its unreleased `main`,
+  still 0.7.1):
+  * **An approval remembered `always` must be of a tool call.** `answer_problem` asks
+    `InterruptResolution.problem_with` first and keeps only the JSON Schema half. Its own
+    copy refused `remember: "run"` on an interrupt with no tool call and let `"always"`
+    through; both are now `422`, with the detail `only an approval of a tool call is
+    remembered beyond its call` (it ended `for the run`). A resolution naming the right
+    interrupt and another run is told so (`it answers run …, not …`). A client that matches
+    the old detail matches the new one.
+  * **A fired run is `Schedule.run_start`'s.** `Firing` no longer copies the schedule's
+    fields itself. The stored run is the same, with one exception: `metadata.fire_time` is
+    the instant in UTC, as in the `idempotency_key`; for `POST /v1/schedules/{id}/fire` with
+    an `at` in another offset it was `at` as spelled. The ticker's fires were in UTC already.
+  * **A record a newer version wrote is read.** The SDK (`start`, `get`, `claim`, `pause`,
+    `resume`, `finish`, `cancel`, `release`, every `schedules` call and a `FireResult`'s
+    schedule) and the store read a run and a schedule with `RunRecord.read`
+    and `Schedule.read`: a field a later contracts patch adds inside `awaiting` or
+    `last_resolution` is dropped, where it failed the read (a `ValidationError` in the
+    client, a `500` from a replica behind in a rolling deploy). What a request sends is
+    validated as before. Where an `Interrupt` is read outside a record it still refuses
+    such a field: a listing's `RunSummary` and the resolution history (SDK and store), and
+    in the store the answer to such a run and its deadline sweep.
+  * **`_move` is pinned to `RunRecord.moved`.** The store moves rows, not records, so it
+    keeps `_move`; a test holds the two to the same refusals and the same clearing of
+    `awaiting` and the checkpoint over every pair of statuses.
+
+  `docs/openapi.json`: `Schedule.last_error` is an `AgentError` (the JSON agent-runs wrote
+  is unchanged; the SDK returns `schedule.last_error.code`, not `["code"]`), and four
+  descriptions changed. `domain.schedules.idempotency_key` is gone (`run_start` builds the
+  key).
 * **The run store announces the changes it makes.** Whether a run change was announced to
   webhooks was decided outside the store, at six call sites (five routes and the ticker),
   each of which had to remember it. `RunStore` now writes the outbox row at the end of the
