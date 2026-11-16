@@ -202,7 +202,11 @@ async def test_a_segmented_checkpoint_reads_as_its_segment_list(app: Any, client
     assert PayloadRef.model_validate(got["checkpoint"][SEGMENTS][0]).ref == segment["ref"]
 
 
-async def test_an_ended_runs_compacted_log_streams_and_replays(app: Any, client: Any) -> None:
+async def test_a_log_compacted_into_one_object_still_streams_and_replays(
+    app: Any, client: Any
+) -> None:
+    """The format before logs were chunked: ``events_ref`` is the reference of one object
+    holding every event. Runs compacted then are read as before."""
     run = (await client.post("/v1/runs", json=started())).json()
     run_id = run["run_id"]
     sent = [_event(run_id, n) for n in range(1, 6)]

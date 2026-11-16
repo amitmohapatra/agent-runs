@@ -6,6 +6,15 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A page of an ended run's events reads a page's worth, not the whole log.** The ticker
+  compacted an ended run's event log into one object, so every page of
+  `GET /v1/runs/{id}/events`, and every 500 events of its stream, downloaded and decoded the
+  whole log: reading a log of n events cost n²/500 of them. A log is now compacted into
+  objects of 500 events (`EVENT_CHUNK`), and a page reads the one it starts in and at most
+  the next. `agent_runs.events_ref` lists the objects (`{"chunks": [{"through", "ref"}]}`);
+  a log compacted before is still one object and is read as before, so there is no
+  migration. Deploy the API before the ticker: an API replica of the previous version
+  cannot read a log the new ticker compacted.
 * **A sweep reads none of its runs' payloads.** Each of the ticker's five run sweeps returned
   full records, reading the input, output, last answer, checkpoint and question payload of up
   to 100 runs from the blob store, only to announce them, and looked each run's

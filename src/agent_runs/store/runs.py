@@ -9,6 +9,7 @@ interrupt or a run that worked too long is a test rather than a wait.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -40,6 +41,7 @@ from agent_runs.config.constants import (
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
     ERROR_RETRY_CAP,
+    EVENT_CHUNK,
     LAPSE_RETRY_BASE,
     LAPSE_RETRY_CAP,
     MAX_ERROR_RETRIES,
@@ -213,6 +215,22 @@ _INPUT, _OUTPUT, _AWAITING, _ANSWER, _CHECKPOINT, _EVENTS = (
     "checkpoint",
     "events",
 )
+
+
+#: In ``events_ref``, the objects of a compacted event log, oldest first: the last position
+#: each holds (``through``) and its reference (``ref``).
+_CHUNKS = "chunks"
+
+
+def _chunks(events_ref: dict[str, Any] | None) -> list[tuple[int, dict[str, Any]]]:
+    """A compacted event log's objects as ``(last position, reference)``, oldest first; none
+    for a log not compacted. A log compacted before logs were chunked is one object, the
+    reference itself, holding every event."""
+    if events_ref is None:
+        return []
+    if _CHUNKS not in events_ref:
+        return [(sys.maxsize, events_ref)]
+    return [(chunk["through"], chunk["ref"]) for chunk in events_ref[_CHUNKS]]
 
 
 def _dumped(ref: PayloadRef | None) -> dict[str, Any] | None:
@@ -1305,17 +1323,24 @@ class RunStore:
     async def _compacted_events(
         self, run_id: str, *, after: int, limit: int
     ) -> list[RunEventEntry]:
-        """An ended run's events from its compacted log (``[[position, event], ...]``), read
-        after the rows came back empty: a compaction that committed in between is seen."""
-        ref = await self._session.scalar(select(RunRow.events_ref).where(RunRow.run_id == run_id))
-        if ref is None:
-            return []
-        logged = await self._payloads.get(ref)
-        return [
-            RunEventEntry(position=position, event=RunEvent.model_validate(event))
-            for position, event in logged
-            if position > after
-        ][:limit]
+        """An ended run's events from its compacted log (objects of ``[[position, event],
+        ...]``), read after the rows came back empty: a compaction that committed in between
+        is seen. Only the objects the page spans are read: the one holding the first
+        position past ``after``, and those after it until the page is full."""
+        logged = await self._session.scalar(
+            select(RunRow.events_ref).where(RunRow.run_id == run_id)
+        )
+        entries: list[RunEventEntry] = []
+        for through, ref in _chunks(logged):
+            if len(entries) >= limit:
+                break
+            if through > after:
+                entries += [
+                    RunEventEntry(position=position, event=RunEvent.model_validate(event))
+                    for position, event in await self._payloads.get(ref)
+                    if position > after
+                ]
+        return entries[:limit]
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
         """Runs that just ended start their artifacts' retention, and let go of their
@@ -1613,10 +1638,11 @@ class RunStore:
         return [(tenant, run) for tenant, run in rows.all()]
 
     async def compact_events(self, tenant_id: str, run_id: str) -> bool:
-        """Move an ended run's event log, every event at its position, into one object and
-        delete its rows. Nothing appends to an ended run, so the log read first is the whole
-        log; the run's row is locked only to swap the rows for the reference. Returns
-        whether this call compacted it (another ticker may have)."""
+        """Move an ended run's event log, every event at its position, into objects of
+        ``EVENT_CHUNK`` events each (``events_ref`` lists them: :func:`_chunks`) and delete
+        its rows. Nothing appends to an ended run, so the log read first is the whole log;
+        the run's row is locked only to swap the rows for the references. Returns whether
+        this call compacted it (another ticker may have)."""
         logged = (
             await self._session.execute(
                 select(RunEventRow.position, RunEventRow.event)
@@ -1624,7 +1650,8 @@ class RunStore:
                 .order_by(RunEventRow.position)
             )
         ).all()
-        ref = await self._payloads.put(tenant_id, [[p, e] for p, e in logged])
+        chunks = [logged[at : at + EVENT_CHUNK] for at in range(0, len(logged), EVENT_CHUNK)]
+        refs = [await self._payloads.put(tenant_id, [[p, e] for p, e in chunk]) for chunk in chunks]
         row = await self._session.scalar(
             select(RunRow)
             .where(RunRow.run_id == run_id, RunRow.events_ref.is_(None))
@@ -1632,7 +1659,12 @@ class RunStore:
         )
         if row is None:
             return False
-        row.events_ref = ref.model_dump()
-        await self._link(run_id, _EVENTS, ref)
+        row.events_ref = {
+            _CHUNKS: [
+                {"through": chunk[-1].position, "ref": ref.model_dump()}
+                for chunk, ref in zip(chunks, refs, strict=True)
+            ]
+        }
+        await self._link(run_id, _EVENTS, *refs)
         await self._session.execute(delete(RunEventRow).where(RunEventRow.run_id == run_id))
         return True

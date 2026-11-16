@@ -70,6 +70,9 @@ DB_STATEMENT_TIMEOUT_MS: Final = 15_000
 
 #: The most events one append may carry.
 MAX_EVENTS_PER_APPEND: Final = 500
+#: Events per object of an ended run's compacted log: a page, so reading one (at most
+#: ``MAX_PAGE`` events) reads the object it starts in and at most the next, never the log.
+EVENT_CHUNK: Final = MAX_PAGE
 #: How often a stream looks for new events of its run, and how long it stays quiet before it
 #: sends a comment, so proxies and load balancers keep the connection open.
 EVENT_POLL_SECONDS: Final = 0.5

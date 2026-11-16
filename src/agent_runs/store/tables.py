@@ -54,7 +54,7 @@ class RunRow(Base):
     #: the run's payloads, by reference to the blob store (``PayloadRef``s,
     #: ``agent_runs.blob.payloads``): its input, output, last answer, the interrupt's
     #: ``payload`` (``awaiting_ref``), a whole checkpoint or its segments (cleared when the run
-    #: ends), and an ended run's compacted event log (``events_ref``)
+    #: ends), and an ended run's compacted event log (``events_ref``: its objects' references)
     input_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     output_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)

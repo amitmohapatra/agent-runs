@@ -1,7 +1,7 @@
 """Run payloads are written by reference: a run's rows hold no payload, reads answer the JSON
 that was sent, a checkpoint may be a list of segments the worker uploaded, an unchanged save
 stores nothing new, a write that never commits leaves only an orphan the sweep deletes, and an
-ended run's events become one object."""
+ended run's events become objects, a page's worth each."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from agent_runs.api.routers import artifacts
 from agent_runs.api.routers.artifacts import MAX_READ_OBJECTS
 from agent_runs.blob.payloads import ORPHAN_AGE
 from agent_runs.config.settings import BlobSettings
+from agent_runs.store import runs
 from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import (
     PayloadBlobRow,
@@ -253,7 +254,7 @@ async def test_a_webhook_body_is_sent_as_it_was_announced(
 
 
 # ------------------------------------------------------------------ event compaction
-async def test_an_ended_runs_events_become_one_object_and_replay_the_same(
+async def test_an_ended_runs_events_become_objects_and_replay_the_same(
     app: Any, client: Any, ticker: Any
 ) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
@@ -278,6 +279,43 @@ async def test_an_ended_runs_events_become_one_object_and_replay_the_same(
     replay = await client.get(f"/v1/runs/{run_id}/events/stream", headers={"Last-Event-ID": "3"})
     assert replay.text == stream
     assert await _links(app, run_id) == {"events": 1}
+
+
+async def test_a_page_of_a_compacted_log_reads_only_the_objects_it_spans(
+    app: Any, client: Any, ticker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compacted log is an object per ``EVENT_CHUNK`` events, so a page reads the chunk it
+    starts in (and the next, when it runs past its end), never the whole log; a run that
+    logged nothing has no object at all."""
+    monkeypatch.setattr(runs, "EVENT_CHUNK", 3)
+    run_id = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    events = [_event(run_id, n) for n in range(1, 9)]
+    await client.post(f"/v1/runs/{run_id}/events", json={"events": events})
+    await client.post(f"/v1/runs/{run_id}/finish", json={"status": "SUCCESS"})
+    silent = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    await client.post(f"/v1/runs/{silent}/finish", json={"status": "SUCCESS"})
+    pages = [(0, 3), (3, 3), (1, 3), (6, 500), (8, 500), (0, 500)]
+    before = [await _page(client, run_id, after, limit) for after, limit in pages]
+    stream = (await client.get(f"/v1/runs/{run_id}/events/stream")).text
+
+    assert (await ticker.tick()).compacted == 2
+    assert await _links(app, run_id) == {"events": 3} and await _links(app, silent) == {}
+    reads = _counting_reads(app, monkeypatch)
+    spanned = []
+    for after, limit in pages:
+        reads.clear()
+        assert await _page(client, run_id, after, limit) == before[pages.index((after, limit))]
+        spanned.append(len(reads))
+    assert spanned == [1, 1, 2, 1, 0, 3]
+    assert (await client.get(f"/v1/runs/{run_id}/events/stream")).text == stream
+    assert await _page(client, silent, 0, 500) == b"[]"
+    assert (await ticker.tick()).compacted == 0
+
+
+async def _page(client: Any, run_id: str, after: int, limit: int) -> bytes:
+    page = await client.get(f"/v1/runs/{run_id}/events", params={"after": after, "limit": limit})
+    assert page.status_code == 200, page.text
+    return page.content
 
 
 async def test_compaction_another_ticker_won_changes_nothing(app: Any, client: Any) -> None:

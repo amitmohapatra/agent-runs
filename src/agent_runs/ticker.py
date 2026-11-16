@@ -267,8 +267,8 @@ class Ticker:
         return purged
 
     async def _compact_events(self) -> int:
-        """Move ended runs' event logs from rows to one object each
-        (``RunStore.compact_events``), a batch per tick."""
+        """Move ended runs' event logs from rows to objects (``RunStore.compact_events``), a
+        batch per tick."""
         async with self._sessions() as db:
             ended = await RunStore(db).ended_uncompacted(limit=SWEEP_BATCH)
         compacted = 0
