@@ -1466,7 +1466,7 @@
                 "type": "null"
               }
             ],
-            "description": "The failure a RUN_ERROR or a failed RUN_FINISHED reports; None otherwise."
+            "description": "The failure a RUN_ERROR, or a RUN_FINISHED whose outcome is error, timeout or rejected, reports; refused on any other event."
           },
           "event_id": {
             "description": "Event id, 'evt_' plus 32 hex characters unless given.",
@@ -1706,7 +1706,7 @@
         "type": "object"
       },
       "RunRecord": {
-        "description": "A run as a run store keeps it: the start plus where it is. ``awaiting`` is the\ninterrupt a paused run waits on and nothing else; ``error`` belongs to a failed ending.\n``checkpoint`` is opaque executor state (the resume journal: answered asks, completed tool\noutputs, a framework's own resume state) written when the run pauses, returned on read and\nclaim so another worker resumes without repeating side effects, and cleared when the run\nfinishes; the service bounds its size. Read back from a store, so unknown columns are\nignored rather than refused.",
+        "description": "A run as a run store keeps it: the start plus where it is. ``awaiting`` is the\ninterrupt a paused run waits on and nothing else; ``error`` belongs to a failed ending.\n``checkpoint`` is opaque executor state (the resume journal: answered asks, completed tool\noutputs, a framework's own resume state) written when the run pauses, returned on read and\nclaim so another worker resumes without repeating side effects, and cleared when the run\nfinishes unless its caller asks the store to keep it (to rewind the ended run from); the\nservice bounds its size. Read back from a store, so unknown columns are ignored rather\nthan refused; :meth:`read` ignores them in ``awaiting`` and ``last_resolution`` too.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent that executes the run.",
@@ -1760,7 +1760,7 @@
                 "type": "null"
               }
             ],
-            "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; never on a final run. Size bounded by the service.",
+            "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; on a final run only when its caller asked the store to keep it. Size bounded by the service.",
             "title": "Checkpoint"
           },
           "concurrency_key": {
@@ -1808,7 +1808,7 @@
                 "type": "null"
               }
             ],
-            "description": "Why the run failed; only on ERROR, TIMEOUT and REJECTED, None otherwise."
+            "description": "Why the run failed. Only an ERROR, TIMEOUT or REJECTED run may carry one, and a record of one without it is valid; refused on any other status."
           },
           "idempotency_key": {
             "anyOf": [
@@ -2188,15 +2188,13 @@
           "last_error": {
             "anyOf": [
               {
-                "additionalProperties": true,
-                "type": "object"
+                "$ref": "#/components/schemas/AgentError"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "The last fire failure as a JSON AgentError; None after a successful fire.",
-            "title": "Last Error"
+            "description": "Why the last fire could not queue a run; None after a successful fire."
           },
           "last_fired_at": {
             "anyOf": [
@@ -2350,7 +2348,7 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can.",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can\n(:meth:`Schedule.run_start` is that copy).",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
