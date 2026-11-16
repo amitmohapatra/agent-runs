@@ -45,7 +45,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from trellis.contracts.ids import now as clock
-from trellis.contracts.runs import RunRecord, RunStatus
+from trellis.contracts.runs import RunRecord
 
 from agent_runs import heartbeat
 from agent_runs.blob import BlobStore, open_blob_store
@@ -59,7 +59,6 @@ from agent_runs.config.constants import (
 )
 from agent_runs.config.settings import get_settings
 from agent_runs.domain.schedules import FireFailed, FireSkipped
-from agent_runs.domain.webhooks import WebhookEvent
 from agent_runs.firing import Firing
 from agent_runs.observability import metrics
 from agent_runs.observability.logging import configure_logging
@@ -80,7 +79,8 @@ _OUTAGE = (OperationalError, InterfaceError, PoolTimeout, OSError)
 
 
 class RunSweep(Protocol):
-    """One of ``RunStore``'s sweeps: the runs it moved, at most ``limit`` of them."""
+    """One of ``RunStore``'s sweeps: the runs it moved, at most ``limit`` of them, without
+    their payloads."""
 
     async def __call__(
         self, store: RunStore, /, *, now: datetime, limit: int
@@ -202,9 +202,7 @@ class Ticker:
         async with self._sessions() as db:
             store = RunStore(db, max_run_seconds=self._max_run_seconds)
             moved = await sweep(store, now=now, limit=SWEEP_BATCH)
-            for run in moved:
-                event = WebhookEvent.ESCALATED if run.status is RunStatus.PAUSED else None
-                await WebhookStore(db).announce(run, event, now=now)
+            await WebhookStore(db).announce(*moved, escalated=True, now=now)
             await db.commit()
         return len(moved)
 

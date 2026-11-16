@@ -8,8 +8,9 @@ import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import OperationalError
 from trellis.runs.blob import FilesystemBlobStore
 
@@ -325,3 +326,55 @@ async def test_an_overdue_interrupt_that_cannot_be_read_ends_its_run(app, client
     assert (ended["status"], ended["error"]["code"]) == ("TIMEOUT", "interrupt_unreadable")
     plain = (await client.get(f"/v1/runs/{readable}")).json()
     assert (plain["status"], plain["error"]["code"]) == ("TIMEOUT", "interrupt_deadline")
+
+
+# ------------------------------------------------------------------ what a sweep costs
+
+
+async def test_a_sweep_announces_its_runs_reading_none_of_their_payloads(
+    app, client, ticker, receiver, monkeypatch
+) -> None:
+    """A sweep moves up to a batch of runs to announce them: it reads nothing of theirs from
+    the blob store (the only read of the tick is the question's payload, for its delivery),
+    and looks its runs' subscriptions up once, not once per run."""
+    await subscribe(client)
+    late = at(1).isoformat()
+    timed_out = [
+        (await client.post("/v1/runs", json=started(input={"n": n}, deadline=late))).json()[
+            "run_id"
+        ]
+        for n in range(3)
+    ]
+    waiting = (await client.post("/v1/runs", json=started(input={"n": 3}))).json()["run_id"]
+    asked = pause(waiting, payload={"rows": [1, 2]}, deadline=late, escalate_to="role:managers")
+    assert (await client.post(f"/v1/runs/{waiting}/pause", json=asked)).status_code == 200
+    await ticker.tick()
+    receiver.received.clear()
+
+    read: list[str] = []
+    get_encoded = app.state.payloads.get_encoded
+
+    async def counted(ref: Any) -> bytes:
+        read.append(ref.ref)
+        return await get_encoded(ref)
+
+    monkeypatch.setattr(app.state.payloads, "get_encoded", counted)
+    lookups = 0
+
+    def count(_conn: Any, _cursor: Any, statement: str, *_: Any) -> None:
+        nonlocal lookups
+        lookups += "FROM webhooks" in statement and "webhook_deliveries" not in statement
+
+    event.listen(app.state.engine.sync_engine, "before_cursor_execute", count)
+    try:
+        report = await ticker.tick(now=at(2))
+    finally:
+        event.remove(app.state.engine.sync_engine, "before_cursor_execute", count)
+    assert (report.timed_out, report.escalated, report.sent) == (3, 1, 4)
+    assert lookups == 2, "one per sweep that moved runs"
+    assert len(read) == 1
+    sent = {e["data"]["run"]["run_id"]: e for e in receiver.events()}
+    assert {sent[run_id]["type"] for run_id in timed_out} == {"run.finished"}
+    assert sent[waiting]["type"] == "run.escalated"
+    assert sent[waiting]["data"]["run"]["awaiting"]["payload"] == {"rows": [1, 2]}
+    assert sent[waiting]["data"]["run"]["assignee"] == "role:managers"

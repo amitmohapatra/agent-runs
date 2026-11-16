@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A sweep reads none of its runs' payloads.** Each of the ticker's five run sweeps returned
+  full records, reading the input, output, last answer, checkpoint and question payload of up
+  to 100 runs from the blob store, only to announce them, and looked each run's
+  subscriptions up on its own: up to about 500 object reads and 200 statements a sweep. A
+  sweep's runs now come back without their payloads, and `WebhookStore.announce` takes them
+  all at once (three statements however many). A swept run whose payload object is lost no
+  longer fails its sweep. The events delivered are unchanged. Nothing to do.
 * **A fire the blob store cannot take is recorded on its schedule.** Only a database error
   failed a fire; a blob store that did not answer when the run's input was written escaped,
   nothing was recorded, and the same schedule was tried first, and failed, on every tick

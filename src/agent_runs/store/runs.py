@@ -167,29 +167,35 @@ _REFS = {
 }
 
 
+def _fields(row: RunRow, now: datetime, places: Mapping[str, datetime]) -> dict[str, Any]:
+    """A record's fields as the row alone gives them, placed as ``places`` says (by run id;
+    none for a run with no key): no payload, each of which the row keeps by reference."""
+    fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
+    fields["placed_at"] = places.get(row.run_id)
+    fields["metadata"] = row.run_metadata or {}
+    fields["worked_seconds"] = _worked(row, now)
+    if row.checkpoint_segments is not None:
+        fields["checkpoint"] = {SEGMENTS: row.checkpoint_segments}
+    if row.awaiting is not None:
+        fields["awaiting"] = dict(row.awaiting)
+    return fields
+
+
 async def _records(
     payloads: PayloadStore,
     rows: Sequence[RunRow],
     now: datetime,
     places: Mapping[str, datetime],
 ) -> list[RunRecord]:
-    """The runs' records, every payload the rows refer to read in (all at once), each placed
-    as ``places`` says (by run id; none for a run with no key)."""
+    """The runs' records, every payload the rows refer to read in (all at once)."""
     wanted: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     records: list[dict[str, Any]] = []
     for row in rows:
-        fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
-        fields["placed_at"] = places.get(row.run_id)
-        fields["metadata"] = row.run_metadata or {}
-        fields["worked_seconds"] = _worked(row, now)
+        fields = _fields(row, now, places)
         for name, column in _REFS.items():
-            fields[name] = None
             if (ref := getattr(row, column)) is not None:
                 wanted.append((fields, name, ref))
-        if row.checkpoint_segments is not None:
-            fields["checkpoint"] = {SEGMENTS: row.checkpoint_segments}
         if row.awaiting_ref is not None and row.awaiting is not None:
-            fields["awaiting"] = dict(row.awaiting)
             wanted.append((fields["awaiting"], "payload", row.awaiting_ref))
         records.append(fields)
     values = await payloads.get_many(ref for _, _, ref in wanted)
@@ -1178,10 +1184,13 @@ class RunStore:
         return len(gone)
 
     async def _swept(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
-        """What every sweep ends with: the rows it moved, written, as records."""
+        """What every sweep ends with: the rows it moved, written, as records without their
+        payloads (input, output, answer, checkpoint, the question's payload). A sweep's runs
+        are announced, which takes none of them: a batch is not read from the blob store."""
         await self._ended(rows, now)
         await self._session.flush()
-        return await self._records(rows, now)
+        places = await self._places(rows)
+        return [RunRecord.model_validate(_fields(row, now, places)) for row in rows]
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (
@@ -1492,13 +1501,15 @@ class RunStore:
         return (await self._records([row], now))[0]
 
     async def _records(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
-        """The rows' records, the places of those that share a key read in one statement."""
+        return await _records(self._payloads, rows, now, await self._places(rows))
+
+    async def _places(self, rows: Sequence[RunRow]) -> dict[str, datetime]:
+        """The places of the rows that share a key, by run id, read in one statement."""
         keyed = [row.run_id for row in rows if row.concurrency_key is not None]
-        places: dict[str, datetime] = {}
-        if keyed:
-            placed = select(RunRow.run_id, _placed_at(RunRow)).where(RunRow.run_id.in_(keyed))
-            places = dict((await self._session.execute(placed)).tuples().all())
-        return await _records(self._payloads, rows, now, places)
+        if not keyed:
+            return {}
+        placed = select(RunRow.run_id, _placed_at(RunRow)).where(RunRow.run_id.in_(keyed))
+        return dict((await self._session.execute(placed)).tuples().all())
 
     # ------------------------------------------------------------------ payloads
     async def _put(self, tenant_id: str, value: Any) -> PayloadRef | None:
