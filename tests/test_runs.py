@@ -493,7 +493,10 @@ async def test_several_picks_are_option_values_and_the_comment_is_kept(client) -
     assert [option["label"] for option in run["awaiting"]["options"]] == ["Europe", "United States"]
     assert run["awaiting"]["multiple"] is True
     await _refused(client, run, resolution(run, "ANSWER", answer="eu"), "is not a list")
-    await _refused(client, run, resolution(run, "ANSWER", answer=["Europe"]), "not among")
+    # a label handed back is its option (``answers.meant``); part of one is no option
+    await _refused(client, run, resolution(run, "ANSWER", answer=["Europ"]), "not among")
+    twice = resolution(run, "ANSWER", answer=["eu", " europe "])
+    await _refused(client, run, twice, "more than once")
     await _refused(client, run, resolution(run, "APPROVE", remember="run"), "remembered")
     await _refused(client, run, resolution(run, "APPROVE", remember="always"), "remembered")
     picked = resolution(run, "ANSWER", answer=["us", "eu"], comment="both regions")

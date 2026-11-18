@@ -6,6 +6,18 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **An option handed back is that option.** `answers.meant(interrupt, value)` reads an
+  answer to a question with `options`: a string equal to an option's value or label once case
+  and spacing are set aside (`" sup-04 (lyon MILLS)"` for `SUP-04 (Lyon Mills)`) is that
+  option's value — with `multiple`, each string of a list; anything else is left as it was
+  given. `answer_problem` reads an answer so before it checks it, so `POST
+  /v1/runs/{id}/resume` takes an option's label where it took its value only (it was a `422`,
+  `the answer 'Globex GmbH' is not one of the options ['ACME', 'globex']`), and a pick of the
+  same option twice by value and label is `the answer picks an option more than once`.
+  Nothing is guessed: part of an option ("SUP-04"), "not SUP-04", "the second one" are no
+  option. The resolution is stored as it was sent: whoever reads it reads it with `meant`
+  (the harness does). A question that takes words beside its options says so in `expects`
+  (a string), as before.
 * **Built on the contracts' own helpers; `docs/openapi.json` follows them.** Four rules
   this repo kept a copy of are now read from `trellis-contracts` (its unreleased `main`,
   still 0.7.1):

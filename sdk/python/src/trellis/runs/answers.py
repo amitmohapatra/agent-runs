@@ -3,6 +3,11 @@ continues, and the harness makes for a run it keeps in its own process (no agent
 
 * :func:`schema_problem`: ``expects`` is a JSON Schema at all (checked when the question is
   asked, so a malformed question fails where it was written, not when someone answers it).
+* :func:`meant`: the option an answer hands back — equal to an option's value or label,
+  whatever its case and spacing — as that option's value (with ``multiple``, each pick); any
+  other answer as it was given. Nothing is guessed from words ("SUP-04" of "SUP-04 (Lyon
+  Mills)", "not SUP-04", "the second one"): whoever asked reads them (an agent's model).
+  Both checks below read an answer so.
 * :func:`answer_problem`: a resolution answers the interrupt
   (``InterruptResolution.problem_with``, the contracts' half), an ``ANSWER`` fits ``expects``
   (else picks among ``options``: one option's value, or with ``multiple`` a list of distinct
@@ -60,7 +65,38 @@ def answer_problem(interrupt: Interrupt, resolution: InterruptResolution) -> str
     return None
 
 
+def meant(interrupt: Interrupt, value: Any) -> Any:
+    """``value`` with an option it hands back as that option's value: a string equal to an
+    option's value or label once case and spacing are set aside (with ``multiple``, each string
+    of a list); anything else as it is."""
+    if not interrupt.options:
+        return value
+    if interrupt.multiple:
+        return [_option_of(interrupt, v) for v in value] if isinstance(value, list) else value
+    return _option_of(interrupt, value)
+
+
+def _option_of(interrupt: Interrupt, value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    said = _plain(value)
+    for option in interrupt.options:
+        if isinstance(option, str):
+            if _plain(option) == said:
+                return option
+        elif said in (_plain(option.value), _plain(option.label or option.value)):
+            return option.value
+    return value
+
+
+def _plain(text: str) -> str:
+    """``text`` as an option is compared: lower case, its words one space apart."""
+    return " ".join(text.casefold().split())
+
+
 def _fit_problem(interrupt: Interrupt, value: Any, *, choosing: bool) -> str | None:
+    if choosing:
+        value = meant(interrupt, value)
     expects = interrupt.expects
     if expects is not None:
         if problem := schema_problem(expects):
