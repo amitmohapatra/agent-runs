@@ -9,6 +9,7 @@ per key per interval. Only a hash of each key is held. The contract is in docs/a
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from agent_runs.config.constants import (
     KEY_MAX_CONNECTIONS,
     KEY_MAX_KEEPALIVE,
     KEY_NEGATIVE_CACHE_SECONDS,
+    KEY_STALE_SECONDS,
     MAX_CACHED_KEYS,
 )
 from agent_runs.domain.errors import Forbidden, ServiceError, Unauthorized, Unavailable
@@ -62,7 +64,9 @@ class KeyInfo(BaseModel):
 
 
 class KeyRegistry:
-    """The Memory Service's key registry, behind a bounded TTL cache."""
+    """The Memory Service's key registry, behind a bounded TTL cache: one question per key at
+    a time (the requests that need it meanwhile share its answer), and a key it accepted kept
+    for :data:`KEY_STALE_SECONDS` past its entry while it cannot be asked."""
 
     def __init__(
         self,
@@ -85,6 +89,8 @@ class KeyRegistry:
         self._clock = clock
         #: sha256(key) -> (expires at, the answer): a KeyInfo, or the refusal to raise
         self._cache: OrderedDict[str, tuple[float, KeyInfo | ServiceError]] = OrderedDict()
+        #: sha256(key) -> the question being asked of the registry about it now
+        self._asking: dict[str, asyncio.Future[KeyInfo | ServiceError]] = {}
 
     async def resolve(self, api_key: str) -> KeyInfo:
         """The key's identity. ``Unauthorized`` for a key the registry does not know (or
@@ -97,15 +103,43 @@ class KeyRegistry:
             self._cache.move_to_end(digest)
             answer = cached[1]
         else:
-            answer = await self._introspect(api_key)
-            ttl = KEY_CACHE_SECONDS if isinstance(answer, KeyInfo) else KEY_NEGATIVE_CACHE_SECONDS
-            self._cache[digest] = (now + ttl, answer)
-            self._cache.move_to_end(digest)
-            while len(self._cache) > MAX_CACHED_KEYS:
-                self._cache.popitem(last=False)
+            answer = await self._asked(api_key, digest, cached)
         if isinstance(answer, ServiceError):
             raise answer
         return answer
+
+    async def _asked(
+        self, api_key: str, digest: str, cached: tuple[float, KeyInfo | ServiceError] | None
+    ) -> KeyInfo | ServiceError:
+        """The registry's answer about the key, asked once however many requests need it now,
+        and cached; while it cannot be asked, the key's last accepted answer within
+        :data:`KEY_STALE_SECONDS` of its entry's end (``Unavailable`` otherwise)."""
+        asking = self._asking.get(digest)
+        if asking is None:
+            asking = asyncio.ensure_future(self._introspect(api_key))
+            self._asking[digest] = asking
+            asking.add_done_callback(lambda done: self._asked_done(digest, done))
+        try:
+            answer = await asyncio.shield(asking)
+        except Unavailable:
+            ended, known = cached if cached is not None else (0.0, None)
+            if isinstance(known, KeyInfo) and self._clock() - ended < KEY_STALE_SECONDS:
+                log.warning("keys.registry_unavailable_served_cached")
+                return known
+            raise
+        ttl = KEY_CACHE_SECONDS if isinstance(answer, KeyInfo) else KEY_NEGATIVE_CACHE_SECONDS
+        self._cache[digest] = (self._clock() + ttl, answer)
+        self._cache.move_to_end(digest)
+        while len(self._cache) > MAX_CACHED_KEYS:
+            self._cache.popitem(last=False)
+        return answer
+
+    def _asked_done(self, digest: str, done: asyncio.Future[KeyInfo | ServiceError]) -> None:
+        """The question about a key is answered: the next one asks again. Its failure is read
+        here too, so one nobody waits for any more is not reported as never retrieved."""
+        # a new question about the key is asked only once this one is gone from here
+        self._asking.pop(digest, None)
+        _ = done.cancelled() or done.exception()
 
     async def _introspect(self, api_key: str) -> KeyInfo | ServiceError:
         try:

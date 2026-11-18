@@ -188,7 +188,12 @@ Other fields are ignored. A missing required field is a malformed answer (`503`)
 Caching (per process, keyed by the SHA-256 of the key; the key itself is not kept): a `200`
 answer for 60 s (`KEY_CACHE_SECONDS`, so a revocation takes effect here within a minute), a
 `401`/`403` answer for 10 s (`KEY_NEGATIVE_CACHE_SECONDS`), at most 10 000 keys (least
-recently used evicted).
+recently used evicted). One question per key at a time: the requests that need a key while
+it is asked share the answer. While the registry cannot be asked (unreachable, or a `5xx`), a
+key it accepted keeps working for up to 300 s past its entry (`KEY_STALE_SECONDS`), so a brief
+outage or overload of the Memory Service does not stop runs' heartbeats; a revocation then
+takes effect within six minutes at most. A refused key is never kept past its entry, and past
+the grace the outage is a `503`, as before.
 
 ## Runs
 

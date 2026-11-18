@@ -6,6 +6,13 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A brief Memory Service outage or overload no longer cancels runs.** The key registry
+  client asks once per key at a time (the requests that need it meanwhile share the answer:
+  a cache entry ending under load no longer sends every request to a busy registry), and a key
+  the registry accepted keeps working for up to `KEY_STALE_SECONDS` (300 s) past its entry
+  while the registry cannot be asked — heartbeats go on instead of failing `503` and losing
+  the run. A revocation takes effect within six minutes at most during such an outage (one
+  minute otherwise); a refused key is never kept. Nothing to do for a caller.
 * **An option handed back is that option.** `answers.meant(interrupt, value)` reads an
   answer to a question with `options`: a string equal to an option's value or label once case
   and spacing are set aside (`" sup-04 (lyon MILLS)"` for `SUP-04 (Lyon Mills)`) is that

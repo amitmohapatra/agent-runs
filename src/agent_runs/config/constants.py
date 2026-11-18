@@ -27,6 +27,12 @@ READY_TIMEOUT_SECONDS: Final = 3.0
 #: How long an introspected key is trusted before the registry is asked again: the longest
 #: a revoked key keeps working here.
 KEY_CACHE_SECONDS: Final = 60.0
+#: How long past its cache entry a key the registry accepted keeps working while the
+#: registry cannot be asked (unreachable, or answering 5xx): a brief outage or overload of the
+#: memory service does not stop every run's heartbeat. The longest a key revoked during such an
+#: outage keeps working here is this plus :data:`KEY_CACHE_SECONDS`; a refused key is never
+#: kept past its own entry.
+KEY_STALE_SECONDS: Final = 300.0
 #: How long a refused key stays refused without asking again.
 KEY_NEGATIVE_CACHE_SECONDS: Final = 10.0
 KEY_INTROSPECTION_TIMEOUT_SECONDS: Final = 3.0
