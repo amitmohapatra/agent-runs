@@ -115,7 +115,7 @@ sections after the table have the bodies and the exact semantics.
 |---|---|---|---|
 | `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` (a platform key may omit `X-Trellis-Tenant`) | `200 Claimed`, `204` nothing queued that may run now | `422` |
-| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?, events?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/release` | `{worker_id, checkpoint?}` | `200 RunRecord` (`QUEUED`; a repeat answers the run) | `404`, `409 LEASE_LOST` not the lease holder or run not `RUNNING`, `413`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `403` the key may not answer this run ([who may](#who-may-answer-a-paused-run)), `404`, `409` not `PAUSED` or another interrupt, `422` another run |
@@ -315,7 +315,13 @@ past `RUNS__SERVICE__MAX_PAYLOAD_BYTES`, nothing saved). It comes back as `RunRe
 next claim and on every read, so when this worker dies the next attempt resumes from it and
 repeats no side effect the journal records. Only the lease holder saves one (`409
 LEASE_LOST` otherwise, nothing saved); sending the same checkpoint again is harmless. A
-worker saves progress after each side-effecting step, on the heartbeat it sends anyway. `409 LEASE_LOST` means the lease is no longer
+worker saves progress after each side-effecting step, on the heartbeat it sends anyway.
+**Events with it:** `events` (optional, at most 500) are added to the run's log in the same
+transaction, as an append adds them (in order, one already logged skipped, each naming this
+run: `422` otherwise, and nothing — checkpoint included — is saved): the progress a crash
+keeps and the events that show it are saved together, so a worker killed right after a step
+leaves neither a step its log never shows nor a shown step the next attempt repeats.
+`409 LEASE_LOST` means the lease is no longer
 this worker's (it lapsed and the run was re-queued, possibly claimed by another worker) or
 the run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do
 not write to it**. Heartbeat well inside the lease (every third of it).

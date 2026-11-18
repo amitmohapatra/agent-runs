@@ -151,3 +151,43 @@ async def test_a_quiet_stream_keeps_its_connection_and_ends_in_time(client, monk
 @pytest.mark.parametrize("path", ["/events", "/events/stream"])
 async def test_an_unknown_runs_events_are_not_found(client, path: str) -> None:
     assert (await client.get(f"/v1/runs/run_nope{path}")).status_code == 404
+
+
+# ------------------------------------------------------------------ saved with the checkpoint
+
+
+async def test_a_heartbeat_saves_its_events_with_its_checkpoint(client) -> None:
+    """The progress a crash keeps and the events that show it go in one transaction: both,
+    in order after what was appended before, an event already logged skipped."""
+    await client.post("/v1/runs", json=started(queue=True))
+    run_id = (await client.post("/v1/runs/claim", json=_CLAIM)).json()["run"]["run_id"]
+    await _append(client, run_id, _event(run_id, 0), worker="w1")
+    journal = {"calls": {"note": "done"}}
+    beat = await client.post(
+        f"/v1/runs/{run_id}/heartbeat",
+        json={
+            "worker_id": "w1",
+            "checkpoint": journal,
+            "events": [_event(run_id, 0), _event(run_id, 1), _event(run_id, 2)],
+        },
+    )
+    assert beat.status_code == 200
+    log = (await client.get(f"/v1/runs/{run_id}/events")).json()
+    assert [(e["position"], e["event"]["sequence"]) for e in log] == [(1, 0), (2, 1), (3, 2)]
+    assert (await client.get(f"/v1/runs/{run_id}")).json()["checkpoint"] == journal
+    # the events alone, with no checkpoint, are kept as well
+    alone = {"worker_id": "w1", "events": [_event(run_id, 3)]}
+    assert (await client.post(f"/v1/runs/{run_id}/heartbeat", json=alone)).status_code == 200
+    assert len((await client.get(f"/v1/runs/{run_id}/events")).json()) == 4
+
+
+async def test_a_heartbeat_whose_events_are_refused_saves_nothing(client) -> None:
+    await client.post("/v1/runs", json=started(queue=True))
+    run_id = (await client.post("/v1/runs/claim", json=_CLAIM)).json()["run"]["run_id"]
+    beat = await client.post(
+        f"/v1/runs/{run_id}/heartbeat",
+        json={"worker_id": "w1", "checkpoint": {"x": 1}, "events": [_event("run_other", 0)]},
+    )
+    assert (beat.status_code, beat.json()["code"]) == (422, "VALIDATION")
+    assert (await client.get(f"/v1/runs/{run_id}/events")).json() == []
+    assert (await client.get(f"/v1/runs/{run_id}")).json()["checkpoint"] is None

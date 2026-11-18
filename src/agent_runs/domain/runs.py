@@ -160,6 +160,14 @@ class HeartbeatRequest(BaseModel):
         description="Progress to save: the executor's resume journal as it stands, at most "
         "1 MiB of compact JSON. Replaces the run's checkpoint; absent, it is kept.",
     )
+    events: list[RunEvent] | None = Field(
+        default=None,
+        max_length=MAX_EVENTS_PER_APPEND,
+        description="Events of the run not in its log yet, added in the same transaction as "
+        f"the checkpoint (at most {MAX_EVENTS_PER_APPEND}, in the order they happened, as an "
+        "append takes them; one already logged is skipped): the progress a crash keeps and "
+        "the events that show it are saved together, or neither is.",
+    )
 
 
 class ReleaseRequest(BaseModel):

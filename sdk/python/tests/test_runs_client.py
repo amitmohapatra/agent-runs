@@ -12,6 +12,7 @@ from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import (
     InterruptDecision,
     InterruptResolution,
+    RunEvent,
     RunStart,
     RunStatus,
 )
@@ -131,6 +132,10 @@ async def test_heartbeat_extends_the_lease_and_may_save_progress(runs: RunsClien
     assert json.loads(sent(route).content) == {"worker_id": "w-1", "lease_seconds": 60}
     await runs.heartbeat("run_1", "w-1", lease_seconds=90, checkpoint={"tools": {}}, tenant="acme")
     assert json.loads(sent(route).content)["checkpoint"] == {"tools": {}}
+    shown = RunEvent(tenant_id="acme", run_id="run_1", sequence=4, attempt=1, type="STEP_STARTED")
+    await runs.heartbeat("run_1", "w-1", checkpoint={"tools": {}}, events=[shown])
+    body = json.loads(sent(route).content)  # saved with the checkpoint, in one request
+    assert [e["sequence"] for e in body["events"]] == [4] and body["checkpoint"] == {"tools": {}}
 
 
 @pytest.mark.parametrize("code", ["LEASE_LOST", "CONFLICT", None])

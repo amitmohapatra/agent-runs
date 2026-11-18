@@ -6,6 +6,12 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A heartbeat saves the events that show its checkpoint, with it.** `POST
+  /v1/runs/{id}/heartbeat` takes optional `events` (at most 500), added to the run's log in the
+  checkpoint's transaction (as an append: in order, one already logged skipped; one naming
+  another run refuses the whole heartbeat, checkpoint included). The SDK's
+  `RunsClient.heartbeat(..., events=)` sends them. A worker killed right after a step no longer
+  leaves a step its event log never shows. Nothing to do for a caller that does not send them.
 * **A brief Memory Service outage or overload no longer cancels runs.** The key registry
   client asks once per key at a time (the requests that need it meanwhile share the answer:
   a cache entry ending under load no longer sends every request to a busy registry), and a key

@@ -135,16 +135,21 @@ class RunsClient:
         *,
         lease_seconds: int = LEASE_SECONDS,
         checkpoint: dict[str, Any] | None = None,
+        events: Sequence[RunEvent] | None = None,
         tenant: str | None = None,
     ) -> Lease:
         """Extend the lease; with ``checkpoint``, also save it as the run's progress (it
-        replaces the run's checkpoint; without, the one there is kept). Any ``409`` raises
+        replaces the run's checkpoint; without, the one there is kept), and with ``events``
+        add them to the run's log in the same transaction (as :meth:`append_events` does: one
+        already logged is skipped), so a crash keeps both or neither. Any ``409`` raises
         :class:`LeaseLostError`: this worker does not hold a running lease on the run. On a
         run kept in the caller's process (started, never queued) it holds the run for
         ``worker_id`` instead: agent-runs ends the run ``ERROR`` once the hold lapses."""
         body: dict[str, Any] = {"worker_id": worker_id, "lease_seconds": lease_seconds}
         if checkpoint is not None:
             body["checkpoint"] = checkpoint
+        if events:
+            body["events"] = [event.model_dump(mode="json") for event in events]
         try:
             data = await self._transport.json(
                 "POST", f"/v1/runs/{run_id}/heartbeat", tenant=tenant, json=body

@@ -536,6 +536,22 @@
             "description": "Progress to save: the executor's resume journal as it stands, at most 1 MiB of compact JSON. Replaces the run's checkpoint; absent, it is kept.",
             "title": "Checkpoint"
           },
+          "events": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RunEvent"
+                },
+                "maxItems": 500,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Events of the run not in its log yet, added in the same transaction as the checkpoint (at most 500, in the order they happened, as an append takes them; one already logged is skipped): the progress a crash keeps and the events that show it are saved together, or neither is.",
+            "title": "Events"
+          },
           "lease_seconds": {
             "default": 60,
             "description": "The new lease (or hold), from now, 5 to 3600 s. A run never queued whose hold lapses is ended ERROR (holder_lost).",

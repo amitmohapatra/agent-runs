@@ -950,6 +950,8 @@ class RunStore:
         if checkpoint is not None:
             await self._keep_checkpoint(row, checkpoint)
             row.updated_at = now
+        if request.events:  # in the checkpoint's transaction: saved with it, or not at all
+            await self._logged(row, request.events)
         if in_process:
             require_may_hold(caller, row.on_behalf_of or row.user_id)
             lease = self._hold(row, request.worker_id, request.lease_seconds, now)
@@ -1266,15 +1268,22 @@ class RunStore:
         (``Unprocessable`` otherwise); one already logged (its attempt and sequence) is
         skipped, so a retried append adds nothing. The run's row lock orders the positions:
         two appends to one run never interleave."""
-        if any((e.tenant_id, e.run_id) != (tenant_id, run_id) for e in append.events):
-            raise Unprocessable("an event names another run")
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if row.status != RunStatus.RUNNING:
             if worker_id is not None:
                 raise LeaseLost(f"run {run_id} is {row.status}; worker {worker_id} holds no lease")
             raise Conflict(f"run {run_id} is {row.status}; events are appended while it runs")
         _held_by(row, worker_id)
-        asked = [(event.attempt, event.sequence) for event in append.events]
+        return await self._logged(row, append.events)
+
+    async def _logged(self, row: RunRow, events: Sequence[RunEvent]) -> EventsAppended:
+        """``events`` added to the log of ``row``'s run (locked, running), each at the next
+        position; one already logged (its attempt and sequence) is skipped. Every event names
+        this run and tenant (``Unprocessable`` otherwise)."""
+        tenant_id, run_id = row.tenant_id, row.run_id
+        if any((e.tenant_id, e.run_id) != (tenant_id, run_id) for e in events):
+            raise Unprocessable("an event names another run")
+        asked = [(event.attempt, event.sequence) for event in events]
         logged = select(RunEventRow.attempt, RunEventRow.sequence).where(
             RunEventRow.run_id == run_id,
             tuple_(RunEventRow.attempt, RunEventRow.sequence).in_(asked),
@@ -1287,7 +1296,7 @@ class RunStore:
         )
         position = int(last or 0)
         added = 0
-        for event in append.events:
+        for event in events:
             if (event.attempt, event.sequence) in seen:
                 continue
             seen.add((event.attempt, event.sequence))
