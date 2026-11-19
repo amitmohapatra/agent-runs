@@ -49,7 +49,7 @@ _RECORD_FIELDS = tuple(name for name in Schedule.model_fields if name not in _UN
 
 def _schedule(row: ScheduleRow) -> Schedule:
     fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
-    return Schedule.model_validate({**fields, "metadata": row.schedule_metadata or {}})
+    return Schedule.read({**fields, "metadata": row.schedule_metadata or {}})
 
 
 def _checked(fields: dict[str, Any]) -> ScheduleSpec:

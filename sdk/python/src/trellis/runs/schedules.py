@@ -25,7 +25,7 @@ class SchedulesAPI:
         data = await self._transport.json(
             "POST", "/v1/schedules", tenant=spec.tenant_id, json=spec.model_dump(mode="json")
         )
-        return Schedule.model_validate(data)
+        return Schedule.read(data)
 
     async def list(
         self,
@@ -49,14 +49,12 @@ class SchedulesAPI:
         if cursor is not None:
             params["cursor"] = cursor
         rows, after = await self._transport.page("/v1/schedules", tenant=tenant, params=params)
-        return Page[Schedule](
-            items=[Schedule.model_validate(row) for row in rows], next_cursor=after
-        )
+        return Page[Schedule](items=[Schedule.read(row) for row in rows], next_cursor=after)
 
     async def get(self, schedule_id: str, *, tenant: str | None = None) -> Schedule | None:
         """The schedule, or None when there is none."""
         data = await self._transport.found("GET", f"/v1/schedules/{schedule_id}", tenant=tenant)
-        return None if data is None else Schedule.model_validate(data)
+        return None if data is None else Schedule.read(data)
 
     async def update(
         self, schedule_id: str, changes: ScheduleUpdate, *, tenant: str | None = None
@@ -69,7 +67,7 @@ class SchedulesAPI:
             tenant=tenant,
             json=changes.model_dump(mode="json", exclude_unset=True),
         )
-        return Schedule.model_validate(data)
+        return Schedule.read(data)
 
     async def delete(self, schedule_id: str, *, tenant: str | None = None) -> None:
         await self._transport.send("DELETE", f"/v1/schedules/{schedule_id}", tenant=tenant)

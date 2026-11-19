@@ -13,12 +13,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Header, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import now
 from trellis.contracts.runs import InterruptResolution, RunRecord, RunStatus
 
 from agent_runs.api import examples
-from agent_runs.api.deps import Claiming, Session, Who
+from agent_runs.api.deps import Claiming, Runs, Session, Who, run_store
 from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
@@ -51,8 +50,6 @@ from agent_runs.domain.runs import (
     bounded_payload,
 )
 from agent_runs.observability.metrics import claims_total
-from agent_runs.store.runs import RunStore
-from agent_runs.store.webhooks import WebhookStore
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
@@ -62,19 +59,6 @@ _NO_CONTENT = 204
 
 def _payload_limit(request: Request) -> int:
     return request.app.state.settings.service.max_payload_bytes
-
-
-def _leasing(request: Request, db: AsyncSession) -> RunStore:
-    """The store for a route that hands out a lease, which tells the worker the working time
-    the run has left under the service's maximum too, and claims within the deployment's
-    limits."""
-    limits = request.app.state.settings.limits
-    return RunStore(
-        db,
-        max_run_seconds=limits.max_run_seconds,
-        concurrency_per_key=limits.concurrency_per_key,
-        max_running_per_tenant=limits.max_running_per_tenant,
-    )
 
 
 #: A worker fencing its write: refused (409) unless it still holds the run's lease.
@@ -117,6 +101,7 @@ async def start(
     body: Annotated[RunCreate, Body(openapi_examples=examples.START)],
     request: Request,
     db: Session,
+    store: Runs,
     who: Who,
     response: Response,
 ) -> RunRecord:
@@ -127,7 +112,7 @@ async def start(
     who.require_tenant(body.tenant_id)
     who.require_may_act_for(body.on_behalf_of)
     bounded_payload(body.input, name="input", limit=_payload_limit(request))
-    run, created = await RunStore(db).start(body.start(), queue=body.queue, now=now())
+    run, created = await store.start(body.start(), queue=body.queue, now=now())
     await db.commit()
     if created:
         response.headers["Location"] = f"{router.prefix}/{run.run_id}"
@@ -149,8 +134,8 @@ async def start(
 )
 async def claim(
     body: Annotated[ClaimRequest, Body(openapi_examples=examples.CLAIM)],
-    request: Request,
     db: Session,
+    store: Runs,
     who: Claiming,
 ) -> Claimed | Response:
     """Lease the next queued run of ``agent_ids`` to ``worker_id``, or 204 when there is
@@ -165,7 +150,7 @@ async def claim(
     workers hold the fewest runs of these agents first: a fair share of the fleet, with
     nothing to set. The claimed run names its tenant (``run.tenant_id``), which the
     worker's later calls send."""
-    claimed = await _leasing(request, db).claim(who.tenant_id, body, now=now())
+    claimed = await store.claim(who.tenant_id, body, now=now())
     await db.commit()
     claims_total.labels("empty" if claimed is None else "claimed").inc()
     return claimed if claimed is not None else Response(status_code=_NO_CONTENT)
@@ -186,6 +171,7 @@ async def heartbeat(
     body: Annotated[HeartbeatRequest, Body(openapi_examples=examples.HEARTBEAT)],
     request: Request,
     db: Session,
+    store: Runs,
     who: Who,
 ) -> Lease:
     """Extend the lease to ``now + lease_seconds``; every third of the lease is a good
@@ -203,9 +189,7 @@ async def heartbeat(
     paused must be held again within ``RESUME_GRACE`` (60 s) by whoever continues it, or the
     ticker ends it ``ERROR`` (``holder_lost``) too."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    lease = await _leasing(request, db).heartbeat(
-        who.tenant_id, run_id, body, caller=who.credential, now=now()
-    )
+    lease = await store.heartbeat(who.tenant_id, run_id, body, caller=who.credential, now=now())
     await db.commit()
     return lease
 
@@ -226,6 +210,7 @@ async def release(
     body: Annotated[ReleaseRequest, Body(openapi_examples=examples.RELEASE)],
     request: Request,
     db: Session,
+    store: Runs,
     who: Who,
 ) -> RunRecord:
     """The worker holding the run lets go of it, as a worker that is stopping does with the
@@ -236,12 +221,7 @@ async def release(
     answers the run as it is. A run kept in its caller's process (never queued) is not
     queued: its holder lets go of the hold, and it goes on ``RUNNING``, unheld."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    at = now()
-    run, released = await RunStore(db).release(
-        who.tenant_id, run_id, body, caller=who.credential, now=at
-    )
-    if released:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.release(who.tenant_id, run_id, body, caller=who.credential, now=now())
     await db.commit()
     return run
 
@@ -257,6 +237,7 @@ async def pause(
     body: Annotated[RunPause, Body(openapi_examples=examples.PAUSE)],
     request: Request,
     db: Session,
+    store: Runs,
     who: Who,
     worker_id: WorkerId = None,
 ) -> RunRecord:
@@ -266,10 +247,7 @@ async def pause(
     The lease ends. Repeated by the same caller on the same interrupt, it answers the stored
     run and changes nothing."""
     bounded_payload(body.checkpoint, name="checkpoint", limit=_payload_limit(request))
-    at = now()
-    run, paused = await RunStore(db).pause(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    if paused:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.pause(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
     await db.commit()
     return run
 
@@ -297,6 +275,7 @@ async def resume(
     run_id: RunId,
     body: Annotated[InterruptResolution, Body(openapi_examples=examples.RESUME)],
     db: Session,
+    store: Runs,
     who: Who,
 ) -> RunRecord:
     """Answer the interrupt the run waits on. ``CANCEL`` ends it; anything else continues it
@@ -318,12 +297,7 @@ async def resume(
     Repeated with the very same resolution (its ``resolved_at`` included), as a client
     retries it after losing the answer, it answers the run as it is now and changes nothing.
     Any other answer to an interrupt already answered is 409."""
-    at = now()
-    run, resumed = await RunStore(db).resume(
-        who.tenant_id, run_id, body, answerer=who.credential, now=at
-    )
-    if resumed:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.resume(who.tenant_id, run_id, body, answerer=who.credential, now=now())
     await db.commit()
     return run
 
@@ -347,6 +321,7 @@ async def cancel(
     run_id: RunId,
     body: Annotated[RunCancel, Body(openapi_examples=examples.CANCEL)],
     db: Session,
+    store: Runs,
     who: Who,
 ) -> RunRecord:
     """Cancel the run, keeping ``reason`` and the key's principal with it. A ``QUEUED`` or
@@ -360,12 +335,7 @@ async def cancel(
     assignee now, before anything is written; 403 otherwise. A cancel already asked for, or
     repeated after the run was cancelled by the same principal for the same reason, answers
     the run as it is; an ended run is otherwise 409."""
-    at = now()
-    run, changed = await RunStore(db).cancel(
-        who.tenant_id, run_id, body, canceller=who.credential, now=at
-    )
-    if changed:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.cancel(who.tenant_id, run_id, body, canceller=who.credential, now=now())
     await db.commit()
     return run
 
@@ -381,6 +351,7 @@ async def finish(
     body: Annotated[RunFinish, Body(openapi_examples=examples.FINISH)],
     request: Request,
     db: Session,
+    store: Runs,
     who: Who,
     worker_id: WorkerId = None,
 ) -> RunRecord:
@@ -389,10 +360,7 @@ async def finish(
     caller with the same status, it answers the stored run and changes nothing. ``output``
     is at most ``RUNS__SERVICE__MAX_PAYLOAD_BYTES`` (1 MiB) of compact JSON."""
     bounded_payload(body.output, name="output", limit=_payload_limit(request))
-    at = now()
-    run, ended = await RunStore(db).finish(who.tenant_id, run_id, body, worker_id=worker_id, now=at)
-    if ended:
-        await WebhookStore(db).announce(run, now=at)
+    run, _ = await store.finish(who.tenant_id, run_id, body, worker_id=worker_id, now=now())
     await db.commit()
     return run
 
@@ -402,10 +370,10 @@ async def finish(
     summary="Read a run",
     response_description="The full record: input, output, error, checkpoint, awaiting.",
 )
-async def get(run_id: RunId, db: Session, who: Who) -> RunRecord:
+async def get(run_id: RunId, store: Runs, who: Who) -> RunRecord:
     """One run of this tenant, the whole record, its ``worked_seconds`` counting the stretch
     it is running now. Another tenant's run is 404."""
-    return await RunStore(db).get(who.tenant_id, run_id, now=now())
+    return await store.get(who.tenant_id, run_id, now=now())
 
 
 AfterQuery = Annotated[
@@ -428,6 +396,7 @@ async def append_events(
     run_id: RunId,
     body: Annotated[EventsAppend, Body(openapi_examples=examples.EVENTS)],
     db: Session,
+    store: Runs,
     who: Who,
     worker_id: WorkerId = None,
 ) -> EventsAppended:
@@ -438,7 +407,7 @@ async def append_events(
     (the same ``attempt`` and ``sequence``) is not added again, so a retried append is safe.
     Append before pausing or finishing: the log takes nothing after. The log goes when the
     run is purged."""
-    appended = await RunStore(db).append_events(who.tenant_id, run_id, body, worker_id=worker_id)
+    appended = await store.append_events(who.tenant_id, run_id, body, worker_id=worker_id)
     await db.commit()
     return appended
 
@@ -450,7 +419,7 @@ async def append_events(
 )
 async def events(
     run_id: RunId,
-    db: Session,
+    store: Runs,
     who: Who,
     after: AfterQuery = 0,
     limit: LimitQuery = DEFAULT_LIMIT,
@@ -458,7 +427,7 @@ async def events(
     """The run's log from position ``after`` on, from any replica. The log is read by
     position rather than by cursor: pass the last ``position`` seen as ``after`` for the
     next page; the stream (``/events/stream``) counts the same positions."""
-    entries, _ = await RunStore(db).events(who.tenant_id, run_id, after=after, limit=limit)
+    entries, _ = await store.events(who.tenant_id, run_id, after=after, limit=limit)
     return entries
 
 
@@ -492,7 +461,7 @@ async def stream_events(
     comment line every 15 s keeps idle connections open, and after five minutes the
     service ends the stream without ``end``: reconnect with the last position seen."""
     async with request.app.state.sessions() as db:  # a 404 before the stream opens
-        await RunStore(db).get(who.tenant_id, run_id, now=now())
+        await run_store(request, db).get(who.tenant_id, run_id, now=now())
     start = max(after, last_event_id or 0)
     return StreamingResponse(
         _follow(request, who.tenant_id, run_id, start),
@@ -514,7 +483,7 @@ async def _follow(request: Request, tenant_id: str, run_id: str, after: int) -> 
     quiet = 0.0
     while True:
         async with request.app.state.sessions() as db:
-            entries, status = await RunStore(db).events(
+            entries, status = await run_store(request, db).events(
                 tenant_id, run_id, after=after, limit=MAX_PAGE
             )
         for entry in entries:
@@ -547,14 +516,14 @@ async def resolutions(
     run_id: RunId,
     request: Request,
     response: Response,
-    db: Session,
+    store: Runs,
     who: Who,
     cursor: CursorQuery = None,
     limit: LimitQuery = DEFAULT_LIMIT,
 ) -> list[ResolutionEntry]:
     """Every interrupt the run paused on and how a person answered it, oldest first: the
     audit trail ``last_resolution`` is only the end of."""
-    page = await RunStore(db).resolutions(
+    page = await store.resolutions(
         who.tenant_id,
         run_id,
         limit=limit,
@@ -573,7 +542,7 @@ async def resolutions(
 async def listing(
     request: Request,
     response: Response,
-    db: Session,
+    store: Runs,
     who: Who,
     status: Annotated[RunStatus | None, Query(description="Only runs in this status.")] = None,
     assignee: Annotated[
@@ -605,7 +574,7 @@ async def listing(
     """This tenant's runs, newest first, as summaries; the full record is
     ``GET /v1/runs/{run_id}``. ``status=PAUSED&assignee=…`` is an inbox, and
     ``&top_level=true`` leaves out the runs other runs started (sub-agents)."""
-    page = await RunStore(db).list(
+    page = await store.list(
         who.tenant_id,
         status=status,
         assignee=assignee,

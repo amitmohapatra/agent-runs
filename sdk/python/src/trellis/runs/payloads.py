@@ -24,6 +24,7 @@ from typing import Any, Final
 
 import zstandard
 from pydantic import BaseModel, ConfigDict
+from trellis.runs.blob import sha256_hex
 
 #: What a payload object is: JSON, zstd-compressed.
 MEDIA_TYPE: Final = "application/vnd.trellis.payload+json+zstd"
@@ -45,6 +46,11 @@ TENANT_SHARDS: Final = 64
 SUFFIX: Final = ".json.zst"
 #: The most a payload may decompress to: a frame claiming more is refused, not allocated.
 MAX_DECODED_BYTES: Final = 512 * 1024 * 1024
+#: The most objects one framed read answers (``POST /v1/payloads/read``), and the most bytes
+#: of them together, an object asked for twice counted twice (413 past it): what the service
+#: holds for one answer is bounded. A reader asks for more in several requests.
+MAX_READ_OBJECTS: Final = 256
+MAX_READ_BYTES: Final = 64 * 1024 * 1024
 
 
 class PayloadRef(BaseModel):
@@ -88,12 +94,23 @@ def encode(value: Any) -> bytes:
     return _compress(_dump(value))
 
 
-def decode(data: bytes) -> Any:
-    """The JSON value of stored bytes (``ValueError`` when they are not a payload)."""
+def decoded_size(data: bytes) -> int:
+    """The bytes stored bytes say they decompress to, read from their header: nothing is
+    decompressed (``ValueError`` when they are not a payload, or do not say)."""
     try:
         size = zstandard.frame_content_size(data)
-        if not 0 <= size <= MAX_DECODED_BYTES:
-            raise ValueError(f"a payload object decodes to at most {MAX_DECODED_BYTES} bytes")
+    except zstandard.ZstdError as exc:
+        raise ValueError(f"not a payload object: {exc}") from exc
+    if size < 0:
+        raise ValueError("not a payload object: it does not say what it decompresses to")
+    return size
+
+
+def decode(data: bytes) -> Any:
+    """The JSON value of stored bytes (``ValueError`` when they are not a payload)."""
+    if decoded_size(data) > MAX_DECODED_BYTES:
+        raise ValueError(f"a payload object decodes to at most {MAX_DECODED_BYTES} bytes")
+    try:
         return json.loads(zstandard.ZstdDecompressor().decompress(data))
     except zstandard.ZstdError as exc:
         raise ValueError(f"not a payload object: {exc}") from exc
@@ -128,7 +145,7 @@ def key_of(tenant_id: str, sha256: str) -> str:
 
 def ref_of(tenant_id: str, data: bytes) -> PayloadRef:
     """The reference ``data`` is stored under for ``tenant_id``: its content's address."""
-    digest = hashlib.sha256(data).hexdigest()
+    digest = sha256_hex(data)
     return PayloadRef(ref=key_of(tenant_id, digest), size=len(data), sha256=digest)
 
 

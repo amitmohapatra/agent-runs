@@ -27,6 +27,12 @@ READY_TIMEOUT_SECONDS: Final = 3.0
 #: How long an introspected key is trusted before the registry is asked again: the longest
 #: a revoked key keeps working here.
 KEY_CACHE_SECONDS: Final = 60.0
+#: How long past its cache entry a key the registry accepted keeps working while the
+#: registry cannot be asked (unreachable, or answering 5xx): a brief outage or overload of the
+#: memory service does not stop every run's heartbeat. The longest a key revoked during such an
+#: outage keeps working here is this plus :data:`KEY_CACHE_SECONDS`; a refused key is never
+#: kept past its own entry.
+KEY_STALE_SECONDS: Final = 300.0
 #: How long a refused key stays refused without asking again.
 KEY_NEGATIVE_CACHE_SECONDS: Final = 10.0
 KEY_INTROSPECTION_TIMEOUT_SECONDS: Final = 3.0
@@ -47,8 +53,14 @@ MAX_PAGE: Final = 500
 # --------------------------------------------------------------------------- the database
 
 #: Connections one process (an API worker, the ticker) opens when no budget is set
-#: (``RUNS__DATABASE__CONNECTION_BUDGET``): 10 kept and 10 more under a burst.
+#: (``RUNS__DATABASE__CONNECTION_BUDGET``): 9 kept, 9 more under a burst and 2 for the
+#: payload registry.
 DB_CONNECTIONS_PER_PROCESS: Final = 20
+#: The share of a process's connections kept for the payload registry's own pool (one in
+#: ten, at least one): a payload is registered, in a short transaction of its own, while the
+#: request that writes it may hold a connection and a row lock, so it must never wait for a
+#: second connection of the pool the requests hold theirs from.
+DB_REGISTRY_SHARE: Final = 10
 #: Seconds a request waits for a pooled connection before a 503.
 DB_POOL_TIMEOUT_SECONDS: Final = 5.0
 #: Seconds after which a pooled connection is replaced rather than reused: under the idle
@@ -64,6 +76,9 @@ DB_STATEMENT_TIMEOUT_MS: Final = 15_000
 
 #: The most events one append may carry.
 MAX_EVENTS_PER_APPEND: Final = 500
+#: Events per object of an ended run's compacted log: a page, so reading one (at most
+#: ``MAX_PAGE`` events) reads the object it starts in and at most the next, never the log.
+EVENT_CHUNK: Final = MAX_PAGE
 #: How often a stream looks for new events of its run, and how long it stays quiet before it
 #: sends a comment, so proxies and load balancers keep the connection open.
 EVENT_POLL_SECONDS: Final = 0.5
@@ -77,6 +92,10 @@ EVENT_STREAM_SECONDS: Final = 300.0
 
 #: The largest artifact one upload may carry (an ``ask`` table, a diff, a report).
 MAX_ARTIFACT_BYTES: Final = 50 * 1024 * 1024
+#: The most an uploaded payload object (a checkpoint's segment) may decompress to, read from
+#: its header before it is decoded to be checked: a few compressed bytes cannot make the
+#: service hold what they claim to expand to.
+MAX_PAYLOAD_DECODED_BYTES: Final = 64 * 1024 * 1024
 #: How long a run's artifacts outlive the run: a reviewer can still open what a finished run
 #: asked about; after that the ticker deletes them.
 ARTIFACT_RETENTION: Final = timedelta(days=7)

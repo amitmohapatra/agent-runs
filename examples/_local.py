@@ -185,7 +185,11 @@ async def local_service() -> AsyncIterator[Local]:
                 client=httpx.AsyncClient(transport=httpx.MockTransport(receiver.handle)),
             )
             ticker = Ticker(
-                app.state.sessions, hooks, app.state.blobs, heartbeat_path=Path(tmp) / "beat"
+                app.state.sessions,
+                hooks,
+                app.state.blobs,
+                heartbeat_path=Path(tmp) / "beat",
+                limits=settings.limits,
             )
             local = Local(app, ticker, receiver)
             try:

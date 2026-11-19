@@ -19,7 +19,6 @@ from agent_runs.domain.cadence import (
     next_fire_at,
     validate_cadence,
 )
-from agent_runs.domain.schedules import idempotency_key
 
 NY = "America/New_York"
 _REFERENCE = datetime(2026, 9, 21, 14, 37, tzinfo=UTC)  # a Monday afternoon
@@ -132,14 +131,6 @@ def test_a_naive_reference_time_is_refused() -> None:
     """A naive instant would be read as UTC and shift every fire by the caller's offset."""
     with pytest.raises(ValueError, match="timezone-aware"):
         next_fire_at("daily", after=datetime(2026, 9, 21, 14, 37), timezone="UTC")
-
-
-def test_one_instant_spelled_two_ways_is_one_idempotency_key() -> None:
-    """A ticker in Berlin and a ticker in UTC name the same tick differently; if that
-    produced two keys, one tick would queue two runs."""
-    utc = datetime(2026, 9, 21, 9, tzinfo=UTC)
-    berlin = utc.astimezone(ZoneInfo("Europe/Berlin"))
-    assert idempotency_key("sch_1", utc) == idempotency_key("sch_1", berlin)
 
 
 @pytest.mark.parametrize(

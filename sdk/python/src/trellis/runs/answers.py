@@ -3,16 +3,22 @@ continues, and the harness makes for a run it keeps in its own process (no agent
 
 * :func:`schema_problem`: ``expects`` is a JSON Schema at all (checked when the question is
   asked, so a malformed question fails where it was written, not when someone answers it).
-* :func:`answer_problem`: a resolution answers the interrupt, an ``ANSWER`` fits ``expects``
+* :func:`meant`: the option an answer hands back — equal to an option's value or label,
+  whatever its case and spacing — as that option's value (with ``multiple``, each pick); any
+  other answer as it was given. Nothing is guessed from words ("SUP-04" of "SUP-04 (Lyon
+  Mills)", "not SUP-04", "the second one"): whoever asked reads them (an agent's model).
+  Both checks below read an answer so.
+* :func:`answer_problem`: a resolution answers the interrupt
+  (``InterruptResolution.problem_with``, the contracts' half), an ``ANSWER`` fits ``expects``
   (else picks among ``options``: one option's value, or with ``multiple`` a list of distinct
   values), and the corrected value of an ``EDIT`` of a question fits ``expects``: its
   ``format`` too when it is one of :data:`ANSWER_FORMATS` (a ``date`` is an ISO 8601
   calendar date, ``YYYY-MM-DD``); any other format is not checked. An answer
   the asker's own screen (``component``) collected is held to the same. ``APPROVE``,
-  ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered for the run
-  (``remember="run"``) must be of a tool call. A tool call's edited arguments are checked
-  against the tool's own schema by whoever knows the tool (the harness), since the
-  interrupt does not carry it.
+  ``REJECT`` and ``CANCEL`` carry no value to check; an approval remembered beyond
+  its call (``remember="run"`` or ``"always"``) must be of a tool call. A tool call's
+  edited arguments are checked against the tool's own schema by whoever knows the tool
+  (the harness), since the interrupt does not carry it.
 
 Both return why, in words, or ``None``.
 """
@@ -50,18 +56,47 @@ def schema_problem(expects: dict[str, Any] | None) -> str | None:
 
 def answer_problem(interrupt: Interrupt, resolution: InterruptResolution) -> str | None:
     """Why ``resolution`` cannot answer ``interrupt``, or ``None`` when it can."""
-    if not resolution.resolves(interrupt):
-        return f"it answers {resolution.interrupt_id}, not {interrupt.interrupt_id}"
+    if problem := resolution.problem_with(interrupt):
+        return problem
     if resolution.decision is InterruptDecision.ANSWER:
         return _fit_problem(interrupt, resolution.answer, choosing=True)
     if resolution.decision is InterruptDecision.EDIT and interrupt.tool_call is None:
         return _fit_problem(interrupt, resolution.payload, choosing=False)
-    if resolution.remember == "run" and interrupt.tool_call is None:
-        return "only an approval of a tool call is remembered for the run"
     return None
 
 
+def meant(interrupt: Interrupt, value: Any) -> Any:
+    """``value`` with an option it hands back as that option's value: a string equal to an
+    option's value or label once case and spacing are set aside (with ``multiple``, each string
+    of a list); anything else as it is."""
+    if not interrupt.options:
+        return value
+    if interrupt.multiple:
+        return [_option_of(interrupt, v) for v in value] if isinstance(value, list) else value
+    return _option_of(interrupt, value)
+
+
+def _option_of(interrupt: Interrupt, value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    said = _plain(value)
+    for option in interrupt.options:
+        if isinstance(option, str):
+            if _plain(option) == said:
+                return option
+        elif said in (_plain(option.value), _plain(option.label or option.value)):
+            return option.value
+    return value
+
+
+def _plain(text: str) -> str:
+    """``text`` as an option is compared: lower case, its words one space apart."""
+    return " ".join(text.casefold().split())
+
+
 def _fit_problem(interrupt: Interrupt, value: Any, *, choosing: bool) -> str | None:
+    if choosing:
+        value = meant(interrupt, value)
     expects = interrupt.expects
     if expects is not None:
         if problem := schema_problem(expects):

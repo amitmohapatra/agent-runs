@@ -61,9 +61,10 @@ async def main() -> None:
             )
 
         try:
-            await priya.resume(answer("Globex GmbH"))  # a label, not a value
+            await priya.resume(answer("Globex Ltd"))  # neither a value nor a label: no option
         except ValidationError as exc:
             print("422:", exc)
+        # (the whole label, any case or spacing, is that option: "globex gmbh" answers globex)
         try:
             await priya.resume(answer("globex", reviewer="raj"))  # she may act only as herself
         except AuthorizationError as exc:

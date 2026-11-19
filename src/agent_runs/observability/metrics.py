@@ -68,6 +68,13 @@ swept_total = Counter(
     ["step"],
     registry=REGISTRY,
 )
+step_failures_total = Counter(
+    "runs_ticker_step_failures_total",
+    "Ticker steps that failed on something other than an outage, by step (named as "
+    "runs_ticker_swept_total names them); the steps after one still ran",
+    ["step"],
+    registry=REGISTRY,
+)
 webhook_dead_total = Counter(
     "runs_webhook_dead_total",
     "Webhook deliveries given up on (out of attempts, or refused for good), kept as dead",

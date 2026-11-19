@@ -1,6 +1,7 @@
 """Run payloads in the blob store, by reference (``trellis.runs.payloads`` is the format).
 
-A write registers the object's key (``payload_blobs``, in its own short transaction) before
+A write registers the object's key (``payload_blobs``, in its own short transaction on the
+registry's own pool: the writer's session may hold a connection and a row lock) before
 it writes the bytes, and returns the :class:`PayloadRef` the caller's row then holds: the
 bytes are durable before any row refers to them, and an object whose row never committed
 (a crash, a lost lease) is an orphan the ticker deletes a day later (:meth:`sweep`). Writes
@@ -122,6 +123,20 @@ class PayloadStore:
 
         return list(await asyncio.gather(*(one(ref) for ref in refs)))
 
+    async def get_each(self, refs: Iterable[PayloadRef | dict[str, Any]]) -> list[Any]:
+        """As :meth:`get_many`, but a missing or corrupt object is its :class:`PayloadLost`,
+        in its place: one lost object does not fail the read of the others."""
+        gate = asyncio.Semaphore(PARALLEL_READS)
+
+        async def one(ref: PayloadRef | dict[str, Any]) -> Any:
+            async with gate:
+                try:
+                    return await self.get(ref)
+                except PayloadLost as lost:
+                    return lost
+
+        return list(await asyncio.gather(*(one(ref) for ref in refs)))
+
     # ------------------------------------------------------------------ the sweep
     async def sweep(self, *, now: datetime, limit: int) -> int:
         """Delete up to ``limit`` objects no run and no webhook delivery refers to, registered
@@ -159,10 +174,16 @@ class PayloadStore:
 
 
 def bind(
-    sessions: Sessions, blobs: BlobStore, *, retention: timedelta = ARTIFACT_RETENTION
+    sessions: Sessions,
+    blobs: BlobStore,
+    *,
+    registry: Sessions,
+    retention: timedelta = ARTIFACT_RETENTION,
 ) -> PayloadStore:
-    """The payload store over ``blobs``, carried by every session ``sessions`` opens."""
-    store = PayloadStore(blobs, sessions, retention=retention)
+    """The payload store over ``blobs``, carried by every session ``sessions`` opens. Its
+    registry is written through ``registry``, sessions on a pool of their own
+    (``store.database.registry_engine``), never one of ``sessions``'s connections."""
+    store = PayloadStore(blobs, registry, retention=retention)
     sessions.configure(info={_PAYLOADS: store})
     return store
 

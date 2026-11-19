@@ -15,7 +15,7 @@ from trellis.contracts.runs import (
     Option,
 )
 from trellis.contracts.tool import ToolCall
-from trellis.runs.answers import ANSWER_FORMATS, answer_problem, schema_problem
+from trellis.runs.answers import ANSWER_FORMATS, answer_problem, meant, schema_problem
 
 
 def _asked(**fields: Any) -> Interrupt:
@@ -144,6 +144,10 @@ def test_an_answer_to_another_interrupt_is_refused() -> None:
         interrupt_id="int_other", run_id=asked.run_id, decision=InterruptDecision.ANSWER
     )
     assert answer_problem(asked, other) == f"it answers int_other, not {asked.interrupt_id}"
+    elsewhere = InterruptResolution(
+        interrupt_id=asked.interrupt_id, run_id="run_other", decision=InterruptDecision.ANSWER
+    )
+    assert answer_problem(asked, elsewhere) == "it answers run run_other, not run_1"
 
 
 def test_expects_must_be_a_json_schema() -> None:
@@ -159,7 +163,7 @@ def test_expects_must_be_a_json_schema() -> None:
     assert problem is not None and problem.startswith("expects is not a valid JSON Schema")
 
 
-def test_an_answer_picks_an_options_value_never_its_label() -> None:
+def test_an_answer_picks_an_options_value_or_hands_back_its_label() -> None:
     asked = _asked(
         reason=InterruptReason.CHOICE,
         ui="choice",
@@ -168,8 +172,11 @@ def test_an_answer_picks_an_options_value_never_its_label() -> None:
     assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer="globex")) is None
     assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer="ACME")) is None
     label = _answer(asked, InterruptDecision.ANSWER, answer="Globex GmbH")
-    assert answer_problem(asked, label) == (
-        "the answer 'Globex GmbH' is not one of the options ['ACME', 'globex']"
+    assert answer_problem(asked, label) is None  # the label a person was shown, handed back
+    assert meant(asked, "Globex GmbH") == "globex"
+    part = _answer(asked, InterruptDecision.ANSWER, answer="Globex G")
+    assert answer_problem(asked, part) == (
+        "the answer 'Globex G' is not one of the options ['ACME', 'globex']"
     )
 
 
@@ -208,14 +215,15 @@ def test_an_answer_from_the_askers_own_screen_still_fits_expects() -> None:
     assert answer_problem(free, _answer(free, InterruptDecision.ANSWER, answer={"x": 1})) is None
 
 
-def test_only_an_approval_of_a_tool_call_is_remembered_for_the_run() -> None:
+@pytest.mark.parametrize("remember", ["run", "always"])
+def test_only_an_approval_of_a_tool_call_is_remembered_beyond_its_call(remember: str) -> None:
     call = _asked(reason=InterruptReason.APPROVAL, tool_call=ToolCall(tool="refund"))
-    remembered = _answer(call, InterruptDecision.APPROVE, remember="run", comment="ok today")
+    remembered = _answer(call, InterruptDecision.APPROVE, remember=remember, comment="ok today")
     assert answer_problem(call, remembered) is None
     question = _asked()
     assert answer_problem(
-        question, _answer(question, InterruptDecision.APPROVE, remember="run")
-    ) == ("only an approval of a tool call is remembered for the run")
+        question, _answer(question, InterruptDecision.APPROVE, remember=remember)
+    ) == ("only an approval of a tool call is remembered beyond its call")
 
 
 #: Each enforced format: a value it takes, and one it refuses.
@@ -299,3 +307,63 @@ def test_the_enforced_set_does_not_depend_on_what_is_installed(libraries: str) -
         [sys.executable, "-c", probe, libraries], capture_output=True, text=True, check=True
     )
     assert ran.stdout.split("\n")[0] == f"{sorted(ANSWER_FORMATS)} False True"
+
+
+SUPPLIERS = [Option(value="s4", label="SUP-04 (Lyon Mills)"), "SUP-07 (Prato Knit)"]
+
+
+@pytest.mark.parametrize(
+    ("given", "option"),
+    [
+        ("S4", "s4"),  # its value
+        ("SUP-04 (Lyon Mills)", "s4"),  # its label
+        ("  sup-04  (LYON   mills) ", "s4"),  # its label, another case and spacing
+        ("sup-07 (prato knit)", "SUP-07 (Prato Knit)"),  # a plain string's value
+    ],
+)
+def test_an_option_handed_back_in_another_case_or_spacing_is_that_option(
+    given: str, option: str
+) -> None:
+    """``meant``: an answer equal to an option's value or label, whatever its case and its
+    spacing, is that option's value; the check takes it."""
+    asked = _asked(reason=InterruptReason.CHOICE, ui="choice", options=SUPPLIERS)
+    assert meant(asked, given) == option
+    assert answer_problem(asked, _answer(asked, InterruptDecision.ANSWER, answer=given)) is None
+
+
+@pytest.mark.parametrize("given", ["SUP-04", "not SUP-04", "the second one", "neither", 4])
+def test_words_that_are_no_option_are_never_read_as_one(given: Any) -> None:
+    """Nothing is guessed: a part of an option ("SUP-04"), words that name one to refuse it,
+    an ordinal, a number stay as they were said, for whoever reads them (the model)."""
+    asked = _asked(reason=InterruptReason.CHOICE, ui="choice", options=SUPPLIERS)
+    assert meant(asked, given) == given
+
+
+def test_each_pick_of_several_is_read_the_same_way() -> None:
+    asked = _asked(reason=InterruptReason.CHOICE, ui="choice", options=SUPPLIERS, multiple=True)
+    assert meant(asked, ["SUP-04 (lyon mills)", " sup-07 (PRATO KNIT)"]) == [
+        "s4",
+        "SUP-07 (Prato Knit)",
+    ]
+    fits = _answer(asked, InterruptDecision.ANSWER, answer=["S4", "SUP-07 (Prato Knit)"])
+    assert answer_problem(asked, fits) is None
+    assert meant(asked, ["SUP-04", 3]) == ["SUP-04", 3]  # no option: as given
+    assert meant(asked, "s4") == "s4"  # one value where a list is asked: as given
+
+
+def test_a_question_with_no_options_is_answered_as_given() -> None:
+    asked = _asked(ui="form")
+    assert meant(asked, " Yes ") == " Yes "
+
+
+def test_an_answer_that_fits_expects_is_read_against_the_options_first() -> None:
+    """A question that takes words beside its options (``expects`` a string): an option
+    handed back in another case is still that option; other words fit as words."""
+    asked = _asked(
+        reason=InterruptReason.CHOICE,
+        ui="choice",
+        options=SUPPLIERS,
+        expects={"type": "string", "enum": ["s4", "SUP-07 (Prato Knit)"]},
+    )
+    fits = _answer(asked, InterruptDecision.ANSWER, answer="SUP-04 (LYON MILLS)")
+    assert answer_problem(asked, fits) is None

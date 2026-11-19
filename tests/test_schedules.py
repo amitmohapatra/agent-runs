@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
 from trellis.contracts.errors import AgentError
 from trellis.contracts.ids import now
-from trellis.contracts.runs import ScheduleSpec
+from trellis.contracts.runs import RunStart, Schedule, ScheduleSpec
 
 from agent_runs.domain.cadence import jitter
 from agent_runs.domain.errors import NotFound
@@ -97,6 +98,45 @@ async def test_a_fired_run_is_queued_as_the_schedules_own_identity(app, client) 
     assert run["metadata"]["schedule_id"] == schedule["schedule_id"]
     assert run["metadata"]["created_by"] == "user_ada"
     assert run["idempotency_key"] == fired["idempotency_key"]
+
+
+async def test_a_fired_run_is_the_one_the_contracts_build(client) -> None:
+    """The run a fire queues is ``Schedule.run_start``'s, field for field: the rule for what
+    a scheduled run carries is the contracts', and the store adds only the thread."""
+    body = scheduled(
+        workspace_id="ws1",
+        timeout_seconds=90,
+        agent_version="v3",
+        priority=4,
+        concurrency_key="inbox",
+        metadata={"thread_id": "chat-7", "team": "ops", "schedule_id": "sch_forged"},
+    )
+    schedule = Schedule.read((await client.post("/v1/schedules", json=body)).json())
+    at = _last_tick()
+    fire = await client.post(
+        f"/v1/schedules/{schedule.schedule_id}/fire", json={"at": at.isoformat()}
+    )
+    fired = fire.json()
+    run = (await client.get(f"/v1/runs/{fired['run_id']}")).json()
+    start = schedule.run_start(fire_time=at, thread_id="chat-7", run_id=fired["run_id"])
+    assert {name: run[name] for name in RunStart.model_fields} == start.model_dump(mode="json")
+    assert fired["idempotency_key"] == start.idempotency_key
+
+
+async def test_one_instant_spelled_in_two_zones_is_one_run(app, client) -> None:
+    """A ticker in Berlin and a ticker in UTC name the same tick differently; if that
+    produced two keys, one tick would queue two runs."""
+    sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+        "schedule_id"
+    ]
+    utc = _last_tick()
+    berlin = utc.astimezone(ZoneInfo("Europe/Berlin")).isoformat()
+    first = (await client.post(f"/v1/schedules/{sid}/fire", json={"at": berlin})).json()
+    second = (await client.post(f"/v1/schedules/{sid}/fire", json={"at": utc.isoformat()})).json()
+    assert first["run_id"] == second["run_id"]
+    assert first["idempotency_key"] == second["idempotency_key"] == f"{sid}@{utc.isoformat()}"
+    [run] = await queued_runs(app)
+    assert run["run_metadata"]["fire_time"] == utc.isoformat()
 
 
 async def test_a_repeat_for_the_same_instant_after_an_edit_returns_the_same_run(
@@ -340,6 +380,39 @@ async def test_a_retryable_failure_backs_off_on_the_schedules_clock(
     broken.heal()
     later = await ticker.tick(now=datetime.now(UTC) + timedelta(minutes=30))
     assert later.fired == 1
+
+
+async def test_a_fire_the_blob_store_cannot_take_is_recorded_and_backs_off(
+    app, client, blobs, ticker, monkeypatch
+) -> None:
+    """A blob store that does not answer fails the fire as the database does: recorded on
+    the schedule, which backs off, so the schedules due after it are tried in the same tick
+    and it is not the first one tried, and failed, on every tick after."""
+    sids = [
+        (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()["schedule_id"]
+        for _ in range(2)
+    ]
+    for sid in sids:
+        await _make_due(app, sid)
+
+    async def unreachable(*_: object, **__: object) -> None:
+        raise OSError("no route to the store")
+
+    with monkeypatch.context() as down:
+        down.setattr(blobs, "put", unreachable)
+        assert (await ticker.tick()).fired == 0
+        failed = await client.post(f"/v1/schedules/{sids[0]}/fire")
+    assert failed.status_code == 503 and failed.json()["retryable"] is True
+    for sid, failures in zip(sids, (2, 1), strict=True):
+        recorded = (await client.get(f"/v1/schedules/{sid}")).json()
+        assert recorded["consecutive_failures"] == failures
+        assert recorded["retry_after"] is not None and recorded["enabled"] is True
+        error = recorded["last_error"]
+        assert (error["code"], error["category"]) == ("Unavailable", "DEPENDENCY")
+        assert error["retryable"] is True
+
+    later = await ticker.tick(now=datetime.now(UTC) + timedelta(hours=2))
+    assert later.fired == 2
 
 
 # ------------------------------------------------------------------ timing

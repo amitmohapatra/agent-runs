@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import at, pause, started
+from tests.conftest import SETTINGS, at, pause, started
 
 
 async def _paused(client, **fields) -> dict:
@@ -14,7 +14,7 @@ async def _paused(client, **fields) -> dict:
 
 async def _sweep(app, minutes: float):
     async with app.state.sessions() as db:
-        moved = await RunStore(db).escalate_overdue(now=at(minutes), limit=10)
+        moved = await RunStore(db, SETTINGS.limits).escalate_overdue(now=at(minutes), limit=10)
         await db.commit()
     return moved
 
@@ -56,5 +56,5 @@ async def test_the_sweep_is_bounded(app, client) -> None:
     for _ in range(3):
         await _paused(client, deadline=at(1).isoformat())
     async with app.state.sessions() as db:
-        assert len(await RunStore(db).escalate_overdue(now=at(2), limit=2)) == 2
+        assert len(await RunStore(db, SETTINGS.limits).escalate_overdue(now=at(2), limit=2)) == 2
         await db.commit()

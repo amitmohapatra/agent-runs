@@ -536,6 +536,22 @@
             "description": "Progress to save: the executor's resume journal as it stands, at most 1 MiB of compact JSON. Replaces the run's checkpoint; absent, it is kept.",
             "title": "Checkpoint"
           },
+          "events": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RunEvent"
+                },
+                "maxItems": 500,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Events of the run not in its log yet, added in the same transaction as the checkpoint (at most 500, in the order they happened, as an append takes them; one already logged is skipped): the progress a crash keeps and the events that show it are saved together, or neither is.",
+            "title": "Events"
+          },
           "lease_seconds": {
             "default": 60,
             "description": "The new lease (or hold), from now, 5 to 3600 s. A run never queued whose hold lapses is ended ERROR (holder_lost).",
@@ -1052,7 +1068,7 @@
         "description": "Payload objects to read at once, by SHA-256: a checkpoint's segments.",
         "properties": {
           "sha256": {
-            "description": "The objects' SHA-256s, in the order their bytes are answered.",
+            "description": "The objects' SHA-256s, in the order their bytes are answered (a resume's segments: a journal keeps at most 64). One named twice is answered twice.",
             "items": {
               "pattern": "^[0-9a-f]{64}$",
               "type": "string"
@@ -1466,7 +1482,7 @@
                 "type": "null"
               }
             ],
-            "description": "The failure a RUN_ERROR or a failed RUN_FINISHED reports; None otherwise."
+            "description": "The failure a RUN_ERROR, or a RUN_FINISHED whose outcome is error, timeout or rejected, reports; refused on any other event."
           },
           "event_id": {
             "description": "Event id, 'evt_' plus 32 hex characters unless given.",
@@ -1706,7 +1722,7 @@
         "type": "object"
       },
       "RunRecord": {
-        "description": "A run as a run store keeps it: the start plus where it is. ``awaiting`` is the\ninterrupt a paused run waits on and nothing else; ``error`` belongs to a failed ending.\n``checkpoint`` is opaque executor state (the resume journal: answered asks, completed tool\noutputs, a framework's own resume state) written when the run pauses, returned on read and\nclaim so another worker resumes without repeating side effects, and cleared when the run\nfinishes; the service bounds its size. Read back from a store, so unknown columns are\nignored rather than refused.",
+        "description": "A run as a run store keeps it: the start plus where it is. ``awaiting`` is the\ninterrupt a paused run waits on and nothing else; ``error`` belongs to a failed ending.\n``checkpoint`` is opaque executor state (the resume journal: answered asks, completed tool\noutputs, a framework's own resume state) written when the run pauses, returned on read and\nclaim so another worker resumes without repeating side effects, and cleared when the run\nfinishes unless its caller asks the store to keep it (to rewind the ended run from); the\nservice bounds its size. Read back from a store, so unknown columns are ignored rather\nthan refused; :meth:`read` ignores them in ``awaiting`` and ``last_resolution`` too.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent that executes the run.",
@@ -1760,7 +1776,7 @@
                 "type": "null"
               }
             ],
-            "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; never on a final run. Size bounded by the service.",
+            "description": "Opaque executor state (resume journal) written with a pause and returned on read and claim; on a final run only when its caller asked the store to keep it. Size bounded by the service.",
             "title": "Checkpoint"
           },
           "concurrency_key": {
@@ -1808,7 +1824,7 @@
                 "type": "null"
               }
             ],
-            "description": "Why the run failed; only on ERROR, TIMEOUT and REJECTED, None otherwise."
+            "description": "Why the run failed. Only an ERROR, TIMEOUT or REJECTED run may carry one, and a record of one without it is valid; refused on any other status."
           },
           "idempotency_key": {
             "anyOf": [
@@ -2188,15 +2204,13 @@
           "last_error": {
             "anyOf": [
               {
-                "additionalProperties": true,
-                "type": "object"
+                "$ref": "#/components/schemas/AgentError"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "The last fire failure as a JSON AgentError; None after a successful fire.",
-            "title": "Last Error"
+            "description": "Why the last fire could not queue a run; None after a successful fire."
           },
           "last_fired_at": {
             "anyOf": [
@@ -2350,7 +2364,7 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can.",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can\n(:meth:`Schedule.run_start` is that copy).",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
@@ -3386,7 +3400,7 @@
     },
     "/v1/payloads/read": {
       "post": {
-        "description": "The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one\nanswer, read from the store in parallel: a resume is one round trip, not one per\nsegment. 404 when any is not this tenant's.",
+        "description": "The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one\nanswer, read from the store in parallel: a resume is one round trip, not one per\nsegment. 404 when any is not this tenant's. What one answer holds is bounded: the bytes\nasked for are at most 64 MiB together (413 past it, before any is read), and an object\nasked for twice is read once.",
         "operationId": "artifacts.get_payloads",
         "parameters": [
           {
@@ -3570,7 +3584,7 @@
                 }
               }
             },
-            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "description": "PAYLOAD_TOO_LARGE: the objects asked for are more than 64 MiB together (one asked for twice counts twice): ask for them in several requests. Or the body itself is too large.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -8824,7 +8838,7 @@
     },
     "/v1/runs/{run_id}/payloads": {
       "post": {
-        "description": "Store the body, a payload object, for the run's tenant and return its reference: a\ncheckpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may\nwrite is who may add an artifact; the object is checked to decode before it is stored, and\nstored once however often it is sent (its key is its SHA-256). At most 50 MiB (413). An\nobject no checkpoint names is deleted a day later.",
+        "description": "Store the body, a payload object, for the run's tenant and return its reference: a\ncheckpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may\nwrite is who may add an artifact; the object is checked to decode before it is stored, and\nstored once however often it is sent (its key is its SHA-256). At most 50 MiB, and at\nmost 64 MiB decompressed, which its header says before anything is decoded (413). An\nobject no checkpoint names is deleted a day later.",
         "operationId": "artifacts.put_payload",
         "parameters": [
           {
@@ -9113,7 +9127,7 @@
                 }
               }
             },
-            "description": "PAYLOAD_TOO_LARGE: the body, or a part of it with its own bound, is too large.",
+            "description": "PAYLOAD_TOO_LARGE: the body is more than 50 MiB, or decompresses to more than 64 MiB.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"

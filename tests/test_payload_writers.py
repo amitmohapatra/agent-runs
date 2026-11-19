@@ -1,7 +1,7 @@
 """Run payloads are written by reference: a run's rows hold no payload, reads answer the JSON
 that was sent, a checkpoint may be a list of segments the worker uploaded, an unchanged save
 stores nothing new, a write that never commits leaves only an orphan the sweep deletes, and an
-ended run's events become one object."""
+ended run's events become objects, a page's worth each."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from sqlalchemy import event, func, select
 from trellis.contracts.ids import now
 from trellis.runs.payloads import FRAMED_MEDIA_TYPE, SEGMENTS, decode, encode, frames, ref_of
 
+from agent_runs.api.routers import artifacts
 from agent_runs.api.routers.artifacts import MAX_READ_OBJECTS
 from agent_runs.blob.payloads import ORPHAN_AGE
 from agent_runs.config.settings import BlobSettings
+from agent_runs.store import runs
 from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import (
     PayloadBlobRow,
@@ -25,7 +27,7 @@ from agent_runs.store.tables import (
     RunRow,
     WebhookDeliveryRow,
 )
-from tests.conftest import client_of, pause, resolution, started
+from tests.conftest import SETTINGS, client_of, pause, resolution, started
 from tests.test_events import _event
 
 TENANT = "acme"
@@ -198,6 +200,24 @@ async def test_a_save_that_never_commits_leaves_an_orphan_the_sweep_deletes(
     assert await _objects(app) == 0, "nothing referred to it"
 
 
+async def test_a_checkpoint_kept_past_the_end_outlives_the_sweep(
+    app: Any, client: Any, ticker: Any
+) -> None:
+    """A run finished with ``keep_checkpoint`` still refers to its checkpoint's object: the
+    sweep, which deletes what nothing refers to, leaves it, and it reads back a day later."""
+    run_id, worker = await _claimed(client)
+    kept = {"asks": {"ask_1": "yes"}, "done": True}
+    done = await client.post(
+        f"/v1/runs/{run_id}/finish",
+        params={"worker_id": worker},
+        json={"status": "SUCCESS", "keep_checkpoint": True, "checkpoint": kept},
+    )
+    assert done.status_code == 200, done.text
+    assert (await _links(app, run_id)).get("checkpoint") == 1
+    await ticker.tick(now=now() + ORPHAN_AGE + timedelta(minutes=1))
+    assert (await client.get(f"/v1/runs/{run_id}")).json()["checkpoint"] == kept
+
+
 async def test_a_store_that_does_not_answer_refuses_the_save_and_keeps_the_last(
     app: Any, client: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -234,7 +254,7 @@ async def test_a_webhook_body_is_sent_as_it_was_announced(
 
 
 # ------------------------------------------------------------------ event compaction
-async def test_an_ended_runs_events_become_one_object_and_replay_the_same(
+async def test_an_ended_runs_events_become_objects_and_replay_the_same(
     app: Any, client: Any, ticker: Any
 ) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
@@ -261,14 +281,51 @@ async def test_an_ended_runs_events_become_one_object_and_replay_the_same(
     assert await _links(app, run_id) == {"events": 1}
 
 
+async def test_a_page_of_a_compacted_log_reads_only_the_objects_it_spans(
+    app: Any, client: Any, ticker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compacted log is an object per ``EVENT_CHUNK`` events, so a page reads the chunk it
+    starts in (and the next, when it runs past its end), never the whole log; a run that
+    logged nothing has no object at all."""
+    monkeypatch.setattr(runs, "EVENT_CHUNK", 3)
+    run_id = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    events = [_event(run_id, n) for n in range(1, 9)]
+    await client.post(f"/v1/runs/{run_id}/events", json={"events": events})
+    await client.post(f"/v1/runs/{run_id}/finish", json={"status": "SUCCESS"})
+    silent = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    await client.post(f"/v1/runs/{silent}/finish", json={"status": "SUCCESS"})
+    pages = [(0, 3), (3, 3), (1, 3), (6, 500), (8, 500), (0, 500)]
+    before = [await _page(client, run_id, after, limit) for after, limit in pages]
+    stream = (await client.get(f"/v1/runs/{run_id}/events/stream")).text
+
+    assert (await ticker.tick()).compacted == 2
+    assert await _links(app, run_id) == {"events": 3} and await _links(app, silent) == {}
+    reads = _counting_reads(app, monkeypatch)
+    spanned = []
+    for after, limit in pages:
+        reads.clear()
+        assert await _page(client, run_id, after, limit) == before[pages.index((after, limit))]
+        spanned.append(len(reads))
+    assert spanned == [1, 1, 2, 1, 0, 3]
+    assert (await client.get(f"/v1/runs/{run_id}/events/stream")).text == stream
+    assert await _page(client, silent, 0, 500) == b"[]"
+    assert (await ticker.tick()).compacted == 0
+
+
+async def _page(client: Any, run_id: str, after: int, limit: int) -> bytes:
+    page = await client.get(f"/v1/runs/{run_id}/events", params={"after": after, "limit": limit})
+    assert page.status_code == 200, page.text
+    return page.content
+
+
 async def test_compaction_another_ticker_won_changes_nothing(app: Any, client: Any) -> None:
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})
     async with app.state.sessions() as db:
-        assert await RunStore(db).compact_events(TENANT, run["run_id"])
+        assert await RunStore(db, SETTINGS.limits).compact_events(TENANT, run["run_id"])
         await db.commit()
     async with app.state.sessions() as db:
-        assert not await RunStore(db).compact_events(TENANT, run["run_id"])
+        assert not await RunStore(db, SETTINGS.limits).compact_events(TENANT, run["run_id"])
 
 
 # ------------------------------------------------------------------ retention
@@ -298,6 +355,93 @@ async def test_a_checkpoints_segments_read_back_in_one_request_in_order(
         assert refused.status_code == 404, "another tenant's objects are not read"
     too_many = {"sha256": [refs[0]["sha256"]] * (MAX_READ_OBJECTS + 1)}
     assert (await client.post("/v1/payloads/read", json=too_many)).status_code == 422
+
+
+async def test_objects_asked_for_twice_are_read_once_and_answered_where_asked(
+    app: Any, client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two segments with the same content are one object: it is read from the store once,
+    and its bytes answered at each place it was asked for."""
+    run_id, worker = await _claimed(client)
+    params = {"worker_id": worker}
+    one, two = [
+        (
+            await client.post(f"/v1/runs/{run_id}/payloads", params=params, content=encode([n]))
+        ).json()["sha256"]
+        for n in (1, 2)
+    ]
+    reads = _counting_reads(app, monkeypatch)
+    read = await client.post(
+        "/v1/payloads/read",
+        json={"sha256": [one, two, one, one]},
+        headers={"Accept-Encoding": "identity"},
+    )
+    assert read.status_code == 200, read.text
+    assert int(read.headers["content-length"]) == len(read.content)
+    assert [decode(f) for f in frames(read.content)] == [[1], [2], [1], [1]]
+    assert len(reads) == 2
+
+
+async def test_a_read_of_more_bytes_than_one_answer_holds_is_refused_before_any_is_read(
+    app: Any, client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What one answer holds is bounded by the bytes asked for, an object asked for twice
+    counted twice: past the bound it is a 413 that read nothing from the store."""
+    run_id, worker = await _claimed(client)
+    stored = [encode([n] * 50) for n in range(3)]
+    refs = [
+        (
+            await client.post(
+                f"/v1/runs/{run_id}/payloads", params={"worker_id": worker}, content=data
+            )
+        ).json()
+        for data in stored
+    ]
+    monkeypatch.setattr(artifacts, "MAX_READ_BYTES", refs[0]["size"] + refs[1]["size"])
+    reads = _counting_reads(app, monkeypatch)
+    fits = await client.post("/v1/payloads/read", json={"sha256": [refs[0]["sha256"]] * 2})
+    assert fits.status_code == 200
+    reads.clear()
+    for asked in ([r["sha256"] for r in refs], [refs[0]["sha256"]] * 3):
+        refused = await client.post("/v1/payloads/read", json={"sha256": asked})
+        assert refused.status_code == 413, refused.text
+        assert refused.json()["code"] == "PAYLOAD_TOO_LARGE"
+    assert reads == []
+
+
+async def test_an_object_that_decodes_past_the_bound_is_refused_undecoded(
+    app: Any, client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A small upload may claim to decompress to far more: its declared size is checked
+    before it is decoded, so validating it cannot be made to hold more than the bound."""
+    run_id, worker = await _claimed(client)
+    monkeypatch.setattr(artifacts, "MAX_PAYLOAD_DECODED_BYTES", 1024)
+    decoded: list[bytes] = []
+
+    async def decoding(data: bytes) -> Any:
+        decoded.append(data)
+        return decode(data)
+
+    monkeypatch.setattr(artifacts, "adecode", decoding)
+    path, params = f"/v1/runs/{run_id}/payloads", {"worker_id": worker}
+    bomb = await client.post(path, params=params, content=encode("0" * 2048))
+    assert bomb.status_code == 413 and "1024" in bomb.json()["detail"]
+    assert decoded == [] and await _objects(app) == 0
+    assert (await client.post(path, params=params, content=encode("0" * 512))).status_code == 201
+    assert (await client.post(path, params=params, content=b"not zstd")).status_code == 422
+
+
+def _counting_reads(app: Any, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The keys read from the payload store from now on, in order."""
+    read: list[str] = []
+    get_encoded = app.state.payloads.get_encoded
+
+    async def counted(ref: Any) -> bytes:
+        read.append(ref.ref)
+        return await get_encoded(ref)
+
+    monkeypatch.setattr(app.state.payloads, "get_encoded", counted)
+    return read
 
 
 async def test_a_save_that_adds_a_segment_costs_the_same_however_many_there_are(

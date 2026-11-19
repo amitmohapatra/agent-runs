@@ -9,10 +9,12 @@ interrupt or a run that worked too long is a test rather than a wait.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import Select, case, delete, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,11 +36,11 @@ from trellis.runs.payloads import SEGMENTS, PayloadRef, owned_by
 from agent_runs.answering import require_may_answer, require_may_cancel, require_may_hold
 from agent_runs.blob.payloads import PayloadStore, payloads_of
 from agent_runs.config.constants import (
-    CONCURRENCY_PER_KEY,
     DEFAULT_LEASE_SECONDS,
     DEFAULT_PAGE,
     ERROR_RETRY_BASE,
     ERROR_RETRY_CAP,
+    EVENT_CHUNK,
     LAPSE_RETRY_BASE,
     LAPSE_RETRY_CAP,
     MAX_ERROR_RETRIES,
@@ -46,6 +48,7 @@ from agent_runs.config.constants import (
     PAUSED_ARTIFACT_ROLE,
     RESUME_GRACE,
 )
+from agent_runs.config.settings import LimitsSettings
 from agent_runs.domain.errors import Conflict, Forbidden, LeaseLost, NotFound, Unprocessable
 from agent_runs.domain.runs import (
     Claimed,
@@ -74,6 +77,7 @@ from agent_runs.store.tables import (
     RunPayloadRow,
     RunRow,
 )
+from agent_runs.store.webhooks import WebhookStore
 
 #: A record's columns; its payloads are read by reference (``_REFS``).
 _RECORD_FIELDS = (
@@ -124,7 +128,7 @@ _IN_LINE = (RunStatus.RUNNING.value, RunStatus.QUEUED.value)
 
 #: The statuses a run can still move on from, as ``ix_runs_deadline`` names them: the runs a
 #: deadline can still catch.
-_UNENDED = (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.PAUSED.value)
+_UNENDED = tuple(status.value for status in RunStatus if not status.final)
 
 #: What a start asks for, compared when an ``idempotency_key`` finds an earlier run: the
 #: same key with a different request is a client bug to surface, not a run to hand back.
@@ -166,35 +170,41 @@ _REFS = {
 }
 
 
+def _fields(row: RunRow, now: datetime, places: Mapping[str, datetime]) -> dict[str, Any]:
+    """A record's fields as the row alone gives them, placed as ``places`` says (by run id;
+    none for a run with no key): no payload, each of which the row keeps by reference."""
+    fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
+    fields["placed_at"] = places.get(row.run_id)
+    fields["metadata"] = row.run_metadata or {}
+    fields["worked_seconds"] = _worked(row, now)
+    if row.checkpoint_segments is not None:
+        fields["checkpoint"] = {SEGMENTS: row.checkpoint_segments}
+    if row.awaiting is not None:
+        fields["awaiting"] = dict(row.awaiting)
+    return fields
+
+
 async def _records(
     payloads: PayloadStore,
     rows: Sequence[RunRow],
     now: datetime,
     places: Mapping[str, datetime],
 ) -> list[RunRecord]:
-    """The runs' records, every payload the rows refer to read in (all at once), each placed
-    as ``places`` says (by run id; none for a run with no key)."""
+    """The runs' records, every payload the rows refer to read in (all at once)."""
     wanted: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     records: list[dict[str, Any]] = []
     for row in rows:
-        fields: dict[str, Any] = {name: getattr(row, name) for name in _RECORD_FIELDS}
-        fields["placed_at"] = places.get(row.run_id)
-        fields["metadata"] = row.run_metadata or {}
-        fields["worked_seconds"] = _worked(row, now)
+        fields = _fields(row, now, places)
         for name, column in _REFS.items():
-            fields[name] = None
             if (ref := getattr(row, column)) is not None:
                 wanted.append((fields, name, ref))
-        if row.checkpoint_segments is not None:
-            fields["checkpoint"] = {SEGMENTS: row.checkpoint_segments}
         if row.awaiting_ref is not None and row.awaiting is not None:
-            fields["awaiting"] = dict(row.awaiting)
             wanted.append((fields["awaiting"], "payload", row.awaiting_ref))
         records.append(fields)
     values = await payloads.get_many(ref for _, _, ref in wanted)
     for (into, name, _), value in zip(wanted, values, strict=True):
         into[name] = value
-    return [RunRecord.model_validate(fields) for fields in records]
+    return [RunRecord.read(fields) for fields in records]
 
 
 #: What a payload object is to a run (``run_payloads.kind``).
@@ -206,6 +216,22 @@ _INPUT, _OUTPUT, _AWAITING, _ANSWER, _CHECKPOINT, _EVENTS = (
     "checkpoint",
     "events",
 )
+
+
+#: In ``events_ref``, the objects of a compacted event log, oldest first: the last position
+#: each holds (``through``) and its reference (``ref``).
+_CHUNKS = "chunks"
+
+
+def _chunks(events_ref: dict[str, Any] | None) -> list[tuple[int, dict[str, Any]]]:
+    """A compacted event log's objects as ``(last position, reference)``, oldest first; none
+    for a log not compacted. A log compacted before logs were chunked is one object, the
+    reference itself, holding every event."""
+    if events_ref is None:
+        return []
+    if _CHUNKS not in events_ref:
+        return [(sys.maxsize, events_ref)]
+    return [(chunk["through"], chunk["ref"]) for chunk in events_ref[_CHUNKS]]
 
 
 def _dumped(ref: PayloadRef | None) -> dict[str, Any] | None:
@@ -220,6 +246,21 @@ def _asked_without_payload(interrupt: Interrupt) -> tuple[dict[str, Any], Any]:
 
 def _json(model: Any) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True) if model is not None else None
+
+
+def _timed_out(code: str, message: str) -> dict[str, Any] | None:
+    """The error of a run a ticker's sweep ended, as its row keeps it. ``retryable`` is false
+    as a directly built ``AgentError``'s is anyway, said here because ``TIMEOUT`` is a
+    category callers otherwise take for retryable."""
+    return _json(
+        AgentError(
+            code=code,
+            category=ErrorCategory.TIMEOUT,
+            message=message,
+            retryable=False,
+            source="agent-runs",
+        )
+    )
 
 
 def _differing(existing: RunRecord, start: RunStart, *, queue: bool, queued: bool) -> list[str]:
@@ -303,7 +344,7 @@ def _retried(row: RunRow, ending: RunFinish) -> bool:
         and error is not None
         and error.retryable
         and row.status == RunStatus.RUNNING
-        and row.queued_at is not None
+        and _durable(row)
         and row.error_retries < MAX_ERROR_RETRIES
         and row.cancel_requested_at is None
     )
@@ -363,10 +404,16 @@ def _after_the_line(tenant_id: str, key: str, now: datetime, *, but: str = "") -
     return func.greatest(clock, latest + _AFTER, type_=RunRow.updated_at.type)
 
 
+def _durable(row: RunRow) -> bool:
+    """Whether the run is a durable one: it went through the queue, so a worker runs it and
+    it can go back on the queue."""
+    return row.queued_at is not None
+
+
 def _in_callers_process(row: RunRow) -> bool:
     """Whether the run is kept in its caller's process: never queued, so no worker leases it
     and its caller may hold it instead."""
-    return row.lease_owner is None and row.queued_at is None
+    return row.lease_owner is None and not _durable(row)
 
 
 def _lock_id(*names: str) -> Any:
@@ -383,24 +430,21 @@ def _counted(error: AgentError | None, retries: int) -> AgentError | None:
 
 
 class RunStore:
-    """Every run operation, in one place. The caller commits. ``max_run_seconds`` is the
-    service's maximum working time (``RUNS__LIMITS__MAX_RUN_SECONDS``): a run's own
-    ``timeout_seconds`` may only be shorter. ``concurrency_per_key`` and
-    ``max_running_per_tenant`` bound what a claim may take (``RUNS__LIMITS__*``)."""
+    """Every run operation, in one place. The caller commits, the run's change and the
+    webhook event it causes (written to the outbox with it) together. ``limits`` are the
+    deployment's (``RUNS__LIMITS__*``), which every store is built with: ``max_run_seconds``
+    is the service's maximum working time (a run's own ``timeout_seconds`` may only be
+    shorter); ``concurrency_per_key`` and ``max_running_per_tenant`` bound what a claim may
+    take."""
 
-    def __init__(
-        self,
-        session: AsyncSession,
-        *,
-        max_run_seconds: float | None = None,
-        concurrency_per_key: int = CONCURRENCY_PER_KEY,
-        max_running_per_tenant: int | None = None,
-    ) -> None:
+    def __init__(self, session: AsyncSession, limits: LimitsSettings) -> None:
         self._session = session
         self._payloads = payloads_of(session)
-        self._max_run_seconds = max_run_seconds
-        self._per_key = concurrency_per_key
-        self._per_tenant = max_running_per_tenant
+        self._webhooks = WebhookStore(session)
+        self.limits = limits
+        self._max_run_seconds = limits.max_run_seconds
+        self._per_key = limits.concurrency_per_key
+        self._per_tenant = limits.max_running_per_tenant
 
     def _limit(self, row: RunRow) -> float | None:
         """The most working time the run may take: its own limit or the service's, the
@@ -614,7 +658,7 @@ class RunStore:
         )
         if resolution.decision is InterruptDecision.CANCEL:
             _move(row, RunStatus.CANCELLED, now)
-        elif row.queued_at is not None:
+        elif _durable(row):
             _requeue(row, now)
         else:
             _move(row, RunStatus.RUNNING, now)
@@ -764,13 +808,11 @@ class RunStore:
     def _next_queued(
         self, tenant_id: str | None, request: ClaimRequest, now: datetime, passed: list[Any]
     ) -> Select[tuple[RunRow]]:
-        """The query for the next run a claim may take, in claim order, locked."""
-        held = (
-            select(RunRow.tenant_id, func.count().label("runs"))
-            .where(*_LEASED, RunRow.agent_id.in_(request.agent_ids))
-            .group_by(RunRow.tenant_id)
-            .subquery()
-        )
+        """The query for the next run a claim may take, in claim order, locked. A tenant's
+        claim is ordered by priority and age alone (the fair share is between tenants), which
+        is the order ``ix_runs_queue`` holds: for one agent it reads the first run with room
+        and stops, whatever the queue's depth. A claim across tenants, or for several agents,
+        sorts every queued run it may take."""
         sharing = aliased(RunRow)
         running_with_key = (
             select(func.count())
@@ -782,21 +824,27 @@ class RunStore:
             )
             .scalar_subquery()
         )
-        query = (
-            select(RunRow)
-            .outerjoin(held, held.c.tenant_id == RunRow.tenant_id)
-            .where(
-                RunRow.status == RunStatus.QUEUED.value,
-                RunRow.agent_id.in_(request.agent_ids),
-                or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
-                or_(RunRow.concurrency_key.is_(None), running_with_key < self._per_key),
-                *passed,
-            )
-            .order_by(func.coalesce(held.c.runs, 0), RunRow.priority.desc(), RunRow.queued_at)
-            .limit(1)
-            .with_for_update(of=RunRow, skip_locked=True)
+        query = select(RunRow).where(
+            RunRow.status == RunStatus.QUEUED.value,
+            RunRow.agent_id.in_(request.agent_ids),
+            or_(RunRow.available_at.is_(None), RunRow.available_at <= now),
+            or_(RunRow.concurrency_key.is_(None), running_with_key < self._per_key),
+            *passed,
         )
-        return query if tenant_id is None else query.where(RunRow.tenant_id == tenant_id)
+        order = (RunRow.priority.desc(), RunRow.queued_at)
+        if tenant_id is not None:
+            query = query.where(RunRow.tenant_id == tenant_id).order_by(*order)
+        else:
+            held = (
+                select(RunRow.tenant_id, func.count().label("runs"))
+                .where(*_LEASED, RunRow.agent_id.in_(request.agent_ids))
+                .group_by(RunRow.tenant_id)
+                .subquery()
+            )
+            query = query.outerjoin(held, held.c.tenant_id == RunRow.tenant_id).order_by(
+                func.coalesce(held.c.runs, 0), *order
+            )
+        return query.limit(1).with_for_update(of=RunRow, skip_locked=True)
 
     async def _tenant_has_room(self, row: RunRow) -> bool:
         """Do the run's tenant's workers hold fewer runs than the cap (always, uncapped)?"""
@@ -902,6 +950,8 @@ class RunStore:
         if checkpoint is not None:
             await self._keep_checkpoint(row, checkpoint)
             row.updated_at = now
+        if request.events:  # in the checkpoint's transaction: saved with it, or not at all
+            await self._logged(row, request.events)
         if in_process:
             require_may_hold(caller, row.on_behalf_of or row.user_id)
             lease = self._hold(row, request.worker_id, request.lease_seconds, now)
@@ -1006,19 +1056,11 @@ class RunStore:
         )
         for row in rows:
             _move(row, RunStatus.TIMEOUT, now)
-            row.error = _json(
-                AgentError(
-                    code="run_deadline",
-                    category=ErrorCategory.TIMEOUT,
-                    message=f"the run did not end by its deadline, {row.deadline}",
-                    # the category alone would say retryable; a retry would only be later
-                    retryable=False,
-                    source="agent-runs",
-                )
+            # not retryable: a retry would only be later
+            row.error = _timed_out(
+                "run_deadline", f"the run did not end by its deadline, {row.deadline}"
             )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def time_out_overworked(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Running runs whose working time passed their limit (``_limit``: their own
@@ -1039,20 +1081,13 @@ class RunStore:
         )
         for row in rows:
             _move(row, RunStatus.TIMEOUT, now)
-            row.error = _json(
-                AgentError(
-                    code="run_timeout",
-                    category=ErrorCategory.TIMEOUT,
-                    message=f"the run worked {row.worked_seconds:.0f} s, past its limit of "
-                    f"{self._limit(row):g} s",
-                    # the category alone would say retryable; a retry would only run as long
-                    retryable=False,
-                    source="agent-runs",
-                )
+            # not retryable: a retry would only run as long
+            row.error = _timed_out(
+                "run_timeout",
+                f"the run worked {row.worked_seconds:.0f} s, past its limit of "
+                f"{self._limit(row):g} s",
             )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def requeue_lapsed(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs whose worker stopped heartbeating go back on the queue as the next attempt,
@@ -1072,21 +1107,15 @@ class RunStore:
             row.lease_lapses += 1
             if row.lease_lapses >= MAX_LEASE_LAPSES:
                 _move(row, RunStatus.ERROR, now)
-                row.error = _json(
-                    AgentError(
-                        code="lease_expired",
-                        category=ErrorCategory.TIMEOUT,
-                        message=f"the lease lapsed {row.lease_lapses} times: every worker "
-                        "that claimed the run stopped heartbeating",
-                        source="agent-runs",
-                    )
+                row.error = _timed_out(
+                    "lease_expired",
+                    f"the lease lapsed {row.lease_lapses} times: every worker "
+                    "that claimed the run stopped heartbeating",
                 )
             else:
                 wait = backoff(LAPSE_RETRY_BASE, row.lease_lapses, cap=LAPSE_RETRY_CAP)
                 _requeue(row, now, wait=jittered(wait))
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def end_abandoned(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Runs kept in their caller's process whose hold lapsed (:meth:`_hold`: the process
@@ -1111,23 +1140,16 @@ class RunStore:
                 f"and nothing held it by {held_until} (the process that ran it before it paused "
                 "stopped while it waited)"
             )
-            row.error = _json(
-                AgentError(
-                    code="holder_lost",
-                    category=ErrorCategory.TIMEOUT,
-                    message=stopped,
-                    # nothing could retry it: the work was in the process that stopped
-                    retryable=False,
-                    source="agent-runs",
-                )
-            )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+            # nothing could retry it: the work was in the process that stopped
+            row.error = _timed_out("holder_lost", stopped)
+        return await self._swept(rows, now)
 
     async def escalate_overdue(self, *, now: datetime, limit: int) -> list[RunRecord]:
         """Paused runs past their interrupt's deadline go to ``escalate_to`` (once: the new
-        interrupt has no deadline), or end as ``TIMEOUT`` when nobody is named."""
+        interrupt has no deadline), or end as ``TIMEOUT`` when nobody is named. One whose
+        stored interrupt cannot be read (a newer build wrote it) ends ``TIMEOUT`` too,
+        ``interrupt_unreadable``: there is nobody to read ``escalate_to`` from, and it must
+        not fail the sweep for the runs after it."""
         rows = await self._sweep(
             RunRow.status == RunStatus.PAUSED.value,
             RunRow.awaiting_deadline < now,
@@ -1135,7 +1157,16 @@ class RunStore:
             limit=limit,
         )
         for row in rows:
-            interrupt = Interrupt.model_validate(row.awaiting)
+            try:
+                interrupt = Interrupt.model_validate(row.awaiting)
+            except ValidationError as exc:
+                _move(row, RunStatus.TIMEOUT, now)
+                row.error = _timed_out(
+                    "interrupt_unreadable",
+                    "nobody answered by the interrupt's deadline, and the stored interrupt "
+                    f"cannot be read to escalate it ({exc.error_count()} validation errors)",
+                )
+                continue
             if interrupt.escalate_to:
                 escalated = interrupt.model_copy(
                     update={
@@ -1150,17 +1181,10 @@ class RunStore:
                 row.updated_at = now
             else:
                 _move(row, RunStatus.TIMEOUT, now)
-                row.error = _json(
-                    AgentError(
-                        code="interrupt_deadline",
-                        category=ErrorCategory.TIMEOUT,
-                        message=f"nobody answered by {interrupt.deadline}",
-                        source="agent-runs",
-                    )
+                row.error = _timed_out(
+                    "interrupt_deadline", f"nobody answered by {interrupt.deadline}"
                 )
-        await self._ended(rows, now)
-        await self._session.flush()
-        return await self._records(rows, now)
+        return await self._swept(rows, now)
 
     async def purge_ended(self, *, before: datetime, limit: int) -> int:
         """Delete the runs that ended before ``before``, with their resolutions and their
@@ -1180,6 +1204,18 @@ class RunStore:
             await self._session.execute(delete(ResolutionRow).where(ResolutionRow.run_id.in_(gone)))
             await self._session.execute(delete(RunRow).where(RunRow.run_id.in_(gone)))
         return len(gone)
+
+    async def _swept(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
+        """What every sweep ends with: the rows it moved, written and announced (one a
+        sweep leaves ``PAUSED`` was escalated; a requeue announces nothing), as records
+        without their payloads (input, output, answer, checkpoint, the question's payload).
+        Announcing takes none of them: a batch is not read from the blob store."""
+        await self._ended(rows, now)
+        await self._session.flush()
+        places = await self._places(rows)
+        moved = [RunRecord.read(_fields(row, now, places)) for row in rows]
+        await self._webhooks.announce(*moved, escalated=True, now=now)
+        return moved
 
     async def _sweep(self, *conditions: Any, order: Any, limit: int) -> Sequence[RunRow]:
         query = (
@@ -1232,15 +1268,22 @@ class RunStore:
         (``Unprocessable`` otherwise); one already logged (its attempt and sequence) is
         skipped, so a retried append adds nothing. The run's row lock orders the positions:
         two appends to one run never interleave."""
-        if any((e.tenant_id, e.run_id) != (tenant_id, run_id) for e in append.events):
-            raise Unprocessable("an event names another run")
         row = await self._locked(tenant_id, run_id, worker_id=None)
         if row.status != RunStatus.RUNNING:
             if worker_id is not None:
                 raise LeaseLost(f"run {run_id} is {row.status}; worker {worker_id} holds no lease")
             raise Conflict(f"run {run_id} is {row.status}; events are appended while it runs")
         _held_by(row, worker_id)
-        asked = [(event.attempt, event.sequence) for event in append.events]
+        return await self._logged(row, append.events)
+
+    async def _logged(self, row: RunRow, events: Sequence[RunEvent]) -> EventsAppended:
+        """``events`` added to the log of ``row``'s run (locked, running), each at the next
+        position; one already logged (its attempt and sequence) is skipped. Every event names
+        this run and tenant (``Unprocessable`` otherwise)."""
+        tenant_id, run_id = row.tenant_id, row.run_id
+        if any((e.tenant_id, e.run_id) != (tenant_id, run_id) for e in events):
+            raise Unprocessable("an event names another run")
+        asked = [(event.attempt, event.sequence) for event in events]
         logged = select(RunEventRow.attempt, RunEventRow.sequence).where(
             RunEventRow.run_id == run_id,
             tuple_(RunEventRow.attempt, RunEventRow.sequence).in_(asked),
@@ -1253,7 +1296,7 @@ class RunStore:
         )
         position = int(last or 0)
         added = 0
-        for event in append.events:
+        for event in events:
             if (event.attempt, event.sequence) in seen:
                 continue
             seen.add((event.attempt, event.sequence))
@@ -1294,28 +1337,41 @@ class RunStore:
     async def _compacted_events(
         self, run_id: str, *, after: int, limit: int
     ) -> list[RunEventEntry]:
-        """An ended run's events from its compacted log (``[[position, event], ...]``), read
-        after the rows came back empty: a compaction that committed in between is seen."""
-        ref = await self._session.scalar(select(RunRow.events_ref).where(RunRow.run_id == run_id))
-        if ref is None:
-            return []
-        logged = await self._payloads.get(ref)
-        return [
-            RunEventEntry(position=position, event=RunEvent.model_validate(event))
-            for position, event in logged
-            if position > after
-        ][:limit]
+        """An ended run's events from its compacted log (objects of ``[[position, event],
+        ...]``), read after the rows came back empty: a compaction that committed in between
+        is seen. Only the objects the page spans are read: the one holding the first
+        position past ``after``, and those after it until the page is full."""
+        logged = await self._session.scalar(
+            select(RunRow.events_ref).where(RunRow.run_id == run_id)
+        )
+        entries: list[RunEventEntry] = []
+        for through, ref in _chunks(logged):
+            if len(entries) >= limit:
+                break
+            if through > after:
+                entries += [
+                    RunEventEntry(position=position, event=RunEvent.model_validate(event))
+                    for position, event in await self._payloads.get(ref)
+                    if position > after
+                ]
+        return entries[:limit]
 
     async def _ended(self, rows: Sequence[RunRow], now: datetime) -> None:
         """Runs that just ended start their artifacts' retention, and let go of their
-        checkpoints (the sweep deletes what nothing else refers to)."""
-        ended = [row.run_id for row in rows if RunStatus(row.status).final]
+        checkpoints (the sweep deletes what nothing else refers to) — except one its caller
+        kept past the end (``_move``'s ``keep_checkpoint``): the run still refers to it."""
+        over = [row for row in rows if RunStatus(row.status).final]
         retention = self._payloads.retention
-        await ArtifactStore(self._session).expire_with(ended, at=now + retention)
-        if ended:
+        await ArtifactStore(self._session).expire_with(
+            [row.run_id for row in over], at=now + retention
+        )
+        let_go = [
+            row.run_id for row in over if row.checkpoint_ref is None and not row.checkpoint_segments
+        ]
+        if let_go:
             await self._session.execute(
                 delete(RunPayloadRow).where(
-                    RunPayloadRow.run_id.in_(ended), RunPayloadRow.kind == _CHECKPOINT
+                    RunPayloadRow.run_id.in_(let_go), RunPayloadRow.kind == _CHECKPOINT
                 )
             )
 
@@ -1471,6 +1527,9 @@ class RunStore:
         return row
 
     async def _flushed(self, row: RunRow, now: datetime) -> RunRecord:
+        """What every change of one run ends with: the row written, and what its status now
+        announces (a pause, an ending; nothing otherwise) written to the outbox of its
+        tenant's subscriptions, in the change's own transaction. Its record."""
         if row.awaiting_ref is None:  # not paused (any more): its question's payload let go
             await self._session.execute(
                 delete(RunPayloadRow).where(
@@ -1478,19 +1537,23 @@ class RunStore:
                 )
             )
         await self._session.flush()
-        return await self._record(row, now)
+        record = await self._record(row, now)
+        await self._webhooks.announce(record, now=now)
+        return record
 
     async def _record(self, row: RunRow, now: datetime) -> RunRecord:
         return (await self._records([row], now))[0]
 
     async def _records(self, rows: Sequence[RunRow], now: datetime) -> list[RunRecord]:
-        """The rows' records, the places of those that share a key read in one statement."""
+        return await _records(self._payloads, rows, now, await self._places(rows))
+
+    async def _places(self, rows: Sequence[RunRow]) -> dict[str, datetime]:
+        """The places of the rows that share a key, by run id, read in one statement."""
         keyed = [row.run_id for row in rows if row.concurrency_key is not None]
-        places: dict[str, datetime] = {}
-        if keyed:
-            placed = select(RunRow.run_id, _placed_at(RunRow)).where(RunRow.run_id.in_(keyed))
-            places = dict((await self._session.execute(placed)).tuples().all())
-        return await _records(self._payloads, rows, now, places)
+        if not keyed:
+            return {}
+        placed = select(RunRow.run_id, _placed_at(RunRow)).where(RunRow.run_id.in_(keyed))
+        return dict((await self._session.execute(placed)).tuples().all())
 
     # ------------------------------------------------------------------ payloads
     async def _put(self, tenant_id: str, value: Any) -> PayloadRef | None:
@@ -1594,10 +1657,11 @@ class RunStore:
         return [(tenant, run) for tenant, run in rows.all()]
 
     async def compact_events(self, tenant_id: str, run_id: str) -> bool:
-        """Move an ended run's event log, every event at its position, into one object and
-        delete its rows. Nothing appends to an ended run, so the log read first is the whole
-        log; the run's row is locked only to swap the rows for the reference. Returns
-        whether this call compacted it (another ticker may have)."""
+        """Move an ended run's event log, every event at its position, into objects of
+        ``EVENT_CHUNK`` events each (``events_ref`` lists them: :func:`_chunks`) and delete
+        its rows. Nothing appends to an ended run, so the log read first is the whole log;
+        the run's row is locked only to swap the rows for the references. Returns whether
+        this call compacted it (another ticker may have)."""
         logged = (
             await self._session.execute(
                 select(RunEventRow.position, RunEventRow.event)
@@ -1605,7 +1669,8 @@ class RunStore:
                 .order_by(RunEventRow.position)
             )
         ).all()
-        ref = await self._payloads.put(tenant_id, [[p, e] for p, e in logged])
+        chunks = [logged[at : at + EVENT_CHUNK] for at in range(0, len(logged), EVENT_CHUNK)]
+        refs = [await self._payloads.put(tenant_id, [[p, e] for p, e in chunk]) for chunk in chunks]
         row = await self._session.scalar(
             select(RunRow)
             .where(RunRow.run_id == run_id, RunRow.events_ref.is_(None))
@@ -1613,7 +1678,12 @@ class RunStore:
         )
         if row is None:
             return False
-        row.events_ref = ref.model_dump()
-        await self._link(run_id, _EVENTS, ref)
+        row.events_ref = {
+            _CHUNKS: [
+                {"through": chunk[-1].position, "ref": ref.model_dump()}
+                for chunk, ref in zip(chunks, refs, strict=True)
+            ]
+        }
+        await self._link(run_id, _EVENTS, *refs)
         await self._session.execute(delete(RunEventRow).where(RunEventRow.run_id == run_id))
         return True

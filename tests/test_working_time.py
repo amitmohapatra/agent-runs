@@ -13,8 +13,9 @@ from sqlalchemy import text
 from trellis.contracts.errors import ErrorCategory
 from trellis.contracts.ids import now
 
+from agent_runs.config.settings import LimitsSettings
 from agent_runs.store.runs import RunStore
-from tests.conftest import backoff_passed, pause, resolution, started
+from tests.conftest import SETTINGS, backoff_passed, pause, resolution, started
 
 _CLAIM = {"worker_id": "w1", "agent_ids": ["triage"], "lease_seconds": 600}
 
@@ -42,7 +43,7 @@ async def _ran_for(app, run_id: str, seconds: float) -> None:
 
 async def _sweep(app, seconds: float, *, max_run_seconds: float | None = None) -> list:
     async with app.state.sessions() as db:
-        store = RunStore(db, max_run_seconds=max_run_seconds)
+        store = RunStore(db, LimitsSettings(max_run_seconds=max_run_seconds))
         ended = await store.time_out_overworked(now=now() + timedelta(seconds=seconds), limit=10)
         await db.commit()
     return ended
@@ -133,7 +134,9 @@ async def test_the_clock_survives_a_crash(app, client) -> None:
     await client.post("/v1/runs/claim", json={**_CLAIM, "lease_seconds": 5})
     await _ran_for(app, run_id, 50)
     async with app.state.sessions() as db:
-        [requeued] = await RunStore(db).requeue_lapsed(now=now() + timedelta(seconds=6), limit=9)
+        [requeued] = await RunStore(db, SETTINGS.limits).requeue_lapsed(
+            now=now() + timedelta(seconds=6), limit=9
+        )
         await db.commit()
     assert 50 <= requeued.worked_seconds < 57
     await backoff_passed(app)

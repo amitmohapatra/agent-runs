@@ -150,6 +150,57 @@ async def test_a_failed_introspection_is_not_cached() -> None:
     assert (await keys.resolve("dev-key")).principal == "user_ada"
 
 
+async def test_requests_at_once_for_one_key_ask_the_registry_once() -> None:
+    """When a key's entry ends under load, the requests that need it share one question
+    rather than each asking a registry that is already busy."""
+    import asyncio
+
+    memory = FakeMemory()
+    keys = memory.registry()
+    answers = await asyncio.gather(*(keys.resolve("dev-key") for _ in range(20)))
+    assert {a.principal for a in answers} == {"user_ada"} and memory.asked == ["dev-key"]
+
+
+async def test_a_known_key_keeps_working_while_the_registry_cannot_be_asked() -> None:
+    """A key the registry accepted works for KEY_STALE_SECONDS past its entry while the
+    registry is down or overloaded (runs' heartbeats go on); past that, or for a key it
+    refused, the outage is a 503 as before; once the registry answers again, it decides."""
+    from agent_runs.config.constants import KEY_CACHE_SECONDS, KEY_STALE_SECONDS
+
+    memory, clock = FakeMemory(), Clock()
+    keys = memory.registry(clock=clock)
+    await keys.resolve("dev-key")
+    with pytest.raises(Unauthorized):
+        await keys.resolve("nope")
+    memory.status = 503
+    clock.now += KEY_CACHE_SECONDS + 1
+    assert (await keys.resolve("dev-key")).principal == "user_ada"  # asked, then kept
+    with pytest.raises(Unavailable):
+        await keys.resolve("nope")  # a refusal is never kept past its entry
+    clock.now += KEY_STALE_SECONDS
+    with pytest.raises(Unavailable):
+        await keys.resolve("dev-key")
+    memory.status = None
+    del memory.keys["dev-key"]  # revoked meanwhile: the registry's answer wins once it is back
+    with pytest.raises(Unauthorized):
+        await keys.resolve("dev-key")
+
+
+async def test_a_question_nobody_waits_for_any_more_is_not_left_unread() -> None:
+    import asyncio
+
+    memory = FakeMemory()
+    memory.status = 503
+    keys = memory.registry()
+    waiting = asyncio.ensure_future(keys.resolve("dev-key"))
+    await asyncio.sleep(0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    await asyncio.sleep(0.05)
+    assert not keys._asking  # answered (refused) and forgotten: the next request asks again
+
+
 async def test_a_malformed_answer_or_an_unreachable_registry_is_unavailable() -> None:
     with pytest.raises(Unavailable):
         await FakeMemory({"k": {"tenant_id": "acme"}}).registry().resolve("k")

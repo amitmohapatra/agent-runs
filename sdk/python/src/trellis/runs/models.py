@@ -16,7 +16,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from trellis.contracts.runs import (
     Interrupt,
     InterruptResolution,
@@ -73,6 +73,11 @@ class Claimed(BaseModel):
 
     run: RunRecord
     lease: Lease
+
+    @field_validator("run", mode="before")
+    @classmethod
+    def _the_run_is_read(cls, data: Any) -> RunRecord:
+        return RunRecord.read(data)
 
 
 class ResolutionEntry(BaseModel):
@@ -138,6 +143,11 @@ class FireResult(BaseModel):
     fire_time: datetime
     idempotency_key: str
     schedule: Schedule
+
+    @field_validator("schedule", mode="before")
+    @classmethod
+    def _the_schedule_is_read(cls, data: Any) -> Schedule:
+        return Schedule.read(data)
 
 
 class WebhookEvent(StrEnum):

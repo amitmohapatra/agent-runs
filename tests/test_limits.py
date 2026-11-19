@@ -7,6 +7,7 @@ from __future__ import annotations
 import gzip
 import json
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,10 +16,21 @@ from sqlalchemy import text
 from trellis.contracts.ids import now
 from trellis.runs.blob import FilesystemBlobStore
 
+from agent_runs.api.deps import run_store
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.settings import RateLimitSettings, ServiceSettings
 from agent_runs.observability import metrics
-from tests.conftest import SETTINGS, client_of, pause, serving, started
+from agent_runs.store.runs import RunStore
+from tests.conftest import (
+    SETTINGS,
+    client_of,
+    pause,
+    paused,
+    resolution,
+    scheduled,
+    serving,
+    started,
+)
 
 
 def _settings(**over: Any) -> Any:
@@ -406,3 +418,47 @@ def test_the_payload_cap_defaults_are_the_documented_ones() -> None:
     assert (service.max_body_bytes, service.max_payload_bytes) == (4 * 1024 * 1024, 1024 * 1024)
     limits = RateLimitSettings()
     assert (limits.per_minute, limits.burst) == (3000, 500)
+
+
+# ------------------------------------------------------------------ the connection pool
+
+
+async def test_an_answer_and_a_fire_need_no_second_connection_of_the_pool(
+    migrated, memory, blobs
+) -> None:
+    """A resume and a fire write payloads while their session holds a connection and a row
+    lock. On the smallest budget (one connection for sessions, none for a burst) both still
+    go through: the payload registry is written on a pool of its own, so a burst of them
+    cannot hold every connection while each waits for one more."""
+    one = SETTINGS.database.model_copy(update={"connection_budget": 2})
+    settings = _settings(database=one)
+    async with serving(settings, memory, blobs) as app, client_of(app) as client:
+        pool = app.state.engine.pool
+        assert (pool.size(), pool._max_overflow) == (1, 0)
+        waiting = await paused(client)
+        answer = resolution(waiting, reviewer="user_ada")
+        answered = await client.post(f"/v1/runs/{waiting['run_id']}/resume", json=answer)
+        assert answered.status_code == 200, answered.text
+        sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
+        fired = await client.post(f"/v1/schedules/{sid}/fire")
+        assert fired.status_code == 200, fired.text
+
+
+# ------------------------------------------------------------------ the deployment's limits
+
+
+async def test_a_run_store_is_built_with_the_deployments_limits_or_not_at_all(
+    migrated, memory, blobs
+) -> None:
+    """One way to build a ``RunStore``: with the limits it works within. A store built
+    without them (which silently ran on the defaults) does not exist, and the store every
+    route gets is the one on the request's session with the configured limits."""
+    limits = SETTINGS.limits.model_copy(update={"max_run_seconds": 30.0})
+    async with (
+        serving(_settings(limits=limits), memory, blobs) as app,
+        app.state.sessions() as db,
+    ):
+        with pytest.raises(TypeError):
+            RunStore(db)  # pyright: ignore[reportCallIssue]
+        store = run_store(SimpleNamespace(app=app), db)  # pyright: ignore[reportArgumentType]
+        assert store.limits is limits

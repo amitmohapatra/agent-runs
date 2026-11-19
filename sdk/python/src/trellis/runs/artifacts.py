@@ -4,14 +4,20 @@ diff, a report) is uploaded beside the run, and the run carries the ``ArtifactRe
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Final
 
 from trellis.contracts.artifacts import ArtifactRef
 from trellis.runs._transport import Transport, worker_params
+from trellis.runs.blob import sha256_hex
 from trellis.runs.errors import NotFoundError
-from trellis.runs.payloads import MEDIA_TYPE, PayloadRef, frames
+from trellis.runs.payloads import (
+    MAX_READ_BYTES,
+    MAX_READ_OBJECTS,
+    MEDIA_TYPE,
+    PayloadRef,
+    frames,
+)
 
 #: What an artifact is sent as when the caller names nothing else.
 JSON_MIME: Final = "application/json"
@@ -39,7 +45,7 @@ class ArtifactsAPI:
         ``worker_id``; a paused one only from a ``service`` key."""
         params = {
             **worker_params(worker_id),
-            "checksum": f"sha256:{hashlib.sha256(data).hexdigest()}",
+            "checksum": f"sha256:{sha256_hex(data)}",
         }
         body = await self._transport.json(
             "POST",
@@ -92,18 +98,40 @@ class ArtifactsAPI:
     async def get_payloads(
         self, refs: Sequence[PayloadRef], *, tenant: str | None = None
     ) -> list[bytes]:
-        """The bytes of several payload objects (a checkpoint's segments) in one request,
-        in their order, each checked as ``get_payload`` checks it."""
-        response = await self._transport.send(
-            "POST",
-            "/v1/payloads/read",
-            tenant=tenant,
-            json={"sha256": [ref.sha256 for ref in refs]},
-        )
-        return [_whole(ref, data) for ref, data in zip(refs, frames(response.content), strict=True)]
+        """The bytes of several payload objects (a checkpoint's segments), in their order,
+        each checked as ``get_payload`` checks it: in one request when one read answers them
+        all (``MAX_READ_OBJECTS``, ``MAX_READ_BYTES``), else in as few as answer them."""
+        found: list[bytes] = []
+        for asked in _reads(refs):
+            if len(asked) == 1:
+                found.append(await self.get_payload(asked[0], tenant=tenant))
+                continue
+            response = await self._transport.send(
+                "POST",
+                "/v1/payloads/read",
+                tenant=tenant,
+                json={"sha256": [ref.sha256 for ref in asked]},
+            )
+            answered = zip(asked, frames(response.content), strict=True)
+            found += [_whole(ref, data) for ref, data in answered]
+        return found
+
+
+def _reads(refs: Sequence[PayloadRef]) -> Iterator[list[PayloadRef]]:
+    """``refs`` in their order, split into what one read answers each."""
+    asked: list[PayloadRef] = []
+    size = 0
+    for ref in refs:
+        if asked and (len(asked) == MAX_READ_OBJECTS or size + ref.size > MAX_READ_BYTES):
+            yield asked
+            asked, size = [], 0
+        asked.append(ref)
+        size += ref.size
+    if asked:
+        yield asked
 
 
 def _whole(ref: PayloadRef, data: bytes) -> bytes:
-    if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256:
+    if len(data) != ref.size or sha256_hex(data) != ref.sha256:
         raise ValueError(f"payload {ref.sha256} did not arrive whole")
     return data

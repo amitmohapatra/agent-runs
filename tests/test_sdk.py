@@ -33,7 +33,7 @@ from trellis.runs import (
 )
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import at
+from tests.conftest import SETTINGS, at
 
 
 @pytest.fixture
@@ -200,7 +200,7 @@ async def test_a_run_past_its_deadline_stops_the_workers_handler(
 
     async def handler(job: Job) -> None:
         async with app.state.sessions() as db:
-            await RunStore(db).time_out_past_deadline(now=at(2), limit=10)
+            await RunStore(db, SETTINGS.limits).time_out_past_deadline(now=at(2), limit=10)
             await db.commit()
         try:
             await asyncio.Event().wait()

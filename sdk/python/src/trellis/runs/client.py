@@ -107,7 +107,7 @@ class RunsClient:
         answers the run that exists."""
         body = {**start.model_dump(mode="json"), "queue": queue}
         data = await self._transport.json("POST", "/v1/runs", tenant=start.tenant_id, json=body)
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def claim(
         self,
@@ -135,16 +135,21 @@ class RunsClient:
         *,
         lease_seconds: int = LEASE_SECONDS,
         checkpoint: dict[str, Any] | None = None,
+        events: Sequence[RunEvent] | None = None,
         tenant: str | None = None,
     ) -> Lease:
         """Extend the lease; with ``checkpoint``, also save it as the run's progress (it
-        replaces the run's checkpoint; without, the one there is kept). Any ``409`` raises
+        replaces the run's checkpoint; without, the one there is kept), and with ``events``
+        add them to the run's log in the same transaction (as :meth:`append_events` does: one
+        already logged is skipped), so a crash keeps both or neither. Any ``409`` raises
         :class:`LeaseLostError`: this worker does not hold a running lease on the run. On a
         run kept in the caller's process (started, never queued) it holds the run for
         ``worker_id`` instead: agent-runs ends the run ``ERROR`` once the hold lapses."""
         body: dict[str, Any] = {"worker_id": worker_id, "lease_seconds": lease_seconds}
         if checkpoint is not None:
             body["checkpoint"] = checkpoint
+        if events:
+            body["events"] = [event.model_dump(mode="json") for event in events]
         try:
             data = await self._transport.json(
                 "POST", f"/v1/runs/{run_id}/heartbeat", tenant=tenant, json=body
@@ -178,7 +183,7 @@ class RunsClient:
         data = await self._transport.json(
             "POST", f"/v1/runs/{run_id}/release", tenant=tenant, json=body
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def pause(
         self,
@@ -197,7 +202,7 @@ class RunsClient:
             json=body,
             params=worker_params(worker_id),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def resume(
         self, resolution: InterruptResolution, *, tenant: str | None = None
@@ -216,7 +221,7 @@ class RunsClient:
             tenant=tenant,
             json=resolution.model_dump(mode="json"),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def cancel(
         self,
@@ -240,7 +245,7 @@ class RunsClient:
         data = await self._transport.json(
             "POST", f"/v1/runs/{run_id}/cancel", tenant=tenant, json=body
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def finish(
         self,
@@ -272,12 +277,12 @@ class RunsClient:
             json=body,
             params=worker_params(worker_id),
         )
-        return RunRecord.model_validate(data)
+        return RunRecord.read(data)
 
     async def get(self, run_id: str, *, tenant: str | None = None) -> RunRecord | None:
         """The full record (input, output, error, checkpoint), or None when there is none."""
         data = await self._transport.found("GET", f"/v1/runs/{run_id}", tenant=tenant)
-        return None if data is None else RunRecord.model_validate(data)
+        return None if data is None else RunRecord.read(data)
 
     async def list(
         self,

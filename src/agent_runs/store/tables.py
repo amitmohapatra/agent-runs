@@ -54,7 +54,7 @@ class RunRow(Base):
     #: the run's payloads, by reference to the blob store (``PayloadRef``s,
     #: ``agent_runs.blob.payloads``): its input, output, last answer, the interrupt's
     #: ``payload`` (``awaiting_ref``), a whole checkpoint or its segments (cleared when the run
-    #: ends), and an ended run's compacted event log (``events_ref``)
+    #: ends), and an ended run's compacted event log (``events_ref``: its objects' references)
     input_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     output_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
     awaiting_ref: Mapped[dict[str, Any] | None] = mapped_column(_REF)
@@ -121,11 +121,13 @@ class RunRow(Base):
         Index("ix_runs_thread", "tenant_id", "thread_id", "created_at"),
         # the inbox: this tenant's PAUSED runs for an assignee, newest first
         Index("ix_runs_inbox", "tenant_id", "status", "assignee", "created_at"),
-        # the claim: the oldest QUEUED run of the worker's agents
+        # the claim: a tenant's QUEUED runs of the worker's agent, in claim order (the
+        # highest priority, then the oldest)
         Index(
             "ix_runs_queue",
             "tenant_id",
             "agent_id",
+            text("priority DESC"),
             "queued_at",
             postgresql_where=text("status = 'QUEUED'"),
         ),
@@ -430,7 +432,7 @@ class RunPayloadRow(Base):
         String(64), ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
     )
     key: Mapped[str] = mapped_column(String(512), primary_key=True)
-    #: what the object is to the run (``PayloadKind``)
+    #: what the object is to the run (``store.runs``' kinds: its input, output, checkpoint, ...)
     kind: Mapped[str] = mapped_column(String(16), primary_key=True)
 
     __table_args__ = (Index("ix_run_payloads_key", "key"),)

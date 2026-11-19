@@ -16,11 +16,13 @@ from trellis.contracts.runs import RunRecord, RunStatus
 from trellis.runs.webhooks import parse_delivery, sign, verify_signature
 
 from agent_runs.config.constants import WEBHOOK_ATTEMPTS
+from agent_runs.domain.runs import RunFinish
 from agent_runs.domain.webhooks import Attempt, WebhookEvent, event_of
+from agent_runs.store.runs import RunStore
 from agent_runs.store.webhooks import Delivery, WebhookStore, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
-from tests.conftest import at, pause, started
+from tests.conftest import SETTINGS, at, pause, started
 
 HOOK = "https://ui.example/h"
 
@@ -219,6 +221,29 @@ async def _outbox(app) -> list[dict[str, Any]]:
         return [dict(row._mapping) for row in rows]
 
 
+async def test_a_run_change_made_through_the_store_is_announced_by_the_store(app, client) -> None:
+    """The store writes the outbox row with the change that causes it: whoever moves a run
+    through it (a route, the ticker, anything later) cannot forget to announce it."""
+    await subscribe(client)
+    ended = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    waiting = (await client.post("/v1/runs", json=started())).json()["run_id"]
+    asked = pause(waiting, deadline=at(1).isoformat(), escalate_to="role:managers")
+    await client.post(f"/v1/runs/{waiting}/pause", json=asked)
+    async with app.state.sessions() as db:
+        store = RunStore(db, SETTINGS.limits)
+        finish = RunFinish(status=RunStatus.SUCCESS)
+        await store.finish("acme", ended, finish, worker_id=None, now=at(0))
+        await store.escalate_overdue(now=at(2), limit=10)
+        await db.commit()
+    announced = sorted(
+        (row["payload"]["data"]["run"]["run_id"], row["payload"]["type"])
+        for row in await _outbox(app)
+    )
+    assert announced == sorted(
+        [(waiting, "run.paused"), (waiting, "run.escalated"), (ended, "run.finished")]
+    )
+
+
 async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
     app, client, tmp_path
 ) -> None:
@@ -233,7 +258,13 @@ async def test_a_failing_receiver_is_retried_with_backoff_then_given_up_on(
         allow_private=True,
         client=httpx.AsyncClient(transport=httpx.MockTransport(failing)),
     )
-    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
+    )
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "ERROR"})
@@ -260,7 +291,13 @@ async def test_a_receiver_that_recovers_is_told_once(app, client, tmp_path) -> N
             transport=httpx.MockTransport(lambda _: httpx.Response(next(answers)))
         ),
     )
-    ticker = Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "beat")
+    ticker = Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "beat",
+        limits=SETTINGS.limits,
+    )
     await subscribe(client)
     run = (await client.post("/v1/runs", json=started())).json()
     await client.post(f"/v1/runs/{run['run_id']}/finish", json={"status": "SUCCESS"})

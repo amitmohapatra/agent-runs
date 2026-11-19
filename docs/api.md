@@ -115,12 +115,12 @@ sections after the table have the bodies and the exact semantics.
 |---|---|---|---|
 | `POST /v1/runs` | `RunStart` + `queue` | `201 RunRecord` (`200` repeat) | `403` tenant or `on_behalf_of`, `409` run id unusable or idempotency key reused with another start, `422` |
 | `POST /v1/runs/claim` | `{worker_id, agent_ids, lease_seconds}` (a platform key may omit `X-Trellis-Tenant`) | `200 Claimed`, `204` nothing queued that may run now | `422` |
-| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
+| `POST /v1/runs/{id}/heartbeat` | `{worker_id, lease_seconds, checkpoint?, events?}` | `200 Lease` | `404`, `409 LEASE_LOST` lease lost or run not `RUNNING`, `422` |
 | `POST /v1/runs/{id}/release` | `{worker_id, checkpoint?}` | `200 RunRecord` (`QUEUED`; a repeat answers the run) | `404`, `409 LEASE_LOST` not the lease holder or run not `RUNNING`, `413`, `422` |
 | `POST /v1/runs/{id}/pause` | `{interrupt, checkpoint}`, `?worker_id=` | `200 RunRecord` (`PAUSED`; a repeat answers the stored run) | `404`, `409` not `RUNNING` (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` interrupt of another run |
 | `POST /v1/runs/{id}/resume` | `InterruptResolution` | `200 RunRecord` | `403` the key may not answer this run ([who may](#who-may-answer-a-paused-run)), `404`, `409` not `PAUSED` or another interrupt, `422` another run |
-| `POST /v1/runs/{id}/cancel` | `{reason?}` | `200 RunRecord` (`CANCELLED`, or `RUNNING` with the cancel asked; a repeat answers the run) | `403` the key may not cancel it, `404`, `409` ended, `422` |
-| `POST /v1/runs/{id}/finish` | `{status, output, error}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
+| `POST /v1/runs/{id}/cancel` | `{reason?, keep_checkpoint?}` | `200 RunRecord` (`CANCELLED`, or `RUNNING` with the cancel asked; a repeat answers the run) | `403` the key may not cancel it, `404`, `409` ended, `422` |
+| `POST /v1/runs/{id}/finish` | `{status, output, error, keep_checkpoint?, checkpoint?}`, `?worker_id=` | `200 RunRecord` (a repeat answers the stored run; a retried `ERROR` answers it `QUEUED`) | `404`, `409` illegal ending (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `422` not an ending, `error` on a non-failure |
 | `GET /v1/runs/{id}` | | `200 RunRecord` | `404` |
 | `GET /v1/runs/{id}/resolutions` | `?cursor=&limit=` | `200 [ResolutionEntry]` | `404`, `422` |
 | `POST /v1/runs/{id}/events` | `{events: [RunEvent]}` (1–500), `?worker_id=` | `200 {appended, position}` | `404`, `409` not `RUNNING` or leased (`CONFLICT`) or not the lease holder (`LEASE_LOST`), `413`, `422` an event of another run |
@@ -188,7 +188,12 @@ Other fields are ignored. A missing required field is a malformed answer (`503`)
 Caching (per process, keyed by the SHA-256 of the key; the key itself is not kept): a `200`
 answer for 60 s (`KEY_CACHE_SECONDS`, so a revocation takes effect here within a minute), a
 `401`/`403` answer for 10 s (`KEY_NEGATIVE_CACHE_SECONDS`), at most 10 000 keys (least
-recently used evicted).
+recently used evicted). One question per key at a time: the requests that need a key while
+it is asked share the answer. While the registry cannot be asked (unreachable, or a `5xx`), a
+key it accepted keeps working for up to 300 s past its entry (`KEY_STALE_SECONDS`), so a brief
+outage or overload of the Memory Service does not stop runs' heartbeats; a revocation then
+takes effect within six minutes at most. A refused key is never kept past its entry, and past
+the grace the outage is a `503`, as before.
 
 ## Runs
 
@@ -310,7 +315,13 @@ past `RUNS__SERVICE__MAX_PAYLOAD_BYTES`, nothing saved). It comes back as `RunRe
 next claim and on every read, so when this worker dies the next attempt resumes from it and
 repeats no side effect the journal records. Only the lease holder saves one (`409
 LEASE_LOST` otherwise, nothing saved); sending the same checkpoint again is harmless. A
-worker saves progress after each side-effecting step, on the heartbeat it sends anyway. `409 LEASE_LOST` means the lease is no longer
+worker saves progress after each side-effecting step, on the heartbeat it sends anyway.
+**Events with it:** `events` (optional, at most 500) are added to the run's log in the same
+transaction, as an append adds them (in order, one already logged skipped, each naming this
+run: `422` otherwise, and nothing — checkpoint included — is saved): the progress a crash
+keeps and the events that show it are saved together, so a worker killed right after a step
+leaves neither a step its log never shows nor a shown step the next attempt repeats.
+`409 LEASE_LOST` means the lease is no longer
 this worker's (it lapsed and the run was re-queued, possibly claimed by another worker) or
 the run is no longer `RUNNING` (it was cancelled or finished): **stop working the run and do
 not write to it**. Heartbeat well inside the lease (every third of it).
@@ -391,7 +402,10 @@ interrupt id, a serialized OpenAI `RunState`). It is returned as `RunRecord.chec
 every read, resume and claim, so whichever worker resumes the run repeats no side effect.
 Each pause replaces it (omitted means `null`); any ending (`finish`, `cancel`, a `CANCEL`
 answer, a `TIMEOUT`, a run past its deadline or its working-time limit, a run failed on its
-`MAX_LEASE_LAPSES`-th lapsed lease) clears it; a requeue (a lapse, a release, a retried
+`MAX_LEASE_LAPSES`-th lapsed lease) clears it — unless the caller keeps it past the end
+(`keep_checkpoint` on `finish` or `cancel`: a caller that rewinds ended runs; `finish` may
+send its last `checkpoint` with it), and then the run still holds its checkpoint's object,
+which the sweep leaves alone; a requeue (a lapse, a release, a retried
 error) keeps it for the next attempt. Larger than `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB)
 as compact JSON is `413`, and nothing changes. A heartbeat may save one too, as
 progress (below).
@@ -425,9 +439,10 @@ Body: an `InterruptResolution` for the interrupt the run waits on:
 
 `decision` is `ANSWER | APPROVE | REJECT | EDIT | CANCEL` (`EDIT` carries `payload`).
 `comment` (optional, any decision) is the reviewer's remark, kept with the resolution.
-`remember` is `once` (default) or `run`: an `APPROVE` of a tool call that also approves calls
-like it for the rest of the run; the harness, which sees the calls, keeps that promise, and
-this service keeps the record.
+`remember` is `once` (default), `run` or `always`: an `APPROVE` of a tool call that also
+approves calls like it for the rest of the conversation (`run`) or for this user in every
+conversation (`always`); the harness, which sees the calls, keeps that promise, and this
+service keeps the record.
 **The answer must fit the question** (`trellis.runs.answers`, checked before anything is
 written): an `ANSWER` fits the interrupt's `expects` — its `format` too when it is one of
 `trellis.runs.answers.ANSWER_FORMATS`: `date` (an ISO 8601 calendar date, `YYYY-MM-DD`),
@@ -438,8 +453,9 @@ server enforces the same set whatever else is installed. Any other format (`date
 `options` when it has some: one option's `value` (never its `label`), or with `multiple` a
 list of distinct values. An answer the asker's own screen (`component`) collected is held to
 the same. An `EDIT` of a question (no `tool_call`) carries a `payload` that fits `expects`;
-`APPROVE`, `REJECT` and `CANCEL` carry nothing to check, and `remember: "run"` is refused for
-an interrupt that has no tool call. A misfit is `422
+`APPROVE`, `REJECT` and `CANCEL` carry nothing to check, and `remember: "run"` or `"always"`
+is refused for an interrupt that has no tool call (the contracts'
+`InterruptResolution.problem_with`). A misfit is `422
 VALIDATION` whose detail says what does not fit, and the run keeps waiting. The
 resolution is kept as `last_resolution`, appended to the run's resolution history in the
 same transaction (`GET /v1/runs/{id}/resolutions`), and:
@@ -493,8 +509,8 @@ Cancels the run, whatever its status, keeping `reason` (optional, at most 1000 c
 and the principal of the key that asked with it:
 
 - `QUEUED` or `PAUSED`, or `RUNNING` with no worker holding it (a run kept in its caller's
-  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared and
-  the artifacts' retention starts. The caller's process gets `409` on its next write.
+  process): `CANCELLED` at once, announced as `run.finished`; the checkpoint is cleared (kept with
+  `keep_checkpoint`) and the artifacts' retention starts. The caller's process gets `409` on its next write.
 - `RUNNING` and held by a worker: the run stays `RUNNING` with its cancel asked. The
   worker's next heartbeat answers `cancel_requested: true` and no longer extends the lease;
   the worker stops and finishes the run `CANCELLED` (the SDK's `Worker` cancels the handler
@@ -710,8 +726,9 @@ Body (optional): `{"at": "2026-10-01T06:00:00Z"}`, an instant that has arrived (
 more than a minute ahead, or without an offset). Without it, the fire is for the tick the
 schedule is due for, else for now. Queues the run (`QUEUED`, `idempotency_key =
 "<schedule_id>@<fire_time UTC ISO>"`, the schedule's limits, version, priority and
-concurrency key, and its metadata under `schedule_id`, `schedule_name`, `fire_time`,
-`created_by`) and advances the schedule:
+concurrency key, and its metadata under `schedule_id`, `schedule_name`, `fire_time` (in UTC,
+as in the key) and `created_by`: the run the contracts' `Schedule.run_start` builds) and
+advances the schedule:
 
 ```json
 {"schedule_id": "sch_…", "run_id": "run_…", "fire_time": "…",
@@ -842,6 +859,8 @@ is kept, dead, to be redelivered (above). At least once: receivers drop repeats 
 outcome, `runs_rate_limited_total`, `runs_db_pool_connections` by state). The ticker serves
 `runs_ticker_ticks_total` (by outcome), `runs_ticker_swept_total` (by step: `fired`,
 `timed_out`, `overworked`, `requeued`, `escalated`, `sent`, `dropped`, `purged`),
+`runs_ticker_step_failures_total` (by step: a step that failed on something other than an
+outage, while the steps after it still ran; alert on any increase),
 `runs_webhook_dead_total` (deliveries given up on) and the pool gauges on `RUNS__TICKER__METRICS_PORT` when it is set. Each process has its own registry: with
 several workers a scrape sees one worker's share. The ticker's probe is
 `python -m agent_runs.heartbeat`, which reads

@@ -39,13 +39,13 @@ async def _rows(app: Any, table: str, run_id: str) -> int:
         return int(found.scalar_one())
 
 
-def _ticker(app: Any, receiver: Any, tmp_path: Any, **over: Any) -> Ticker:
+def _ticker(app: Any, receiver: Any, tmp_path: Any, *, retention_days: int | None) -> Ticker:
     return Ticker(
         app.state.sessions,
         sender(receiver),
         app.state.blobs,
         heartbeat_path=tmp_path / "beat",
-        **over,
+        limits=LimitsSettings(retention_days=retention_days),
     )
 
 
@@ -54,7 +54,7 @@ async def test_runs_ended_before_the_retention_go_with_their_records(
 ) -> None:
     old = await _ended(client)
     running = (await client.post("/v1/runs", json=started())).json()["run_id"]
-    ticker = _ticker(app, receiver, tmp_path, run_retention=_KEPT)
+    ticker = _ticker(app, receiver, tmp_path, retention_days=_KEPT.days)
     assert (await ticker.tick(now=now() + _KEPT - timedelta(hours=1))).runs_purged == 0
     assert (await ticker.tick(now=now() + _KEPT + timedelta(hours=1))).runs_purged == 1
     for table in ("agent_runs", "run_resolutions", "run_events"):
@@ -65,7 +65,7 @@ async def test_runs_ended_before_the_retention_go_with_their_records(
 
 async def test_without_a_retention_every_run_is_kept(app, client, receiver, tmp_path) -> None:
     old = await _ended(client, answered=False)
-    ticker = _ticker(app, receiver, tmp_path)
+    ticker = _ticker(app, receiver, tmp_path, retention_days=None)
     assert (await ticker.tick(now=now() + timedelta(days=3650))).runs_purged == 0
     assert await _rows(app, "agent_runs", old) == 1
 
@@ -77,7 +77,7 @@ async def test_a_run_waits_for_its_artifacts_to_go_first(app, client, receiver, 
     )
     assert uploaded.status_code == 201, uploaded.text
     await client.post(f"/v1/runs/{run_id}/finish", json={"status": "SUCCESS"})
-    ticker = _ticker(app, receiver, tmp_path, run_retention=timedelta(days=1))
+    ticker = _ticker(app, receiver, tmp_path, retention_days=1)
     later = now() + timedelta(days=2)
     assert (await ticker.tick(now=later)).runs_purged == 0, "its artifact is kept 7 days"
     report = await ticker.tick(now=later + ARTIFACT_RETENTION)

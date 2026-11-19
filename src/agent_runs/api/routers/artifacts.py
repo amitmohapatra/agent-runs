@@ -4,7 +4,7 @@ table, a diff) go to blob storage, and the run carries an ``ArtifactRef`` to the
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Body, Header, Path, Query, Request, Response
@@ -15,18 +15,21 @@ from trellis.contracts.artifacts import ArtifactRef
 from trellis.contracts.ids import new_id, now
 from trellis.runs.payloads import (
     FRAMED_MEDIA_TYPE,
+    MAX_READ_BYTES,
+    MAX_READ_OBJECTS,
     MEDIA_TYPE,
     SEGMENTS,
     PayloadRef,
     adecode,
+    decoded_size,
     key_of,
 )
 
-from agent_runs.api.deps import Session, Who
+from agent_runs.api.deps import Runs, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.routers.runs import RunId, WorkerId
 from agent_runs.blob import BlobCorrupt, BlobNotFound, BlobStore, read
-from agent_runs.config.constants import MAX_ARTIFACT_BYTES
+from agent_runs.config.constants import MAX_ARTIFACT_BYTES, MAX_PAYLOAD_DECODED_BYTES
 from agent_runs.domain.errors import NotFound, ServiceError, TooLarge, Unprocessable
 from agent_runs.store.artifacts import (
     ARTIFACTS_PATH,
@@ -35,7 +38,6 @@ from agent_runs.store.artifacts import (
     artifact_ref,
     sha256_of,
 )
-from agent_runs.store.runs import RunStore
 from agent_runs.store.tables import PayloadBlobRow
 
 router = APIRouter(tags=["artifacts"])
@@ -144,6 +146,7 @@ async def upload(
     run_id: RunId,
     request: Request,
     db: Session,
+    runs: Runs,
     who: Who,
     response: Response,
     worker_id: WorkerId = None,
@@ -154,7 +157,6 @@ async def upload(
     while ``PAUSED`` only a service key may add one (403); never after (409). The same bytes
     uploaded to the same run again answer 200 with the first artifact. At most 50 MiB,
     streamed to the blob store as it arrives (413 past it); an empty body is 422."""
-    runs = RunStore(db)
     # fail fast, before the bytes are read and stored; checked again, locked, below
     await runs.check_artifact_writer(
         who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
@@ -276,6 +278,10 @@ Sha256 = Annotated[
             "LEASE_LOST: a `worker_id` that does not hold the run's lease. CONFLICT: a leased "
             "run without `worker_id`, or a run that is no longer running or paused."
         ),
+        413: {
+            "description": "PAYLOAD_TOO_LARGE: the body is more than 50 MiB, or decompresses "
+            "to more than 64 MiB."
+        },
         422: {"description": "VALIDATION: the body is not a payload object (zstd JSON)."},
     },
     openapi_extra={
@@ -298,19 +304,29 @@ Sha256 = Annotated[
     },
 )
 async def put_payload(
-    run_id: RunId, request: Request, db: Session, who: Who, worker_id: WorkerId = None
+    run_id: RunId,
+    request: Request,
+    db: Session,
+    runs: Runs,
+    who: Who,
+    worker_id: WorkerId = None,
 ) -> PayloadRef:
     """Store the body, a payload object, for the run's tenant and return its reference: a
     checkpoint then names it among its segments (``{trellis_segments: [ref, ...]}``). Who may
     write is who may add an artifact; the object is checked to decode before it is stored, and
-    stored once however often it is sent (its key is its SHA-256). At most 50 MiB (413). An
+    stored once however often it is sent (its key is its SHA-256). At most 50 MiB, and at
+    most 64 MiB decompressed, which its header says before anything is decoded (413). An
     object no checkpoint names is deleted a day later."""
-    await RunStore(db).check_artifact_writer(
+    await runs.check_artifact_writer(
         who.tenant_id, run_id, worker_id=worker_id, role=who.credential.role, lock=False
     )
     await db.close()  # no connection held while the body arrives
     data = b"".join([chunk async for chunk in await _nonempty(request)])
     try:
+        if decoded_size(data) > MAX_PAYLOAD_DECODED_BYTES:
+            raise TooLarge(
+                f"a payload object decompresses to at most {MAX_PAYLOAD_DECODED_BYTES} bytes"
+            )
         await adecode(data)
     except ValueError as exc:
         raise Unprocessable(f"the body is not a payload object: {exc}") from exc
@@ -341,10 +357,6 @@ async def get_payload(sha256: Sha256, request: Request, db: Session, who: Who) -
     return Response(data, media_type=MEDIA_TYPE, headers={"Cache-Control": CACHE_CONTROL})
 
 
-#: Objects one read may ask for: a resume's segments (a journal keeps at most 64).
-MAX_READ_OBJECTS: Final = 256
-
-
 class PayloadsAsked(BaseModel):
     """Payload objects to read at once, by SHA-256: a checkpoint's segments."""
 
@@ -353,7 +365,8 @@ class PayloadsAsked(BaseModel):
     sha256: list[Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]] = Field(
         min_length=1,
         max_length=MAX_READ_OBJECTS,
-        description="The objects' SHA-256s, in the order their bytes are answered.",
+        description="The objects' SHA-256s, in the order their bytes are answered (a "
+        "resume's segments: a journal keeps at most 64). One named twice is answered twice.",
     )
 
 
@@ -374,6 +387,11 @@ _SEGMENTS_ASKED: Final[dict[str, Any]] = {
             "description": "Each object's bytes in the order asked, each after its length "
             "(8 bytes, big-endian), verified.",
         },
+        413: {
+            "description": "PAYLOAD_TOO_LARGE: the objects asked for are more than 64 MiB "
+            "together (one asked for twice counts twice): ask for them in several requests. "
+            "Or the body itself is too large."
+        },
         500: {"description": "INTERNAL: an object no longer matches its checksum."},
     },
 )
@@ -385,23 +403,40 @@ async def get_payloads(
 ) -> Response:
     """The tenant's payload objects with these SHA-256s (a checkpoint's segments) in one
     answer, read from the store in parallel: a resume is one round trip, not one per
-    segment. 404 when any is not this tenant's."""
-    keys = [key_of(who.tenant_id, sha) for sha in body.sha256]
+    segment. 404 when any is not this tenant's. What one answer holds is bounded: the bytes
+    asked for are at most 64 MiB together (413 past it, before any is read), and an object
+    asked for twice is read once."""
+    keys = {sha: key_of(who.tenant_id, sha) for sha in body.sha256}
     sizes = dict(
         (
             await db.execute(
-                select(PayloadBlobRow.key, PayloadBlobRow.size).where(PayloadBlobRow.key.in_(keys))
+                select(PayloadBlobRow.key, PayloadBlobRow.size).where(
+                    PayloadBlobRow.key.in_(keys.values())
+                )
             )
         )
         .tuples()
         .all()
     )
     await db.close()
-    if missing := [sha for sha, key in zip(body.sha256, keys, strict=True) if key not in sizes]:
+    if missing := [sha for sha, key in keys.items() if key not in sizes]:
         raise NotFound(f"no payload object {missing[0]}")
-    refs = [
-        PayloadRef(ref=k, size=sizes[k], sha256=s) for k, s in zip(keys, body.sha256, strict=True)
-    ]
-    stored = await request.app.state.payloads.get_many_encoded(refs)
-    framed = b"".join(len(data).to_bytes(8, "big") + data for data in stored)
-    return Response(framed, media_type=FRAMED_MEDIA_TYPE)
+    asked = sum(sizes[keys[sha]] for sha in body.sha256)
+    if asked > MAX_READ_BYTES:
+        raise TooLarge(
+            f"one read answers at most {MAX_READ_BYTES} bytes of payload objects; these are "
+            f"{asked}: ask for them in several requests"
+        )
+    refs = [PayloadRef(ref=key, size=sizes[key], sha256=sha) for sha, key in keys.items()]
+    read = await request.app.state.payloads.get_many_encoded(refs)
+    stored = dict(zip(keys, read, strict=True))
+
+    def framed() -> Iterator[bytes]:
+        for sha in body.sha256:
+            yield len(stored[sha]).to_bytes(8, "big")
+            yield stored[sha]
+
+    length = asked + 8 * len(body.sha256)
+    return StreamingResponse(
+        framed(), media_type=FRAMED_MEDIA_TYPE, headers={"Content-Length": str(length)}
+    )

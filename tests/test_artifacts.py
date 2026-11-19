@@ -9,6 +9,7 @@ import json
 from collections.abc import AsyncIterator
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import text
 from trellis.contracts.ids import now
 
@@ -292,3 +293,43 @@ async def test_a_malformed_checksum_is_refused_before_anything_is_stored(client,
 async def test_an_artifact_for_an_unknown_run_is_404(client, blobs) -> None:
     assert (await upload(client, "run_nope")).status_code == 404
     assert blob_files(blobs) == []
+
+
+async def test_an_upload_racing_a_sweep_of_the_same_bytes_is_a_conflict(
+    app, client, monkeypatch
+) -> None:
+    """The insert meets the run's artifact of these bytes, which the sweep deletes before it
+    can be read back: answered as a conflict, never an assertion or an empty answer."""
+    from agent_runs.blob import StoredBlob
+    from agent_runs.domain.errors import Conflict
+    from agent_runs.store.artifacts import ArtifactStore
+
+    run = await running(client)
+    first = (await upload(client, run["run_id"])).json()
+    async with app.state.sessions() as db:
+        real = db.scalar
+        calls = 0
+
+        async def scalar(statement, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = await real(statement, *args, **kwargs)
+            if calls == 1:  # the insert met the row: it goes before the read-back
+                async with app.state.engine.begin() as conn:
+                    await conn.execute(
+                        text("DELETE FROM run_artifacts WHERE artifact_id = :a"),
+                        {"a": first["artifact_id"]},
+                    )
+            return result
+
+        monkeypatch.setattr(db, "scalar", scalar)
+        blob = StoredBlob(key="k", size=len(TABLE_BYTES), sha256=first["checksum"].split(":")[-1])
+        with pytest.raises(Conflict, match="now gone"):
+            await ArtifactStore(db).add(
+                artifact_id="art_again",
+                tenant_id=run["tenant_id"],
+                run_id=run["run_id"],
+                blob=blob,
+                mime="application/json",
+                now=now(),
+            )

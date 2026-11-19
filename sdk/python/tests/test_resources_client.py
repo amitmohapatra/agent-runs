@@ -11,7 +11,7 @@ import pytest
 import respx
 from conftest import URL, artifact, record, schedule, webhook
 from trellis.contracts.runs import ScheduleSpec
-from trellis.runs import NotFoundError, RunsClient, ScheduleUpdate, WebhookEvent
+from trellis.runs import NotFoundError, RunsClient, ScheduleUpdate, WebhookEvent, artifacts
 from trellis.runs.payloads import MEDIA_TYPE, encode, ref_of
 
 
@@ -87,6 +87,41 @@ async def test_several_payload_objects_come_back_in_one_request_each_checked(
     assert json.loads(sent(route).content) == {"sha256": [r.sha256 for r in refs]}
     with pytest.raises(ValueError, match="cut short"):
         await runs.artifacts.get_payloads(refs)
+
+
+@respx.mock
+async def test_payload_objects_past_what_one_read_answers_are_asked_for_in_several(
+    runs: RunsClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One read answers a bounded number of objects and of bytes (413 past either): more are
+    read in several requests, split where a bound is reached, and an object alone in its
+    request (the last before a large one, or one larger than the bound) is read on its own."""
+    values = [[0], [1], [2], list(range(300)), [4], [5]]
+    data = [encode(value) for value in values]
+    refs = [ref_of("acme", d) for d in data]
+    stored = {ref.sha256: d for ref, d in zip(refs, data, strict=True)}
+    monkeypatch.setattr(artifacts, "MAX_READ_OBJECTS", 2)
+    monkeypatch.setattr(artifacts, "MAX_READ_BYTES", refs[3].size - 1)
+
+    def framed(request: httpx.Request) -> httpx.Response:
+        asked = [stored[sha] for sha in json.loads(request.content)["sha256"]]
+        return httpx.Response(200, content=b"".join(len(d).to_bytes(8, "big") + d for d in asked))
+
+    def whole(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=stored[request.url.path.rsplit("/", 1)[1]])
+
+    several = respx.post(f"{URL}/v1/payloads/read").mock(side_effect=framed)
+    alone = respx.get(url__regex=rf"{URL}/v1/payloads/[0-9a-f]{{64}}").mock(side_effect=whole)
+    assert await runs.artifacts.get_payloads(refs, tenant="acme") == data
+    assert [json.loads(call.request.content)["sha256"] for call in several.calls] == [
+        [refs[0].sha256, refs[1].sha256],
+        [refs[4].sha256, refs[5].sha256],
+    ]
+    assert [call.request.url.path.rsplit("/", 1)[1] for call in alone.calls] == [
+        refs[2].sha256,
+        refs[3].sha256,
+    ]
+    assert await runs.artifacts.get_payloads([]) == []
 
 
 # --------------------------------------------------------------------------- schedules

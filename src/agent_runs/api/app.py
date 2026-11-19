@@ -25,7 +25,7 @@ from agent_runs.blob.payloads import bind
 from agent_runs.config.settings import Settings, get_settings
 from agent_runs.keys import KeyRegistry
 from agent_runs.observability.logging import configure_logging
-from agent_runs.store.database import connect
+from agent_runs.store.database import connect, registry_engine
 
 log = structlog.get_logger(__name__)
 
@@ -44,8 +44,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.limiter = TenantRateLimiter(settings.rate_limit, engine)
         app.state.keys = KeyRegistry(settings.memory.url)
         app.state.blobs = open_blob_store(settings.blob)
+        registry = registry_engine(settings.database, settings.service.worker_count)
+        app.state.registry = async_sessionmaker(registry, expire_on_commit=False)
         app.state.payloads = bind(
-            app.state.sessions, app.state.blobs, retention=settings.blob.retention
+            app.state.sessions,
+            app.state.blobs,
+            registry=app.state.registry,
+            retention=settings.blob.retention,
         )
         log.info("agent_runs.started", environment=settings.service.environment)
         try:
@@ -53,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await app.state.keys.aclose()
             await app.state.blobs.aclose()
+            await registry.dispose()
             await engine.dispose()
             log.info("agent_runs.stopped")
 

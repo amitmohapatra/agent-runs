@@ -1,10 +1,12 @@
 """Webhook subscriptions and the delivery outbox.
 
 A run event is written to the outbox in the same transaction as the run change that caused
-it, one row per subscription of the tenant that wants that event, so an event is never lost
-to a crash between the commit and the send and never sent for a change that rolled back. The
-ticker delivers from the outbox (``claim_due`` / ``settle``). A delivery given up on stays in
-it, dead, for the tenant to list and redeliver, until the ticker drops it (``drop_dead``).
+it, by the store that makes the change (``RunStore._flushed`` and ``_swept`` call
+``announce``: no caller of a transition can leave it out), one row per subscription of the
+tenant that wants that event, so an event is never lost to a crash between the commit and
+the send and never sent for a change that rolled back. The ticker delivers from the outbox
+(``claim_due`` / ``settle``). A delivery given up on stays in it, dead, for the tenant to
+list and redeliver, until the ticker drops it (``drop_dead``).
 """
 
 from __future__ import annotations
@@ -19,10 +21,10 @@ from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from trellis.contracts.ids import new_id, stable_id
-from trellis.contracts.runs import RunRecord
+from trellis.contracts.runs import RunRecord, RunStatus
 from trellis.runs.payloads import jsonb_order
 
-from agent_runs.blob.payloads import payloads_of
+from agent_runs.blob.payloads import PayloadLost, payloads_of
 from agent_runs.config.constants import (
     DEFAULT_PAGE,
     MAX_WEBHOOKS_PER_TENANT,
@@ -114,10 +116,17 @@ def _with_payload(body: dict[str, Any], payload: Any) -> dict[str, Any]:
     return {**body, "data": {**body["data"], "run": {**run, "awaiting": awaiting}}}
 
 
+def _hears(hook: Any, run: RunRecord, event: WebhookEvent) -> bool:
+    """Does the subscription (its row) want this event of this run? Its tenant's, and one of
+    the events it names."""
+    return hook.tenant_id == run.tenant_id and event.value in hook.events
+
+
 @dataclass(frozen=True)
 class Delivery:
     """One outbox row the ticker holds, with where it goes and what signs it: the
-    subscription's secret, and the one a rotation replaced while it still signs too."""
+    subscription's secret, and the one a rotation replaced while it still signs too. ``lost``:
+    why it can never be sent (its payload is gone from the blob store)."""
 
     delivery_id: str
     url: str
@@ -125,6 +134,7 @@ class Delivery:
     payload: dict[str, Any]
     attempts: int
     previous_secret: str | None = None
+    lost: str | None = None
 
 
 class WebhookStore:
@@ -213,52 +223,61 @@ class WebhookStore:
             raise NotFound(f"no webhook {webhook_id}")
 
     # ------------------------------------------------------------------ the outbox
-    async def announce(
-        self, run: RunRecord, event: WebhookEvent | None = None, *, now: datetime
-    ) -> None:
-        """Write the event ``run`` warrants (``event`` overrides the one its status
-        announces) for every subscription of its tenant that wants it. One statement; a
-        repeat of the same event to the same subscription is dropped by the primary key."""
-        event = event or event_of(run)
-        if event is None:
+    async def announce(self, *runs: RunRecord, escalated: bool = False, now: datetime) -> None:
+        """Write the event each of ``runs`` warrants (what its status announces;
+        ``escalated``: one left ``PAUSED`` was escalated, not paused) for every subscription
+        of its tenant that wants it. Three statements however many runs: their tenants'
+        subscriptions, the references of the questions' payloads, the outbox rows. A repeat
+        of the same event to the same subscription is dropped by the primary key."""
+        events = [
+            (run, WebhookEvent.ESCALATED if escalated and run.status is RunStatus.PAUSED else e)
+            for run in runs
+            if (e := event_of(run)) is not None
+        ]
+        if not events:
             return
-        payload = envelope(run, event)
-        wanting = select(WebhookRow.webhook_id).where(
-            WebhookRow.tenant_id == run.tenant_id, WebhookRow.events.contains([event.value])
+        subscribed = select(WebhookRow.tenant_id, WebhookRow.webhook_id, WebhookRow.events).where(
+            WebhookRow.tenant_id.in_({run.tenant_id for run, _ in events})
         )
-        hooks = (await self._session.scalars(wanting)).all()
-        if not hooks:
-            return
-        # the interrupt's payload is the run's, by reference: the body keeps the reference
-        payload_ref = await self._session.scalar(
-            select(RunRow.awaiting_ref).where(RunRow.run_id == run.run_id)
-        )
-        awaiting = payload["data"]["run"]["awaiting"]
-        if payload_ref is not None and awaiting is not None:
-            awaiting.pop("payload", None)
-        await self._session.execute(
-            insert(WebhookDeliveryRow)
-            .values(
-                [
-                    {
-                        "delivery_id": stable_id(payload["event_id"], hook, prefix="dlv_"),
-                        "webhook_id": hook,
-                        "payload": payload,
-                        "payload_ref": payload_ref if awaiting is not None else None,
-                        "attempts": 0,
-                        "next_attempt_at": now,
-                        "created_at": now,
-                    }
-                    for hook in hooks
-                ]
+        hooks = (await self._session.execute(subscribed)).all()
+        wanted = [
+            (run, event, [h.webhook_id for h in hooks if _hears(h, run, event)])
+            for run, event in events
+        ]
+        # an interrupt's payload is the run's, by reference: the body keeps the reference
+        asking = [run.run_id for run, _, to in wanted if to and run.awaiting is not None]
+        refs: dict[str, Any] = {}
+        if asking:
+            referred = select(RunRow.run_id, RunRow.awaiting_ref).where(RunRow.run_id.in_(asking))
+            refs = dict((await self._session.execute(referred)).tuples().all())
+        owed: list[dict[str, Any]] = []
+        for run, event, to in wanted:
+            payload = envelope(run, event)
+            payload_ref = refs.get(run.run_id)
+            if payload_ref is not None:
+                payload["data"]["run"]["awaiting"].pop("payload", None)
+            owed += [
+                {
+                    "delivery_id": stable_id(payload["event_id"], hook, prefix="dlv_"),
+                    "webhook_id": hook,
+                    "payload": payload,
+                    "payload_ref": payload_ref,
+                    "attempts": 0,
+                    "next_attempt_at": now,
+                    "created_at": now,
+                }
+                for hook in to
+            ]
+        if owed:
+            await self._session.execute(
+                insert(WebhookDeliveryRow).values(owed).on_conflict_do_nothing()
             )
-            .on_conflict_do_nothing()
-        )
 
     async def claim_due(self, *, now: datetime, limit: int) -> list[Delivery]:
         """Deliveries still owed and due now, held for ``WEBHOOK_LEASE`` (another ticker
         skips them; a ticker that dies holding them lets them come due again) and counted as
-        attempted."""
+        attempted. One whose payload is lost from the blob store says so (``Delivery.lost``):
+        its attempt is refused for good, so it does not fail the claim of the others."""
         rows = (
             await self._session.execute(
                 select(WebhookDeliveryRow, WebhookRow)
@@ -273,10 +292,14 @@ class WebhookStore:
             )
         ).all()
         referred = [row for row, _ in rows if row.payload_ref is not None]
-        payloads = await payloads_of(self._session).get_many(r.payload_ref for r in referred)
+        payloads = await payloads_of(self._session).get_each(r.payload_ref for r in referred)
         bodies = {row.delivery_id: row.payload for row, _ in rows}
+        lost: dict[str, str] = {}
         for row, payload in zip(referred, payloads, strict=True):
-            bodies[row.delivery_id] = _with_payload(row.payload, payload)
+            if isinstance(payload, PayloadLost):
+                lost[row.delivery_id] = str(payload)
+            else:
+                bodies[row.delivery_id] = _with_payload(row.payload, payload)
         held: list[Delivery] = []
         for row, hook in rows:
             row.attempts += 1
@@ -291,6 +314,7 @@ class WebhookStore:
                     bodies[row.delivery_id],
                     row.attempts,
                     previous,
+                    lost.get(row.delivery_id),
                 )
             )
         await self._session.flush()

@@ -6,6 +6,152 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A heartbeat saves the events that show its checkpoint, with it.** `POST
+  /v1/runs/{id}/heartbeat` takes optional `events` (at most 500), added to the run's log in the
+  checkpoint's transaction (as an append: in order, one already logged skipped; one naming
+  another run refuses the whole heartbeat, checkpoint included). The SDK's
+  `RunsClient.heartbeat(..., events=)` sends them. A worker killed right after a step no longer
+  leaves a step its event log never shows. Nothing to do for a caller that does not send them.
+* **A brief Memory Service outage or overload no longer cancels runs.** The key registry
+  client asks once per key at a time (the requests that need it meanwhile share the answer:
+  a cache entry ending under load no longer sends every request to a busy registry), and a key
+  the registry accepted keeps working for up to `KEY_STALE_SECONDS` (300 s) past its entry
+  while the registry cannot be asked — heartbeats go on instead of failing `503` and losing
+  the run. A revocation takes effect within six minutes at most during such an outage (one
+  minute otherwise); a refused key is never kept. Nothing to do for a caller.
+* **An option handed back is that option.** `answers.meant(interrupt, value)` reads an
+  answer to a question with `options`: a string equal to an option's value or label once case
+  and spacing are set aside (`" sup-04 (lyon MILLS)"` for `SUP-04 (Lyon Mills)`) is that
+  option's value — with `multiple`, each string of a list; anything else is left as it was
+  given. `answer_problem` reads an answer so before it checks it, so `POST
+  /v1/runs/{id}/resume` takes an option's label where it took its value only (it was a `422`,
+  `the answer 'Globex GmbH' is not one of the options ['ACME', 'globex']`), and a pick of the
+  same option twice by value and label is `the answer picks an option more than once`.
+  Nothing is guessed: part of an option ("SUP-04"), "not SUP-04", "the second one" are no
+  option. The resolution is stored as it was sent: whoever reads it reads it with `meant`
+  (the harness does). A question that takes words beside its options says so in `expects`
+  (a string), as before.
+* **Built on the contracts' own helpers; `docs/openapi.json` follows them.** Four rules
+  this repo kept a copy of are now read from `trellis-contracts` (its unreleased `main`,
+  still 0.7.1):
+  * **An approval remembered `always` must be of a tool call.** `answer_problem` asks
+    `InterruptResolution.problem_with` first and keeps only the JSON Schema half. Its own
+    copy refused `remember: "run"` on an interrupt with no tool call and let `"always"`
+    through; both are now `422`, with the detail `only an approval of a tool call is
+    remembered beyond its call` (it ended `for the run`). A resolution naming the right
+    interrupt and another run is told so (`it answers run …, not …`). A client that matches
+    the old detail matches the new one.
+  * **A fired run is `Schedule.run_start`'s.** `Firing` no longer copies the schedule's
+    fields itself. The stored run is the same, with one exception: `metadata.fire_time` is
+    the instant in UTC, as in the `idempotency_key`; for `POST /v1/schedules/{id}/fire` with
+    an `at` in another offset it was `at` as spelled. The ticker's fires were in UTC already.
+  * **A record a newer version wrote is read.** The SDK (`start`, `get`, `claim`, `pause`,
+    `resume`, `finish`, `cancel`, `release`, every `schedules` call and a `FireResult`'s
+    schedule) and the store read a run and a schedule with `RunRecord.read`
+    and `Schedule.read`: a field a later contracts patch adds inside `awaiting` or
+    `last_resolution` is dropped, where it failed the read (a `ValidationError` in the
+    client, a `500` from a replica behind in a rolling deploy). What a request sends is
+    validated as before. Where an `Interrupt` is read outside a record it still refuses
+    such a field: a listing's `RunSummary` and the resolution history (SDK and store), and
+    in the store the answer to such a run and its deadline sweep.
+  * **`_move` is pinned to `RunRecord.moved`.** The store moves rows, not records, so it
+    keeps `_move`; a test holds the two to the same refusals and the same clearing of
+    `awaiting` and the checkpoint over every pair of statuses.
+
+  `docs/openapi.json`: `Schedule.last_error` is an `AgentError` (the JSON agent-runs wrote
+  is unchanged; the SDK returns `schedule.last_error.code`, not `["code"]`), and four
+  descriptions changed. `domain.schedules.idempotency_key` is gone (`run_start` builds the
+  key).
+* **The run store announces the changes it makes.** Whether a run change was announced to
+  webhooks was decided outside the store, at six call sites (five routes and the ticker),
+  each of which had to remember it. `RunStore` now writes the outbox row at the end of the
+  transition itself (`_flushed` for one run, `_swept` for a sweep's), in the same
+  transaction as before. The events delivered are unchanged. Nothing to do.
+* **A tenant's claim no longer reads its whole queue.** Every claim read all the queued runs
+  of the worker's agents and sorted them to take one: `ix_runs_queue` held them by age, and
+  the claim's order starts with the fair share between tenants. Measured with
+  `EXPLAIN ANALYZE` on one tenant's queue (PostgreSQL 16, JIT off): 37 ms a claim at 10,000
+  queued runs and 400 ms at 100,000 (790 ms when every run has a `concurrency_key`), a sort
+  spilling to disk. `ix_runs_queue` now holds the queue in claim order (`priority`
+  descending, then `queued_at`; migration `d0f5a6b7c8e9`), and a claim for one tenant, among
+  whose runs the fair share decides nothing, is ordered by priority and age alone: it reads
+  the first run with room and stops, 0.1 ms at either depth. The order runs are claimed in
+  is unchanged. A platform key's claim across tenants (no `X-Trellis-Tenant`) still sorts
+  every queued run of its agents (470 ms at 100,000), and so does a tenant's claim for
+  several `agent_ids` at once (80 ms). Run `alembic upgrade head` (`make migrate`) before starting
+  this version; the index is rebuilt in the migration's transaction, which blocks writes to
+  `agent_runs` while it runs.
+* **One way to build a `RunStore`.** `RunStore(session, limits)` takes the deployment's
+  `RUNS__LIMITS__*` (`Settings.limits`) and has no defaults: most routes, the ticker's
+  retention and compaction steps and `Firing` built one without them, which no method read
+  yet, so the next one that did would have ignored the configured limits. Routes get the
+  store from one dependency (`api/deps.py` `Runs`), `Firing` is handed it, and `Ticker` takes
+  `limits=` (was `max_run_seconds=` and `run_retention=`). Nothing to do: no route or setting
+  changes.
+* **A page of an ended run's events reads a page's worth, not the whole log.** The ticker
+  compacted an ended run's event log into one object, so every page of
+  `GET /v1/runs/{id}/events`, and every 500 events of its stream, downloaded and decoded the
+  whole log: reading a log of n events cost n²/500 of them. A log is now compacted into
+  objects of 500 events (`EVENT_CHUNK`), and a page reads the one it starts in and at most
+  the next. `agent_runs.events_ref` lists the objects (`{"chunks": [{"through", "ref"}]}`);
+  a log compacted before is still one object and is read as before, so there is no
+  migration. Deploy the API before the ticker: an API replica of the previous version
+  cannot read a log the new ticker compacted.
+* **A sweep reads none of its runs' payloads.** Each of the ticker's five run sweeps returned
+  full records, reading the input, output, last answer, checkpoint and question payload of up
+  to 100 runs from the blob store, only to announce them, and looked each run's
+  subscriptions up on its own: up to about 500 object reads and 200 statements a sweep. A
+  sweep's runs now come back without their payloads, and `WebhookStore.announce` takes them
+  all at once (three statements however many). A swept run whose payload object is lost no
+  longer fails its sweep. The events delivered are unchanged. Nothing to do.
+* **A fire the blob store cannot take is recorded on its schedule.** Only a database error
+  failed a fire; a blob store that did not answer when the run's input was written escaped,
+  nothing was recorded, and the same schedule was tried first, and failed, on every tick
+  while the schedules due after it never fired. It is now a failed fire like any other:
+  `last_error` (`Unavailable`, category `DEPENDENCY`, retryable), `consecutive_failures`,
+  the backoff, the auto-pause after three, and `503` with the schedule's state in `details`
+  from `POST /v1/schedules/{id}/fire` (it was a `503` naming the payload store). Nothing to
+  do.
+* **What a payload route holds is bounded.** `POST /v1/payloads/read` took up to 256 SHA-256s,
+  the same one as often as sent, read every object whole and copied them into one answer:
+  256 names of one 50 MiB object made one replica hold about 12.8 GB, twice. Now an object
+  named twice is read once (and still answered at each place asked), the bytes asked for are
+  at most 64 MiB together (`413 PAYLOAD_TOO_LARGE` past it, before anything is read from the
+  store), and the answer is written frame by frame, not copied into one body.
+  `POST /v1/runs/{id}/payloads` refuses (`413`) an object whose header says it decompresses
+  to more than 64 MiB (`MAX_PAYLOAD_DECODED_BYTES`) before decoding it to check it; it was
+  decoded up to 512 MiB. The SDK's `artifacts.get_payloads` asks for more than one read
+  answers (`trellis.runs.payloads.MAX_READ_OBJECTS`, `MAX_READ_BYTES`) in several requests,
+  so a caller of it has nothing to do; a client that posts to `/v1/payloads/read` itself
+  must split a read past 64 MiB. `payloads.decoded_size` is new.
+* **A burst of answers or fires no longer runs the pool dry.** `POST /v1/runs/{id}/resume` and
+  a schedule's fire register their payloads while their session holds a connection and a row
+  lock, and the registry took a second connection from the same pool: about 20 at once (the
+  default pool) each held one connection, waited 5 s for another and answered `503`. The
+  payload registry now has a pool of its own (`store/database.py` `registry_engine`), taken
+  out of the same budget: of a process's connections a tenth (at least one) are the
+  registry's, so the default is 9 kept + 9 burst for sessions and 2 for the registry (was
+  10 + 10), and `RUNS__DATABASE__CONNECTION_BUDGET` still bounds everything the container
+  opens. Nothing to do; `runs_db_pool_connections` reports the sessions' pool.
+* **One failing ticker step no longer stops the others.** Every step of a tick ran in one
+  `try` that caught only database and OS errors, so anything else one step raised (a webhook
+  delivery whose payload object was lost, a stored interrupt this build cannot read) ended the
+  tick there, and, the same rows coming first again, every later step for every tenant, for
+  good. Each step now runs on its own: what it raises that is no outage is logged
+  (`ticker.step_failed`) and counted in the new `runs_ticker_step_failures_total{step}`, and
+  the steps after it run. Only an outage (the database or its pool not answering, an OS
+  error) fails the tick as a whole and counts against the breaker. A delivery whose payload
+  is lost is kept dead (`last_error` says "missing or corrupt") instead of failing the claim
+  of the others, and a paused run past its interrupt's deadline whose stored interrupt cannot
+  be read ends `TIMEOUT` with code `interrupt_unreadable`. Alert on any increase of the new
+  counter.
+* **A checkpoint kept past a run's end stays readable.** A run finished or cancelled with
+  `keep_checkpoint` lost its link to the checkpoint's object when it ended, so the sweep
+  deleted the object after 24 hours while the record still named it. The link is now kept
+  for such a run. Nothing to do.
+* An artifact row deleted between a duplicate upload's insert and its read answers
+  `409 CONFLICT` instead of failing an assertion.
+
 * **An answer is held to its question's `format`s.** `trellis.runs.answers.answer_problem` (what
   `POST /v1/runs/{id}/resume` checks, and the harness for a run it keeps in its process) now
   validates `expects` with the schema draft's own format checker (`jsonschema`, already a

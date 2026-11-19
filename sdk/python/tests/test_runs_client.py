@@ -12,6 +12,8 @@ from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import (
     InterruptDecision,
     InterruptResolution,
+    RunEvent,
+    RunEventType,
     RunStart,
     RunStatus,
 )
@@ -131,6 +133,12 @@ async def test_heartbeat_extends_the_lease_and_may_save_progress(runs: RunsClien
     assert json.loads(sent(route).content) == {"worker_id": "w-1", "lease_seconds": 60}
     await runs.heartbeat("run_1", "w-1", lease_seconds=90, checkpoint={"tools": {}}, tenant="acme")
     assert json.loads(sent(route).content)["checkpoint"] == {"tools": {}}
+    shown = RunEvent(
+        tenant_id="acme", run_id="run_1", sequence=4, attempt=1, type=RunEventType.STEP_STARTED
+    )
+    await runs.heartbeat("run_1", "w-1", checkpoint={"tools": {}}, events=[shown])
+    body = json.loads(sent(route).content)  # saved with the checkpoint, in one request
+    assert [e["sequence"] for e in body["events"]] == [4] and body["checkpoint"] == {"tools": {}}
 
 
 @pytest.mark.parametrize("code", ["LEASE_LOST", "CONFLICT", None])
@@ -232,6 +240,27 @@ async def test_get_answers_the_record_or_none(runs: RunsClient) -> None:
     found = await runs.get("run_1")
     assert found is not None and found.run_id == "run_1"
     assert await runs.get("run_1") is None
+
+
+@respx.mock
+async def test_a_record_a_newer_server_wrote_is_read(runs: RunsClient) -> None:
+    """A later patch of the contracts may add a field to an interrupt; the client reads the
+    record without it instead of refusing the run."""
+    newer = record(status="PAUSED")
+    newer["awaiting"]["added_later"] = {"any": "value"}
+    respx.get(f"{URL}/v1/runs/run_1").respond(200, json=newer)
+    found = await runs.get("run_1")
+    assert found is not None and found.awaiting == interrupt()
+    running = record()
+    running["last_resolution"] = {
+        "interrupt_id": "int_1",
+        "run_id": "run_1",
+        "decision": "APPROVE",
+        "added_later": True,
+    }
+    respx.post(f"{URL}/v1/runs/claim").respond(200, json={"run": running, "lease": lease()})
+    claimed = await runs.claim("w-1", ["triage"])
+    assert claimed is not None and claimed.run.last_resolution is not None
 
 
 # --------------------------------------------------------------------------- listings

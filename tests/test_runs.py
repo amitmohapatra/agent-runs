@@ -13,7 +13,7 @@ from sqlalchemy import text
 from trellis.contracts.runs import RunStart
 
 from agent_runs.store.runs import RunStore
-from tests.conftest import interrupt, pause, paused, resolution, started
+from tests.conftest import SETTINGS, interrupt, pause, paused, resolution, started
 
 
 async def test_a_run_starts_running_and_comes_back_by_id(client) -> None:
@@ -108,9 +108,11 @@ async def test_concurrent_starts_on_one_key_make_one_run_and_no_error(app) -> No
     from trellis.contracts.ids import now
 
     async with app.state.sessions() as winner_db, app.state.sessions() as loser_db:
-        winner, created = await RunStore(winner_db).start(spec, queue=False, now=now())
+        winner, created = await RunStore(winner_db, SETTINGS.limits).start(
+            spec, queue=False, now=now()
+        )
         loser = asyncio.create_task(
-            RunStore(loser_db).start(
+            RunStore(loser_db, SETTINGS.limits).start(
                 spec.model_copy(update={"run_id": "run_x"}), queue=False, now=now()
             )
         )
@@ -441,6 +443,23 @@ async def _asked(client, **question) -> dict:
     return response.json()
 
 
+async def test_a_run_whose_interrupt_a_newer_version_wrote_is_read(app, client) -> None:
+    """During a rolling deploy a newer replica may store an interrupt with a field this one
+    does not know; the run is read without it, not refused."""
+    run = await paused(client)
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text(
+                """UPDATE agent_runs SET awaiting = awaiting || '{"added_later": true}'
+                   WHERE run_id = :run_id"""
+            ),
+            {"run_id": run["run_id"]},
+        )
+    response = await client.get(f"/v1/runs/{run['run_id']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["awaiting"] == run["awaiting"]
+
+
 async def _refused(client, run: dict, body: dict, why: str) -> None:
     """Refused with 422 saying ``why``, and nothing written: the run still waits, unanswered."""
     response = await client.post(f"/v1/runs/{run['run_id']}/resume", json=body)
@@ -474,8 +493,12 @@ async def test_several_picks_are_option_values_and_the_comment_is_kept(client) -
     assert [option["label"] for option in run["awaiting"]["options"]] == ["Europe", "United States"]
     assert run["awaiting"]["multiple"] is True
     await _refused(client, run, resolution(run, "ANSWER", answer="eu"), "is not a list")
-    await _refused(client, run, resolution(run, "ANSWER", answer=["Europe"]), "not among")
+    # a label handed back is its option (``answers.meant``); part of one is no option
+    await _refused(client, run, resolution(run, "ANSWER", answer=["Europ"]), "not among")
+    twice = resolution(run, "ANSWER", answer=["eu", " europe "])
+    await _refused(client, run, twice, "more than once")
     await _refused(client, run, resolution(run, "APPROVE", remember="run"), "remembered")
+    await _refused(client, run, resolution(run, "APPROVE", remember="always"), "remembered")
     picked = resolution(run, "ANSWER", answer=["us", "eu"], comment="both regions")
     resumed = await client.post(f"/v1/runs/{run['run_id']}/resume", json=picked)
     assert resumed.status_code == 200, resumed.text

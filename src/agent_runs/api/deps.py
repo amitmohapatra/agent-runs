@@ -1,4 +1,4 @@
-"""Request-scoped dependencies: a session, and who is calling."""
+"""Request-scoped dependencies: a session, the run store on it, and who is calling."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from agent_runs.config.constants import HEADER_API_KEY, HEADER_TENANT
 from agent_runs.domain.errors import BadRequest, Forbidden, RateLimited, Unauthorized
 from agent_runs.keys import KeyInfo, KeyRegistry
 from agent_runs.observability.metrics import rate_limited_total
+from agent_runs.store.runs import RunStore
 
 
 @dataclass(frozen=True)
@@ -130,5 +131,14 @@ async def _within_budget(request: Request, tenant_id: str) -> None:
 
 
 Session = Annotated[AsyncSession, Depends(session)]
+
+
+def run_store(request: Request, db: Session) -> RunStore:
+    """The run store on the request's session, within the deployment's limits: the one way a
+    route gets one."""
+    return RunStore(db, request.app.state.settings.limits)
+
+
+Runs = Annotated[RunStore, Depends(run_store)]
 Who = Annotated[Caller, Depends(caller)]
 Claiming = Annotated[Claimer, Depends(claimer)]

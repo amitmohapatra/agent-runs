@@ -131,7 +131,7 @@ flowchart LR
 | Claim order | `store/runs.py` `RunStore.claim`, `_next_queued`, `_tenant_has_room`, `_key_has_room` | the next queued run: the tenant whose workers hold fewest runs of the claimed agents first (fair share), then `priority`, then `queued_at`, among runs with room under their `concurrency_key` (`RUNS__LIMITS__CONCURRENCY_PER_KEY`) and their tenant's cap (`RUNS__LIMITS__MAX_RUNNING_PER_TENANT`); the room recounted under `pg_try_advisory_xact_lock` on the key or tenant, a key another claim is counting passed over like a locked row |
 | A key's line | `store/runs.py` `RunStore._key_locked`, `_after_the_line` (in `start`), `_placed_again` (in `resume`), `_place`, `_holds_before` | a run that shares a `concurrency_key` is created — or continues after its answer — in its place: the key's transaction lock (`pg_advisory_xact_lock`, the one claims count under), then the one statement that writes it, the transaction's last, sets its `created_at` (its answer's `recorded_at`) just after the latest `updated_at` of the key's running and queued runs when its clock is behind (`ix_runs_concurrency`). `created_at` never changes. The place (`_place`: `created_at`, or the latest answer's `recorded_at`) is read back as `placed_at` on the record and the summary (`_placed_at`), so no client computes it. Of two placed at once, the one committing second is placed after the first. A claim takes a queued run only while no run placed before it runs. One kept in its caller's process is born with `held_until = created_at + RESUME_GRACE` |
 | Run events | `store/runs.py` `RunStore.append_events`, `events`; `api/routers/runs.py` `stream_events`, `_follow` | each run's event log (`run_events`): appends fenced like a heartbeat, a position per event under the run's row lock, repeats (`attempt`, `sequence`) dropped; reads by position, and a server-sent event stream that polls in short transactions of its own (`EVENT_POLL_SECONDS`), keeps quiet connections open (`EVENT_KEEPALIVE_SECONDS`), ends with `end` once the run has, and lasts at most `EVENT_STREAM_SECONDS` |
-| Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), at most 10 000 keys |
+| Key registry | `keys.py` `KeyRegistry`, `KeyInfo` | introspection at the Memory Service, cached 60 s (refusals 10 s), one question per key at a time, an accepted key kept 300 s more while the registry is down, at most 10 000 keys |
 | Answering | `answering.py` `require_may_answer`, `require_may_cancel` | who may answer a paused run: an admin or platform key, or one that may act for anyone, answers any run; a key restricted to listed people answers, only as one of them, a run assigned to that person or to nobody. `RunStore.resume` applies it under the row lock, to the assignee now, before writing; then `trellis.runs.answers.answer_problem` checks the answer fits the question. `RunStore.cancel` applies the same rule (as any principal the key may act for) |
 | Stores | `store/runs.py`, `store/schedules.py`, `store/webhooks.py`, `store/artifacts.py` | every read and write of one table family; the caller commits |
 | Firing | `firing.py` `Firing` | queueing one run for one schedule tick, in the transaction that advances the schedule |
@@ -142,7 +142,7 @@ flowchart LR
 | SDK | `sdk/python/src/trellis/runs`: `RunsClient`, `Worker`, `webhooks`, `errors`, `models` | the Python client of every route (method names are the operation ids), the framework-neutral worker loop, the delivery signature; `sdk/python/tests` holds it to 100% line and branch coverage and checks it against `docs/openapi.json` |
 | Blob port | `trellis.runs.blob` (the SDK) `BlobStore`, `read`, `FilesystemBlobStore`; `blob/gcs.py`; `blob/payloads.py` `PayloadStore` (run payloads by reference) | create-only bytes under a key; `put_stream` writes an upload as it arrives (a temporary file, or a bounded spool for GCS), hashing as it goes; `read` verifies SHA-256 and size while streaming |
 | Schema | `alembic/versions/*`, `store/tables.py` | migrations are the schema; `tests/test_schema.py` checks the mappings match them; `store/database.py` `connect` refuses a database not at the head revision |
-| Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process, its share of the container's connection budget (`pool_plan`), with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
+| Engine | `store/database.py` `connect`, `ping`; `config/settings.py` `DatabaseSettings` | one pool per process for its sessions and a small one for the payload registry (`registry_engine`: a payload is registered while the request writing it may hold a connection and a row lock, so it never waits for a second connection of the sessions' pool), together its share of the container's connection budget (`pool_plan`), each with a pre-ping on checkout, a recycle window, a bounded wait for a connection, a connect timeout and a statement timeout; `ping` is the bounded readiness probe |
 
 ## The run lifecycle
 
@@ -487,7 +487,7 @@ sequenceDiagram
       T->>DB: SAVEPOINT, then INSERT agent_runs QUEUED, idempotency_key "schedule_id@fire_time",<br/>on_behalf_of, input, timeout_seconds, agent_version, priority, concurrency_key copied,<br/>metadata = the schedule's, then schedule_id, schedule_name, fire_time, created_by (these win)
       alt the run is queued (or already was for this tick)
         T->>DB: record_success: last_fired_at, last_run_id, failures 0,<br/>next_fire_at = next occurrence after max(fire_time, now)
-      else the database refuses it (DBAPIError)
+      else the database refuses it (DBAPIError), or the blob store does not take its input (Unavailable)
         T->>DB: ROLLBACK TO SAVEPOINT, then record_failure: consecutive_failures + 1, last_error
         Note over T,DB: permanent error, or MAX_CONSECUTIVE_FAILURES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h
       end
@@ -539,7 +539,7 @@ sequenceDiagram
       T->>DB: settle: delete the row
     else 408, 429, 5xx or unreachable, attempts left (7 in all)
       T->>DB: next_attempt_at = now + 15 s doubling (at most 10 min)
-    else any other answer (a 3xx too), a private address, or the 7th attempt
+    else any other answer (a 3xx too), a private address, a lost payload, or the 7th attempt
       T->>DB: dead: dead_at, last_error (kept RUNS__WEBHOOKS__DEAD_RETENTION_DAYS, 7)
     end
   end
@@ -653,7 +653,12 @@ a run's events.
    still kept after them. Unset, every run is kept.
 
 Each step is bounded per tick and safe in several replicas. A tick that fails as a whole
-(the database is down) counts against a breaker; `python -m agent_runs.heartbeat` is the liveness
+(the database or its pool does not answer) counts against a breaker. A step that fails on
+anything else (a row it cannot handle, a payload lost from the blob store) is logged
+(`ticker.step_failed`) and counted (`runs_ticker_step_failures_total`), and the steps after it
+still run: one bad row never stops the rest of the tick. A delivery whose payload is lost is
+kept dead, and a paused run past its deadline whose stored interrupt cannot be read ends
+`TIMEOUT` (`interrupt_unreadable`). `python -m agent_runs.heartbeat` is the liveness
 check (a heartbeat file touched after every tick, `RUNS__TICKER__HEARTBEAT_FILE`, one per
 ticker; unset, each ticker process beats into its own file in the temp directory).
 
@@ -816,7 +821,7 @@ after the last row returned. The indexes each serve one query:
 | `ix_runs_tenant_created` | `agent_runs (tenant_id, created_at)` | `GET /v1/runs`, newest first |
 | `ix_runs_parent` | `agent_runs (parent_run_id)` | `GET /v1/runs?parent_run_id=` |
 | `ix_runs_inbox` | `agent_runs (tenant_id, status, assignee, created_at)` | the inbox, `status=PAUSED&assignee=` |
-| `ix_runs_queue` | `agent_runs (tenant_id, agent_id, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim` |
+| `ix_runs_queue` | `agent_runs (tenant_id, agent_id, priority DESC, queued_at) WHERE status = 'QUEUED'` | `RunStore.claim`: a tenant's claim reads it in claim order and stops at the first run with room |
 | `ix_runs_lease` | `agent_runs (status, lease_expires_at) WHERE lease_expires_at IS NOT NULL` | `RunStore.requeue_lapsed` |
 | `ix_runs_held` | `agent_runs (held_until) WHERE status = 'RUNNING' AND held_until IS NOT NULL` | `RunStore.end_abandoned` |
 | `ix_runs_escalation` | `agent_runs (awaiting_deadline) WHERE status = 'PAUSED' AND awaiting_deadline IS NOT NULL` | `RunStore.escalate_overdue` |
@@ -843,7 +848,7 @@ and the run deadline sweep, `1a7f2b3c4d5e` run working time, `2b8a3c4d5e6f` run 
 `3c9b4d5e6f7a` run cancel, `4d0c5e6f7a8b` webhook dead letters and secret rotation,
 `5e1f6a7b8c9d` schedules' run limits, `6a2b7c8d9e0f` run priority and concurrency key,
 `7b3c8d9e0f1a` shared rate-limit budgets, `8c4d9e0f1a2b` run events, `9d5e0f1a2b3c` run
-retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key, `c9e4f5a6b7d8` a key's line (`ix_runs_concurrency` with the queued runs). Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
+retention, `0a6b1c2d3e4f` schedules' run priority and concurrency key, `c9e4f5a6b7d8` a key's line (`ix_runs_concurrency` with the queued runs), `d0f5a6b7c8e9` the queue in claim order (`ix_runs_queue` by priority, then age). Each has a downgrade; CI runs upgrade, downgrade to base and upgrade again.
 
 ## Code map
 

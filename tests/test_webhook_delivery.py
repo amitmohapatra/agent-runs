@@ -27,7 +27,7 @@ from agent_runs.egress import pinned
 from agent_runs.store.webhooks import Delivery, envelope
 from agent_runs.ticker import Ticker
 from agent_runs.webhooks import WebhookSender
-from tests.conftest import Receiver, at, sender, started
+from tests.conftest import SETTINGS, Receiver, at, sender, started
 from tests.test_webhooks import _run, subscribe
 
 
@@ -61,7 +61,14 @@ async def _finished(client) -> str:
 
 
 def _ticker(app, hooks: WebhookSender, tmp_path, **over: Any) -> Ticker:
-    return Ticker(app.state.sessions, hooks, app.state.blobs, heartbeat_path=tmp_path / "b", **over)
+    return Ticker(
+        app.state.sessions,
+        hooks,
+        app.state.blobs,
+        heartbeat_path=tmp_path / "b",
+        limits=SETTINGS.limits,
+        **over,
+    )
 
 
 # ------------------------------------------------------------------ dead letters

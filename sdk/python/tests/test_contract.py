@@ -234,7 +234,12 @@ async def test_every_call_is_what_the_document_describes(contract: OpenAPI) -> N
         await runs.start(start, queue=True)
         claimed = await runs.claim("w-1", ["triage"], lease_seconds=60)
         assert claimed is not None
-        await runs.heartbeat("run_1", "w-1", checkpoint={"tools": {"call_1": {"output": "ok"}}})
+        await runs.heartbeat(  # the progress, and the events that show it, saved together
+            "run_1",
+            "w-1",
+            checkpoint={"tools": {"call_1": {"output": "ok"}}},
+            events=[RunEvent.model_validate(EVENT)],
+        )
         await runs.heartbeat("run_1", "w-1")
         await runs.release("run_1", "w-1", checkpoint={"tools": {}})
         await runs.release("run_1", "w-1")
