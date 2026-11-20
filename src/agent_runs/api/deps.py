@@ -147,6 +147,6 @@ def schedule_policy(request: Request) -> SchedulesSettings:
 
 
 Runs = Annotated[RunStore, Depends(run_store)]
-SchedulePolicy = Annotated[SchedulesSettings, Depends(schedule_policy)]
+Policy = Annotated[SchedulesSettings, Depends(schedule_policy)]
 Who = Annotated[Caller, Depends(caller)]
 Claiming = Annotated[Claimer, Depends(claimer)]

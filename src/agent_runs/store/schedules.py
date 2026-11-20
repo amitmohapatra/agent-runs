@@ -25,7 +25,7 @@ two count limits, on by default and off at 0.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -43,6 +43,7 @@ from agent_runs.domain.cadence import jitter, next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
 from agent_runs.domain.schedules import (
     DuplicateSchedule,
+    SchedulePolicy,
     ScheduleUpdate,
     TooManySchedules,
     input_sha256,
@@ -173,13 +174,7 @@ class ScheduleStore:
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
             {"key": f"agent_schedules:{row.tenant_id}"},
         )
-        held = (
-            await self._session.execute(
-                select(func.count())
-                .select_from(ScheduleRow)
-                .where(ScheduleRow.tenant_id == row.tenant_id)
-            )
-        ).scalar_one()
+        held = await self._count(row.tenant_id)
         if held < limit:
             return None
         existing = (
@@ -190,8 +185,45 @@ class ScheduleStore:
             )
         ).scalar_one_or_none()
         if existing is None:
-            raise TooManySchedules(limit)
+            raise TooManySchedules(limit, held)
         return existing
+
+    async def _count(self, tenant_id: str) -> int:
+        """The schedules the tenant has."""
+        return (
+            await self._session.execute(
+                select(func.count())
+                .select_from(ScheduleRow)
+                .where(ScheduleRow.tenant_id == tenant_id)
+            )
+        ).scalar_one()
+
+    async def fires_on(self, tenant_id: str, day: date) -> int:
+        """The fires counted for the tenant on the UTC ``day`` (0 when none were)."""
+        fires = await self._session.scalar(
+            select(ScheduleFireCountRow.fires).where(
+                ScheduleFireCountRow.tenant_id == tenant_id, ScheduleFireCountRow.day == day
+            )
+        )
+        return fires or 0
+
+    async def policy_of(self, tenant_id: str, *, now: datetime) -> SchedulePolicy:
+        """The deployment's policy and where the tenant stands: its schedules, and its fires
+        of ``now``'s UTC day while the daily limit is on (nothing is counted while it is
+        off, so then ``None``)."""
+        policy = self._policy
+        day = now.astimezone(UTC).date()
+        counted = policy.fires_per_day_limit is not None
+        return SchedulePolicy(
+            min_interval_seconds=policy.min_interval_seconds,
+            jitter_seconds=policy.jitter_seconds,
+            max_failed_fires=policy.max_failed_fires,
+            max_per_tenant=policy.per_tenant_limit,
+            max_fires_per_day=policy.fires_per_day_limit,
+            schedule_count=await self._count(tenant_id),
+            fires_today=await self.fires_on(tenant_id, day) if counted else None,
+            day=day,
+        )
 
     async def get(self, tenant_id: str, schedule_id: str) -> Schedule:
         return _schedule(await self._row(tenant_id, schedule_id))

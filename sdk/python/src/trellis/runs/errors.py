@@ -1,7 +1,10 @@
 """SDK exceptions mapped from agent-runs' RFC 9457 problems.
 
 The names and the shape are the memory SDK's (``trellis.memory.errors``), so one ``except``
-reads both services. Branch on the class, or on ``code`` (the problem's stable category).
+reads both services. Branch on the class, or on ``code`` (the problem's stable category). The
+schedule limits are each their own class, a kind of the class their status always raised
+(:class:`ScheduleLimitError` and :class:`FiresPerDayError` are conflicts,
+:class:`CadenceTooFrequentError` a validation error), with their numbers in ``details``.
 
 :class:`LeaseLostError` is **not** a :class:`ConflictError`: it tells a worker to stop
 working the run and write nothing more, while a conflict is a refused transition the caller
@@ -66,6 +69,18 @@ class ConflictError(RunsError):
     transition, an answer to another interrupt, a run id that cannot be used)."""
 
 
+class ScheduleLimitError(ConflictError):
+    """409 ``SCHEDULE_LIMIT``: the tenant has the most schedules the deployment allows.
+    ``details``: ``max_per_tenant`` and ``schedule_count``. A delete makes room. A kind of
+    :class:`ConflictError`, which is what it was raised as before it had its own code."""
+
+
+class FiresPerDayError(ConflictError):
+    """409 ``FIRES_PER_DAY``: the tenant's schedule fires for the UTC day are spent; the fire
+    queued nothing and is recorded on the schedule (``last_error``, the same code).
+    ``details``: ``max_fires_per_day``, ``fires_today`` and ``day``."""
+
+
 class LeaseLostError(RunsError):
     """409 ``LEASE_LOST``: the worker no longer holds the run. Stop working it and write
     nothing more; another worker runs it again."""
@@ -73,6 +88,12 @@ class LeaseLostError(RunsError):
 
 class ValidationError(RunsError):
     """400, 405 or 422: the request is invalid."""
+
+
+class CadenceTooFrequentError(ValidationError):
+    """422 ``CADENCE_TOO_FREQUENT``: the cadence fires more often than the deployment's floor.
+    ``details``: ``min_interval_seconds`` and the cadence's shortest gap,
+    ``interval_seconds``."""
 
 
 class PayloadTooLargeError(ValidationError):
@@ -96,7 +117,10 @@ BY_CODE: Final[dict[str, type[RunsError]]] = {
     "NOT_FOUND": NotFoundError,
     "CONFLICT": ConflictError,
     "LEASE_LOST": LeaseLostError,
+    "SCHEDULE_LIMIT": ScheduleLimitError,
+    "FIRES_PER_DAY": FiresPerDayError,
     "VALIDATION": ValidationError,
+    "CADENCE_TOO_FREQUENT": CadenceTooFrequentError,
     "PAYLOAD_TOO_LARGE": PayloadTooLargeError,
     "RATE_LIMIT": RateLimitedError,
     "DEPENDENCY_UNAVAILABLE": DependencyUnavailableError,

@@ -4,7 +4,8 @@ A run *is* the contracts' ``RunRecord`` (started from a ``RunStart``, paused wit
 ``Interrupt``, resumed with an ``InterruptResolution``) and a schedule *is* a ``Schedule``
 (created from a ``ScheduleSpec``); those are used as they are. What is here is the service's
 own shapes: a listing's summary, a lease and a claim, the resolution history, the event
-log's entries and what an append did, a schedule's partial update and a fire's result,
+log's entries and what an append did, a schedule's partial update, a fire's result and the
+schedule policy,
 webhook subscriptions, the outbox's deliveries and the delivery envelope, and a page of a
 listing. ``tests/test_contract.py`` checks every one
 against the committed ``docs/openapi.json``.
@@ -12,7 +13,7 @@ against the committed ``docs/openapi.json``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -151,6 +152,24 @@ class FireResult(BaseModel):
     @classmethod
     def _the_schedule_is_read(cls, data: Any) -> Schedule:
         return Schedule.read(data)
+
+
+class SchedulePolicy(BaseModel):
+    """How the deployment's schedules fire, and where the tenant stands against its limits
+    (``GET /v1/schedules/policy``). ``max_per_tenant`` and ``max_fires_per_day`` are ``None``
+    when that limit is off; ``fires_today`` counts the UTC ``day``, ``None`` while the daily
+    limit is off (nothing is counted then)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    min_interval_seconds: int
+    jitter_seconds: int
+    max_failed_fires: int
+    max_per_tenant: int | None
+    max_fires_per_day: int | None
+    schedule_count: int
+    fires_today: int | None
+    day: date
 
 
 class WebhookEvent(StrEnum):

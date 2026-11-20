@@ -120,6 +120,8 @@ ERROR_DESCRIPTIONS: Final[dict[int, str]] = {
 _CREATED: Final = 201
 _FIRST_ERROR: Final = 400
 _UNPROCESSABLE: Final = 422
+#: The words FastAPI gives a 422 it adds itself; a route's own 422 says something else.
+_FASTAPI_422: Final = "Validation Error"
 _RETRYABLE: Final = frozenset({429, 503})
 #: What any authenticated route may answer before it looks at the request.
 AUTH_STATUSES: Final[tuple[int, ...]] = (400, 401, 403, 422, 429, 503)
@@ -188,7 +190,8 @@ def _document(path: str, method: str, op: dict[str, Any]) -> None:
             headers[HEADER_LIMIT] = _ref(HEADER_LIMIT)
             headers[HEADER_REMAINING] = _ref(HEADER_REMAINING)
         if code >= _FIRST_ERROR:
-            if code == _UNPROCESSABLE or not response.get("description"):
+            said = response.get("description")
+            if not said or (code == _UNPROCESSABLE and said == _FASTAPI_422):
                 response["description"] = ERROR_DESCRIPTIONS[code]
             response["content"] = _problem_content(code, path)
             if code in _RETRYABLE:

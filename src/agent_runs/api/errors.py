@@ -43,6 +43,9 @@ PROBLEM_TITLES: Final[dict[ErrorCode, str]] = {
     ErrorCode.NOT_FOUND: "Not found",
     ErrorCode.CONFLICT: "Conflict",
     ErrorCode.LEASE_LOST: "Lease lost",
+    ErrorCode.SCHEDULE_LIMIT: "Schedule limit reached",
+    ErrorCode.FIRES_PER_DAY: "Schedule fires for the day spent",
+    ErrorCode.CADENCE_TOO_FREQUENT: "Cadence too frequent",
     ErrorCode.PAYLOAD_TOO_LARGE: "Payload too large",
     ErrorCode.RATE_LIMIT: "Too many requests",
     ErrorCode.DEPENDENCY_UNAVAILABLE: "A dependency is unavailable",
@@ -91,8 +94,10 @@ class Problem(BaseModel):
     instance: str = Field(description="The request path.", examples=["/v1/runs/run_01J8/finish"])
     code: ErrorCode = Field(
         description="Stable machine-readable category. LEASE_LOST: the worker no longer holds "
-        "the run's lease and must stop working it; CONFLICT: any other state conflict; "
-        "DEPENDENCY_UNAVAILABLE and RATE_LIMIT are retryable after Retry-After."
+        "the run's lease and must stop working it; SCHEDULE_LIMIT (409), FIRES_PER_DAY (409) "
+        "and CADENCE_TOO_FREQUENT (422): a schedule limit, its numbers in `details`; "
+        "CONFLICT: any other state conflict; DEPENDENCY_UNAVAILABLE and RATE_LIMIT are "
+        "retryable after Retry-After."
     )
     retryable: bool = Field(description="Whether the same request may succeed if repeated.")
     request_id: str | None = Field(
@@ -101,7 +106,8 @@ class Problem(BaseModel):
     details: dict[str, Any] = Field(
         default_factory=dict,
         description="Category-specific structured context: `errors` (each with `loc`, `msg`, "
-        "`type`) for a 422, the schedule's state for a failed fire, the budget for a 429.",
+        "`type`) for a 422, the schedule's state for a failed fire, the budget for a 429, "
+        "the limit and where the tenant stands for a schedule limit.",
     )
 
 

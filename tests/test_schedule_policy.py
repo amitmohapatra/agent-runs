@@ -16,9 +16,12 @@ from typing import Any
 
 import pytest
 from sqlalchemy import text
+from trellis.contracts.runs import ScheduleSpec
 
 from agent_runs.config.settings import SchedulesSettings, Settings
 from agent_runs.domain.cadence import jitter
+from agent_runs.domain.schedules import TooManySchedules
+from agent_runs.store.schedules import ScheduleStore
 from agent_runs.ticker import Ticker
 from tests.conftest import SETTINGS, arm, client_of, queued_runs, scheduled, sender, serving
 
@@ -151,7 +154,9 @@ async def test_a_tenant_has_at_most_the_schedules_the_deployment_allows(parts) -
         assert [r.status_code for r in made] == [201, 201]
         refused = await client.post("/v1/schedules", json=scheduled())
         assert refused.status_code == 409, refused.text
-        assert refused.json()["code"] == "CONFLICT" and "2 schedules" in refused.json()["detail"]
+        assert (
+            refused.json()["code"] == "SCHEDULE_LIMIT" and "2 schedules" in refused.json()["detail"]
+        )
         again = await client.post("/v1/schedules", json=first)
         assert again.status_code == 200
         assert again.json()["schedule_id"] == made[0].json()["schedule_id"]
@@ -277,3 +282,187 @@ async def test_zero_turns_both_limits_off(parts) -> None:
         _, client, _ = served
         made = [await client.post("/v1/schedules", json=scheduled()) for _ in range(51)]
         assert {r.status_code for r in made} == {201}
+
+
+# ------------------------------------------------------------------ each limit, its own code
+
+
+async def test_a_create_past_the_tenants_limit_has_its_own_code_and_says_the_numbers(
+    parts,
+) -> None:
+    """``SCHEDULE_LIMIT``, not ``CONFLICT``: a caller tells "you have too many" from a lost
+    race by the code alone, and reads the limit and the tenant's count from ``details``. The
+    status stays ``409``."""
+    async with _served(parts, max_per_tenant=2) as served:
+        _, client, _ = served
+        for _ in range(2):
+            assert (await client.post("/v1/schedules", json=scheduled())).status_code == 201
+        refused = await client.post("/v1/schedules", json=scheduled())
+        assert refused.status_code == 409, refused.text
+        problem = refused.json()
+        assert problem["code"] == "SCHEDULE_LIMIT"
+        assert problem["type"] == "urn:trellis:problem:schedule-limit"
+        assert problem["details"] == {"max_per_tenant": 2, "schedule_count": 2}
+        assert problem["retryable"] is False and "2 schedules" in problem["detail"]
+
+
+async def test_the_schedule_limit_counts_what_the_tenant_really_has(app, client) -> None:
+    """A limit lowered under what a tenant already has: the count is the real one."""
+    for _ in range(3):
+        assert (await client.post("/v1/schedules", json=scheduled())).status_code == 201
+    async with app.state.sessions() as db:
+        lowered = ScheduleStore(db, SchedulesSettings(max_per_tenant=2))
+        with pytest.raises(TooManySchedules) as refused:
+            await lowered.upsert(
+                ScheduleSpec.model_validate(scheduled()),
+                created_by="user_ada",
+                now=datetime.now(UTC),
+            )
+    assert refused.value.code == "SCHEDULE_LIMIT"
+    assert refused.value.details == {"max_per_tenant": 2, "schedule_count": 3}
+
+
+async def test_a_fire_by_hand_past_the_day_has_its_own_code_and_says_the_numbers(parts) -> None:
+    """``POST /fire`` past ``MAX_FIRES_PER_DAY``: ``409 FIRES_PER_DAY``, the code the schedule
+    records in ``last_error``, with the limit, the fires the tenant used and the UTC day in
+    ``details``; the same numbers are in ``last_error.details``."""
+    async with _served(parts, max_fires_per_day=1) as served:
+        _, client, _ = served
+        sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+            "schedule_id"
+        ]
+        assert (
+            await client.post(f"/v1/schedules/{sid}/fire", json={"at": _last_tick().isoformat()})
+        ).status_code == 200
+        earlier = (_last_tick() - timedelta(hours=1)).isoformat()
+        over = await client.post(f"/v1/schedules/{sid}/fire", json={"at": earlier})
+        assert over.status_code == 409, over.text
+        problem = over.json()
+        day = datetime.now(UTC).date().isoformat()
+        assert problem["code"] == "FIRES_PER_DAY" and problem["retryable"] is False
+        assert problem["type"] == "urn:trellis:problem:fires-per-day"
+        numbers = {"max_fires_per_day": 1, "fires_today": 1, "day": day}
+        assert {k: problem["details"][k] for k in numbers} == numbers
+        recorded = (await client.get(f"/v1/schedules/{sid}")).json()["last_error"]
+        assert recorded["code"] == "FIRES_PER_DAY"
+        assert recorded["details"] == numbers
+        assert problem["details"]["error"] == recorded
+
+
+async def test_a_tick_refused_by_the_day_records_the_numbers(parts) -> None:
+    async with _served(parts, max_fires_per_day=1) as served:
+        app, client, ticker = served
+        await _due(app, client)
+        await _due(app, client)
+        now = datetime.now(UTC)
+        assert (await ticker.tick(now=now)).fired == 1
+        errors = [s["last_error"] for s in (await client.get("/v1/schedules")).json()]
+        [refused] = [e for e in errors if e is not None]
+        day = now.date().isoformat()
+        assert refused["code"] == "FIRES_PER_DAY"
+        assert refused["details"] == {"max_fires_per_day": 1, "fires_today": 1, "day": day}
+
+
+@pytest.mark.parametrize(
+    ("cadence", "gap"), [("*/5 * * * *", 300), ("0,30 * * * *", 1800), ("0 * * * * *", 1)]
+)
+async def test_a_cadence_under_the_floor_has_its_own_code_and_says_the_numbers(
+    client, cadence: str, gap: int
+) -> None:
+    """``422 CADENCE_TOO_FREQUENT``, with the floor and the cadence's real shortest gap in
+    seconds, on a create and on an update."""
+    refused = await client.post("/v1/schedules", json=scheduled(cadence=cadence))
+    assert refused.status_code == 422, refused.text
+    problem = refused.json()
+    assert problem["code"] == "CADENCE_TOO_FREQUENT"
+    assert problem["type"] == "urn:trellis:problem:cadence-too-frequent"
+    assert problem["details"] == {"min_interval_seconds": 3600, "interval_seconds": gap}
+    sid = (await client.post("/v1/schedules", json=scheduled())).json()["schedule_id"]
+    patched = await client.patch(f"/v1/schedules/{sid}", json={"cadence": cadence})
+    assert (patched.status_code, patched.json()["code"]) == (422, "CADENCE_TOO_FREQUENT")
+    assert patched.json()["details"] == problem["details"]
+
+
+async def test_the_cadence_floor_in_the_details_is_the_deployments(parts) -> None:
+    async with _served(parts, min_interval_seconds=900) as served:
+        _, client, _ = served
+        refused = (await client.post("/v1/schedules", json=scheduled(cadence="*/5 * * * *"))).json()
+        assert refused["details"] == {"min_interval_seconds": 900, "interval_seconds": 300}
+
+
+async def test_a_cadence_that_is_not_one_stays_a_validation_error(client) -> None:
+    refused = await client.post("/v1/schedules", json=scheduled(cadence="every so often"))
+    assert (refused.status_code, refused.json()["code"]) == (422, "VALIDATION")
+
+
+# ------------------------------------------------------------------ the policy, read
+
+
+async def test_the_policy_is_the_deployments_defaults_and_the_tenants_numbers(app, client) -> None:
+    """``GET /v1/schedules/policy``: the limits as facts, and where the tenant stands."""
+    day = datetime.now(UTC).date().isoformat()
+    empty = await client.get("/v1/schedules/policy")
+    assert empty.status_code == 200, empty.text
+    assert empty.json() == {
+        "min_interval_seconds": 3600,
+        "jitter_seconds": 60,
+        "max_failed_fires": 3,
+        "max_per_tenant": 50,
+        "max_fires_per_day": 500,
+        "schedule_count": 0,
+        "fires_today": 0,
+        "day": day,
+    }
+    sid = (await client.post("/v1/schedules", json=scheduled(cadence="hourly"))).json()[
+        "schedule_id"
+    ]
+    await client.post("/v1/schedules", json=scheduled())
+    assert (await client.post(f"/v1/schedules/{sid}/fire")).status_code == 200
+    now = (await client.get("/v1/schedules/policy")).json()
+    assert (now["schedule_count"], now["fires_today"]) == (2, 1)
+
+
+async def test_the_policy_is_the_deployments_and_a_limit_off_is_null(parts) -> None:
+    policy = {
+        "min_interval_seconds": 900,
+        "jitter_seconds": 5,
+        "max_failed_fires": 7,
+        "max_per_tenant": 0,
+        "max_fires_per_day": 0,
+    }
+    async with _served(parts, **policy) as served:
+        _, client, _ = served
+        await client.post("/v1/schedules", json=scheduled())
+        read = (await client.get("/v1/schedules/policy")).json()
+        assert read == {
+            **policy,
+            "max_per_tenant": None,
+            "max_fires_per_day": None,
+            "schedule_count": 1,
+            "fires_today": None,  # nothing is counted while the limit is off
+            "day": datetime.now(UTC).date().isoformat(),
+        }
+
+
+async def test_the_policy_counts_only_the_callers_tenant_and_only_today(app, client) -> None:
+    await client.post("/v1/schedules", json=scheduled())
+    yesterday = datetime.now(UTC).date() - timedelta(days=1)
+    async with app.state.engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO schedule_fire_counts (tenant_id, day, fires) VALUES (:t, :d, 9)"),
+            {"t": "acme", "d": yesterday},
+        )
+    async with client_of(app, "other-key") as globex:
+        theirs = (await globex.get("/v1/schedules/policy")).json()
+        assert (theirs["schedule_count"], theirs["fires_today"]) == (0, 0)
+    ours = (await client.get("/v1/schedules/policy")).json()
+    assert (ours["schedule_count"], ours["fires_today"]) == (1, 0)
+
+
+async def test_the_policy_needs_a_key_and_a_platform_key_names_the_tenant(app) -> None:
+    async with client_of(app, "no-such-key") as stranger:
+        assert (await stranger.get("/v1/schedules/policy")).status_code == 401
+    async with client_of(app, "platform-key") as platform:
+        assert (await platform.get("/v1/schedules/policy")).status_code == 400
+        named = await platform.get("/v1/schedules/policy", headers={"X-Trellis-Tenant": "acme"})
+        assert named.status_code == 200 and named.json()["max_per_tenant"] == 50

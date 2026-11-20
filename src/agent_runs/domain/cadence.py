@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
-from agent_runs.domain.errors import Unprocessable
+from agent_runs.domain.errors import ErrorCode, Unprocessable
 
 #: The named buckets and the cron expression each means; ``manual`` never fires on its own.
 #: They fire at local midnight (weekly on Monday): a schedule that wants a time of day says
@@ -50,6 +50,23 @@ class InvalidCadence(Unprocessable):
     """A cadence this service refuses to run."""
 
 
+class CadenceTooFrequent(InvalidCadence):
+    """A cadence whose real occurrences come closer together than the floor: its own code,
+    with the floor and the cadence's shortest gap, in seconds, in ``details``."""
+
+    code = ErrorCode.CADENCE_TOO_FREQUENT
+
+    def __init__(self, cadence: str, *, interval: timedelta, floor: timedelta) -> None:
+        super().__init__(
+            f"cadence {cadence!r} fires every {interval}, under the floor of one run every "
+            f"{floor}: per-minute schedules are refused",
+            details={
+                "min_interval_seconds": int(floor.total_seconds()),
+                "interval_seconds": int(interval.total_seconds()),
+            },
+        )
+
+
 def validate_cadence(cadence: str, *, floor: timedelta = MIN_INTERVAL) -> str:
     """The normalised cadence: a bucket, or a cron expression firing at most once per
     ``floor`` (hourly unless the deployment lowered it).
@@ -68,10 +85,7 @@ def validate_cadence(cadence: str, *, floor: timedelta = MIN_INTERVAL) -> str:
     times = [cursor.get_next(datetime) for _ in range(_PROBE_COUNT)]
     interval = min(later - earlier for earlier, later in pairwise(times))
     if interval < floor:
-        raise InvalidCadence(
-            f"cadence {cadence!r} fires every {interval}, under the floor of one run every "
-            f"{floor}: per-minute schedules are refused"
-        )
+        raise CadenceTooFrequent(cadence, interval=interval, floor=floor)
     return normalized
 
 

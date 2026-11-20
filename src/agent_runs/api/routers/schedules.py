@@ -17,7 +17,7 @@ from trellis.contracts.ids import now
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
 from agent_runs.api import examples
-from agent_runs.api.deps import Runs, SchedulePolicy, Session, Who
+from agent_runs.api.deps import Policy, Runs, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
@@ -31,6 +31,7 @@ from agent_runs.domain.schedules import (
     FireRefused,
     FireRequest,
     FireResult,
+    SchedulePolicy,
     ScheduleUpdate,
 )
 from agent_runs.firing import Firing
@@ -48,6 +49,12 @@ _ADMINISTER = (
     "names another tenant)."
 )
 
+_TOO_FREQUENT = (
+    "CADENCE_TOO_FREQUENT: the cadence fires more often than the deployment's floor; `details` "
+    "has `min_interval_seconds` and the cadence's real shortest gap, `interval_seconds`. "
+    "VALIDATION: anything else is invalid; details.errors says where."
+)
+
 
 @router.post(
     "",
@@ -62,17 +69,19 @@ _ADMINISTER = (
             "input) already exists: it, unchanged.",
         },
         **conflict(
-            "CONFLICT: the identity was deleted while this create ran (rare); repeat. Or the "
-            "tenant has the most schedules the deployment allows (RUNS__SCHEDULES__MAX_PER_"
-            "TENANT)."
+            "CONFLICT: the identity was deleted while this create ran (rare); repeat. "
+            "SCHEDULE_LIMIT: the tenant has the most schedules the deployment allows "
+            "(RUNS__SCHEDULES__MAX_PER_TENANT); `details` has `max_per_tenant` and "
+            "`schedule_count`."
         ),
+        422: {"description": _TOO_FREQUENT},
     },
 )
 async def create(
     spec: Annotated[ScheduleSpec, Body(openapi_examples=examples.SCHEDULE)],
     db: Session,
     who: Who,
-    policy: SchedulePolicy,
+    policy: Policy,
     response: Response,
 ) -> Schedule:
     """An upsert on the schedule's identity ``(agent_id, on_behalf_of, cadence, input)`` in
@@ -129,6 +138,20 @@ async def listing(
 
 
 @router.get(
+    "/policy",
+    summary="Read the schedule policy",
+    response_description="How this deployment's schedules fire, and where the tenant stands "
+    "against its limits.",
+)
+async def policy(db: Session, who: Who, settings: Policy) -> SchedulePolicy:
+    """The deployment's schedule policy (``RUNS__SCHEDULES__*``): the cadence floor, the
+    jitter, the failed fires before an auto-pause and the two limits (``null`` when off),
+    with the tenant's schedules and its fires of the UTC day (``null`` while that limit is
+    off). Any key of the tenant may read it."""
+    return await ScheduleStore(db, settings).policy_of(who.tenant_id, now=now())
+
+
+@router.get(
     "/{schedule_id}",
     summary="Read a schedule",
     response_description="The schedule, with its next fire and failure state.",
@@ -145,6 +168,7 @@ async def get(schedule_id: ScheduleId, db: Session, who: Who) -> Schedule:
     responses={
         403: {"description": _ADMINISTER},
         **conflict("CONFLICT: the change would give it another schedule's identity."),
+        422: {"description": _TOO_FREQUENT},
     },
 )
 async def update(
@@ -152,7 +176,7 @@ async def update(
     change: Annotated[ScheduleUpdate, Body(openapi_examples=examples.SCHEDULE_UPDATE)],
     db: Session,
     who: Who,
-    policy: SchedulePolicy,
+    policy: Policy,
 ) -> Schedule:
     """Change the fields sent; ``on_behalf_of`` is not one of them. ``{"enabled": false}``
     pauses, ``{"enabled": true}`` resumes (clearing an auto-pause; nothing is armed once the
@@ -189,9 +213,10 @@ async def delete(schedule_id: ScheduleId, db: Session, who: Who) -> Response:
         403: {"description": _ADMINISTER},
         **conflict(
             "CONFLICT: the schedule is paused and will not fire; or it has ended (an `at` at "
-            "or after its `end_at`, or any fire once that has passed); or the tenant's fires "
-            "for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; recorded on the "
-            "schedule)."
+            "or after its `end_at`, or any fire once that has passed). FIRES_PER_DAY: the "
+            "tenant's fires for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; "
+            "recorded on the schedule's `last_error` with the same code); `details` has "
+            "`max_fires_per_day`, `fires_today` and `day`."
         ),
         503: {
             "description": "DEPENDENCY_UNAVAILABLE: the run could not be queued; recorded on "
@@ -204,7 +229,7 @@ async def fire(
     db: Session,
     runs: Runs,
     who: Who,
-    policy: SchedulePolicy,
+    policy: Policy,
     body: Annotated[FireRequest | None, Body(openapi_examples=examples.FIRE)] = None,
 ) -> FireResult:
     """Queue the run for this schedule's tick now. Repeating it for the same ``at`` returns

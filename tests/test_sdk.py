@@ -21,20 +21,24 @@ from trellis.contracts.runs import (
     ScheduleSpec,
 )
 from trellis.runs import (
+    CadenceTooFrequentError,
     ConflictError,
     DeliveryState,
+    FiresPerDayError,
     Job,
     LeaseLostError,
     NotFoundError,
     RunsClient,
+    ScheduleLimitError,
     ScheduleUpdate,
     ValidationError,
     WebhookEvent,
     Worker,
 )
 
+from agent_runs.config.settings import SchedulesSettings
 from agent_runs.store.runs import RunStore
-from tests.conftest import SETTINGS, at
+from tests.conftest import SETTINGS, at, serving
 
 
 @pytest.fixture
@@ -338,3 +342,51 @@ async def test_the_ops_routes_through_the_sdk(runs: RunsClient) -> None:
     assert await runs.live() == {"status": "ok"}
     assert await runs.ready() == {"status": "ok"}
     assert "runs_http_requests_total" in await runs.metrics()
+
+
+async def test_each_schedule_limit_reaches_the_sdk_as_its_own_error(
+    migrated, memory, blobs
+) -> None:
+    """The SDK raises each limit as its own class (each a kind of the error its status always
+    was), with the code and the numbers in ``details``; and reads the policy."""
+    policy = SchedulesSettings(max_per_tenant=1, max_fires_per_day=1)
+    settings = SETTINGS.model_copy(update={"schedules": policy})
+    async with serving(settings, memory, blobs) as app:
+        http = AsyncClient(transport=ASGITransport(app=app), base_url="http://runs")
+        async with RunsClient("http://runs", api_key="dev-key", http_client=http) as runs:
+            spec = ScheduleSpec(
+                tenant_id="acme",
+                agent_id="briefing",
+                name="hourly",
+                cadence="hourly",
+                on_behalf_of="user_ada",
+            )
+            made = await runs.schedules.create(spec)
+            with pytest.raises(ScheduleLimitError) as many:
+                await runs.schedules.create(spec.model_copy(update={"agent_id": "other"}))
+            assert isinstance(many.value, ConflictError) and many.value.code == "SCHEDULE_LIMIT"
+            assert many.value.details == {"max_per_tenant": 1, "schedule_count": 1}
+
+            tick = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+            await runs.schedules.fire(made.schedule_id, at=tick)
+            with pytest.raises(FiresPerDayError) as spent:
+                await runs.schedules.fire(made.schedule_id, at=tick - timedelta(hours=1))
+            assert isinstance(spent.value, ConflictError) and spent.value.code == "FIRES_PER_DAY"
+            assert spent.value.details["max_fires_per_day"] == 1
+            assert spent.value.details["fires_today"] == 1
+
+            with pytest.raises(CadenceTooFrequentError) as fast:
+                await runs.schedules.update(made.schedule_id, ScheduleUpdate(cadence="*/5 * * * *"))
+            assert isinstance(fast.value, ValidationError)
+            assert fast.value.code == "CADENCE_TOO_FREQUENT"
+            assert fast.value.details == {"min_interval_seconds": 3600, "interval_seconds": 300}
+
+            read = await runs.schedules.policy()
+            assert (read.max_per_tenant, read.max_fires_per_day) == (1, 1)
+            assert (read.schedule_count, read.fires_today, read.min_interval_seconds) == (
+                1,
+                1,
+                3600,
+            )
+            assert read.day == datetime.now(UTC).date()
+        await http.aclose()

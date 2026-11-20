@@ -10,7 +10,7 @@ as comes from the stored row.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from hashlib import sha256
 from typing import Any, Final
 
@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from trellis.contracts.errors import AgentError
 from trellis.contracts.runs import Schedule
 
-from agent_runs.domain.errors import Conflict, Unavailable, Unprocessable
+from agent_runs.domain.errors import Conflict, ErrorCode, Unavailable, Unprocessable
 
 
 class ScheduleUpdate(BaseModel):
@@ -129,26 +129,78 @@ class ScheduleEnded(Conflict):
 
 
 class TooManySchedules(Conflict):
-    """A create past the tenant's ``RUNS__SCHEDULES__MAX_PER_TENANT``."""
+    """A create past the tenant's ``RUNS__SCHEDULES__MAX_PER_TENANT``: ``SCHEDULE_LIMIT``,
+    with the limit and the schedules the tenant has (``count``) in ``details``, so a caller
+    tells it from a lost race (``CONFLICT``) and says the numbers without reading the text.
+    Still 409: the tenant's state, not its pace, refuses it, and only a delete makes room."""
 
-    def __init__(self, limit: int) -> None:
-        super().__init__(f"a tenant has at most {limit} schedules")
+    code = ErrorCode.SCHEDULE_LIMIT
+
+    def __init__(self, limit: int, count: int) -> None:
+        super().__init__(
+            f"a tenant has at most {limit} schedules",
+            details={"max_per_tenant": limit, "schedule_count": count},
+        )
 
 
-#: ``AgentError.code`` of a fire refused by ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY``.
-FIRES_PER_DAY: Final = "FIRES_PER_DAY"
+#: ``AgentError.code`` of a fire refused by ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY``, and the
+#: code of the ``409`` a fire by hand answers for it: one code wherever the refusal is read.
+FIRES_PER_DAY: Final = ErrorCode.FIRES_PER_DAY.value
+
+
+def fires_per_day_details(limit: int, fires: int, day: date) -> dict[str, Any]:
+    """What a refusal by the daily fire limit says: the limit, the fires the tenant's
+    schedules used on the UTC day, and that day."""
+    return {"max_fires_per_day": limit, "fires_today": fires, "day": day.isoformat()}
 
 
 class FireRefused(Conflict):
     """A fire past the tenant's ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY`` for the UTC day: it
     queued nothing. Recorded on the schedule (``last_error``) and the tick skipped, as a
     failed fire is recorded and an overlapping tick skipped; the schedule is not paused for
-    it. The caller commits that before answering."""
+    it. The caller commits that before answering. ``FIRES_PER_DAY``: ``details`` holds the
+    numbers the recorded error does, and that error."""
+
+    code = ErrorCode.FIRES_PER_DAY
 
     def __init__(self, schedule: Schedule, error: AgentError) -> None:
-        super().__init__(error.message, details={"error": error.model_dump(mode="json")})
+        super().__init__(
+            error.message, details={**error.details, "error": error.model_dump(mode="json")}
+        )
         self.schedule = schedule
         self.error = error
+
+
+class SchedulePolicy(BaseModel):
+    """How this deployment's schedules fire, and where the caller's tenant stands against
+    its limits: what a harness tells a model as facts before it sets a schedule."""
+
+    model_config = ConfigDict(frozen=True)
+
+    min_interval_seconds: int = Field(
+        description="The shortest gap a cadence's occurrences may have, in seconds "
+        "(RUNS__SCHEDULES__MIN_INTERVAL_SECONDS); a faster one is 422 CADENCE_TOO_FREQUENT."
+    )
+    jitter_seconds: int = Field(
+        description="Each schedule fires a stable 0 to this many seconds after its tick."
+    )
+    max_failed_fires: int = Field(
+        description="Fires in a row that could not queue a run before a schedule pauses itself."
+    )
+    max_per_tenant: int | None = Field(
+        description="The most schedules a tenant may have (409 SCHEDULE_LIMIT past it); null: "
+        "no limit."
+    )
+    max_fires_per_day: int | None = Field(
+        description="The most runs a tenant's schedules may fire in a UTC day (FIRES_PER_DAY "
+        "past it); null: no limit."
+    )
+    schedule_count: int = Field(description="The schedules the tenant has now.")
+    fires_today: int | None = Field(
+        description="The fires the tenant's schedules used on `day`; null while "
+        "max_fires_per_day is off (nothing is counted)."
+    )
+    day: date = Field(description="The UTC day `fires_today` counts.")
 
 
 class FireTimeOutOfRange(Unprocessable):

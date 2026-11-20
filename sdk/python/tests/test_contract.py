@@ -39,22 +39,27 @@ from trellis.contracts.runs import (
     ScheduleSpec,
 )
 from trellis.runs import (
+    CadenceTooFrequentError,
     Claimed,
     DeliveryRecord,
     DeliveryState,
     EventsAppended,
     FireResult,
+    FiresPerDayError,
     Lease,
     LeaseLostError,
     ResolutionEntry,
     RunEventEntry,
     RunsClient,
     RunSummary,
+    ScheduleLimitError,
+    SchedulePolicy,
     ScheduleUpdate,
     Webhook,
     WebhookCreated,
     WebhookEvent,
 )
+from trellis.runs.errors import BY_CODE
 
 # --------------------------------------------------------------------------- the schemas
 #: the document's component schema, and the model the SDK reads (or sends) it as
@@ -321,3 +326,76 @@ async def test_the_error_answers_are_problems_the_document_describes(contract: O
         await runs.release("run_1", "w-1", checkpoint={"tools": {}})
         await runs.release("run_1", "w-1")
     assert service.violations == []
+
+
+# --------------------------------------------------------------------------- the schedule policy
+def test_the_schedule_policy_is_the_documents_schema(contract: OpenAPI) -> None:
+    schema = contract.schema("SchedulePolicy")
+    assert set(SchedulePolicy.model_fields) == set(schema["properties"])
+    required = {n for n, f in SchedulePolicy.model_fields.items() if f.is_required()}
+    assert required == set(schema.get("required", []))
+
+
+def test_every_problem_code_the_document_lists_has_its_own_class(contract: OpenAPI) -> None:
+    """A code the service may answer is raised as its class, not guessed from the status."""
+    assert set(contract.schema("ErrorCode")["enum"]) - {"INTERNAL"} == set(BY_CODE)
+
+
+POLICY = {
+    "min_interval_seconds": 3600,
+    "jitter_seconds": 60,
+    "max_failed_fires": 3,
+    "max_per_tenant": None,
+    "max_fires_per_day": 500,
+    "schedule_count": 2,
+    "fires_today": 1,
+    "day": "2026-11-20",
+}
+
+
+class _WithPolicy(Service):
+    """The service, answering ``GET /v1/schedules/policy`` too."""
+
+    @staticmethod
+    def _answer(op: str) -> httpx.Response:
+        if op == "schedules.policy":
+            return httpx.Response(200, json=POLICY)
+        return Service._answer(op)
+
+
+async def test_reading_the_policy_and_each_limit_are_what_the_document_describes(
+    contract: OpenAPI,
+) -> None:
+    service = _WithPolicy(contract)
+    service.refusals = {
+        "schedules.create": (
+            409,
+            problem(409, "SCHEDULE_LIMIT", details={"max_per_tenant": 1, "schedule_count": 1}),
+        ),
+        "schedules.fire": (
+            409,
+            problem(409, "FIRES_PER_DAY", details={"max_fires_per_day": 1, "fires_today": 1}),
+        ),
+        "schedules.update": (
+            422,
+            problem(
+                422,
+                "CADENCE_TOO_FREQUENT",
+                details={"min_interval_seconds": 3600, "interval_seconds": 300},
+            ),
+        ),
+    }
+    spec = ScheduleSpec(
+        tenant_id="acme", agent_id="briefing", name="m", cadence="daily", on_behalf_of="user_ada"
+    )
+    async with service.client() as runs:
+        policy = await runs.schedules.policy()
+        assert (policy.schedule_count, policy.max_per_tenant) == (2, None)
+        with pytest.raises(ScheduleLimitError):
+            await runs.schedules.create(spec)
+        with pytest.raises(FiresPerDayError):
+            await runs.schedules.fire("sch_1")
+        with pytest.raises(CadenceTooFrequentError):
+            await runs.schedules.update("sch_1", ScheduleUpdate(cadence="*/5 * * * *"))
+    assert service.violations == []
+    assert "schedules.policy" in service.seen

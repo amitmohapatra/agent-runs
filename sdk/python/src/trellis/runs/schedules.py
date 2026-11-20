@@ -10,11 +10,12 @@ from typing import Any
 
 from trellis.contracts.runs import Schedule, ScheduleSpec
 from trellis.runs._transport import PAGE_LIMIT, Transport
-from trellis.runs.models import FireResult, Page, ScheduleUpdate
+from trellis.runs.models import FireResult, Page, SchedulePolicy, ScheduleUpdate
 
 
 class SchedulesAPI:
-    """``runs.schedules``: ``create``, ``list``, ``get``, ``update``, ``delete``, ``fire``."""
+    """``runs.schedules``: ``create``, ``list``, ``get``, ``update``, ``delete``, ``fire``,
+    ``policy``."""
 
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
@@ -83,3 +84,10 @@ class SchedulesAPI:
             "POST", f"/v1/schedules/{schedule_id}/fire", tenant=tenant, json=body
         )
         return FireResult.model_validate(data)
+
+    async def policy(self, *, tenant: str | None = None) -> SchedulePolicy:
+        """The deployment's schedule policy and the tenant's standing against it: the cadence
+        floor, the jitter, the failed fires before an auto-pause, the two limits (``None``
+        when off), the tenant's schedules and its fires of the UTC day."""
+        data = await self._transport.json("GET", "/v1/schedules/policy", tenant=tenant)
+        return SchedulePolicy.model_validate(data)

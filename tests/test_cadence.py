@@ -15,6 +15,7 @@ import pytest
 from agent_runs.domain.cadence import (
     JITTER_MAX,
     MIN_INTERVAL,
+    CadenceTooFrequent,
     InvalidCadence,
     jitter,
     next_fire_at,
@@ -179,3 +180,23 @@ def test_the_jitter_spread_is_the_deployments_and_zero_turns_it_off() -> None:
     assert len(set(narrow)) == 10
     assert jitter("sch_1", spread=JITTER_MAX) == jitter("sch_1")
     assert {jitter(f"sch_{n}", spread=timedelta(0)) for n in range(20)} == {timedelta(0)}
+
+
+def test_a_cadence_under_the_floor_says_the_floor_and_its_real_gap_in_seconds() -> None:
+    """``CadenceTooFrequent``: its own code, and the numbers a caller tells a person,
+    measured on real occurrences (``0,30`` is every 30 minutes, not every hour)."""
+    with pytest.raises(CadenceTooFrequent) as refused:
+        validate_cadence("0,30 * * * *")
+    assert refused.value.code == "CADENCE_TOO_FREQUENT" and refused.value.status_code == 422
+    assert refused.value.details == {"min_interval_seconds": 3600, "interval_seconds": 1800}
+    assert isinstance(refused.value, InvalidCadence)
+    with pytest.raises(CadenceTooFrequent) as lower:
+        validate_cadence("*/5 * * * *", floor=timedelta(minutes=15))
+    assert lower.value.details == {"min_interval_seconds": 900, "interval_seconds": 300}
+
+
+def test_a_cadence_that_is_not_one_is_not_too_frequent() -> None:
+    with pytest.raises(InvalidCadence) as refused:
+        validate_cadence("every so often")
+    assert not isinstance(refused.value, CadenceTooFrequent)
+    assert refused.value.code == "VALIDATION" and refused.value.details == {}

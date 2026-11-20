@@ -107,7 +107,7 @@ are grouped:
 | `runs.stream_events` | `stream_events(run_id, *, after=0)` | an async iterator of `RunEventEntry`, live, until the run has ended; it reconnects from the last position on its own |
 | `artifacts.upload` | `artifacts.upload(run_id, data, *, mime_type="application/json", worker_id=None)` | `ArtifactRef` (its SHA-256 is sent and checked) |
 | `artifacts.download` | `artifacts.download(artifact_id)` | `bytes`, or `None` |
-| `schedules.*` | `schedules.create(spec)`, `list(...)`, `get(id)`, `update(id, ScheduleUpdate(...))`, `delete(id)`, `fire(id, *, at=None)` | `Schedule`, `Page[Schedule]`, `Schedule` or `None`, `Schedule`, `None`, `FireResult` |
+| `schedules.*` | `schedules.create(spec)`, `list(...)`, `get(id)`, `update(id, ScheduleUpdate(...))`, `delete(id)`, `fire(id, *, at=None)`, `policy()` | `Schedule`, `Page[Schedule]`, `Schedule` or `None`, `Schedule`, `None`, `FireResult`, `SchedulePolicy` |
 | `webhooks.*` | `webhooks.create(url, events)`, `list()`, `get(id)`, `delete(id)`, `rotate_secret(id)` | `WebhookCreated` (with the secret), `Page[Webhook]`, `Webhook` or `None`, `None`, `WebhookCreated` (the new secret) |
 | | `webhooks.deliveries(*, state=None, webhook_id=None, cursor, limit=50)`, `redeliver(delivery_id)` | `Page[DeliveryRecord]`, `DeliveryRecord` |
 | `ops.*` | `live()`, `ready()`, `metrics()` | `{"status": "ok"}`, `{"status": "ok"}`, Prometheus text |
@@ -247,6 +247,28 @@ its `metadata` under the fire's own keys (`schedule_id`, `schedule_name`, `fire_
 `created_by`), which win on conflict. `ScheduleUpdate` changes any of them. A schedule with
 an `end_at` (on the spec or set by an update) fires nothing at or after it: its
 `next_fire_at` is `None` once the next occurrence would be.
+
+The deployment's limits are facts to read, not text to parse. `schedules.policy()` answers
+them with where the tenant stands, and each limit raises its own error with its numbers:
+
+```python
+from trellis.runs import CadenceTooFrequentError, FiresPerDayError, ScheduleLimitError
+
+policy = await runs.schedules.policy()
+# SchedulePolicy(min_interval_seconds=3600, jitter_seconds=60, max_failed_fires=3,
+#                max_per_tenant=50, max_fires_per_day=500,   # None when that limit is off
+#                schedule_count=12, fires_today=40, day=date(2026, 11, 20))
+try:
+    await runs.schedules.create(spec)
+except ScheduleLimitError as full:  # a ConflictError
+    print(full.details)  # {"max_per_tenant": 50, "schedule_count": 50}
+except CadenceTooFrequentError as fast:  # a ValidationError
+    print(fast.details)  # {"min_interval_seconds": 3600, "interval_seconds": 300}
+try:
+    await runs.schedules.fire(briefing.schedule_id)
+except FiresPerDayError as spent:  # a ConflictError; also the schedule's last_error.code
+    print(spent.details["max_fires_per_day"], spent.details["fires_today"])
+```
 
 ## Webhooks
 
@@ -398,6 +420,9 @@ its status). Every error has `message`, `code`, `status` (0 without a response),
 | `NotFoundError` | `NOT_FOUND` / 404 | no such record (reads by id answer `None` instead) |
 | `ConflictError` | `CONFLICT` / 409 | an illegal transition, an answer to another interrupt, a cancel of a run that ended, a redelivery of a delivery still owed |
 | `LeaseLostError` | `LEASE_LOST` / 409 | the worker no longer holds the run: stop, write nothing more. **Not** a `ConflictError` |
+| `ScheduleLimitError` | `SCHEDULE_LIMIT` / 409 | a `ConflictError`: the tenant has the most schedules allowed; `details`: `max_per_tenant`, `schedule_count` |
+| `FiresPerDayError` | `FIRES_PER_DAY` / 409 | a `ConflictError`: the tenant's schedule fires for the UTC day are spent (recorded on the schedule); `details`: `max_fires_per_day`, `fires_today`, `day` |
+| `CadenceTooFrequentError` | `CADENCE_TOO_FREQUENT` / 422 | a `ValidationError`: the cadence fires more often than the floor; `details`: `min_interval_seconds`, `interval_seconds` |
 | `ValidationError` | `VALIDATION` / 400, 405, 422 | the request is invalid, an answer that does not fit its question included (the message says what) |
 | `PayloadTooLargeError` | `PAYLOAD_TOO_LARGE` / 413 | a `ValidationError`: a body, payload, checkpoint or artifact too large |
 | `RateLimitedError` | `RATE_LIMIT` / 429 | the tenant's budget is spent for now (`retry_after`) |

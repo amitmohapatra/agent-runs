@@ -18,7 +18,9 @@ The Python client is the SDK in [`sdk/python`](../sdk/python/README.md), `trelli
 (pip `trellis-runs`, versioned with this API): `RunsClient` has one method per operation,
 named by its operation id (`runs.start` is `RunsClient.start`, `schedules.fire` is
 `RunsClient.schedules.fire`), raises each problem `code` below as its own error class
-(`LEASE_LOST` is `LeaseLostError`, a sibling of `ConflictError`, not a kind of it), and
+(`LEASE_LOST` is `LeaseLostError`, a sibling of `ConflictError`, not a kind of it; the
+schedule limits are `ScheduleLimitError`, `FiresPerDayError` and `CadenceTooFrequentError`,
+kinds of `ConflictError` and `ValidationError`), and
 retries what is safe to retry; its `Worker` implements the claim, heartbeat and release
 semantics of [Runs](#runs).
 
@@ -46,7 +48,8 @@ Service's shape, so one client reads both services:
 `detail` is this occurrence and never echoes a submitted value; `retryable: true` means the
 same request may succeed later, and then a `429` or `503` carries `Retry-After` (seconds).
 `details` is structured context: `errors` (each `{loc, msg, type}`) for a `422`, the
-schedule's state for a failed fire, `differing` for a reused idempotency key.
+schedule's state for a failed fire, `differing` for a reused idempotency key, the limit and
+where the tenant stands for a [schedule limit](#schedule-limits).
 
 | Status | `code` | Means |
 |---|---|---|
@@ -56,8 +59,11 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 | `404` | `NOT_FOUND` | no such run, schedule, webhook or artifact in this tenant (or no such route) |
 | `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
 | `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, release, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled, finished, or ended past its deadline or working time. **Stop working the run.** |
-| `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a cancel of a run that ended, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused or ended schedule, a schedule or a fire past the deployment's limit (`RUNS__SCHEDULES__MAX_PER_TENANT`, `MAX_FIRES_PER_DAY`), a 21st webhook, a redelivery of a delivery still owed |
+| `409` | `SCHEDULE_LIMIT` | a create of a new schedule past the tenant's limit (`RUNS__SCHEDULES__MAX_PER_TENANT`); `details`: `max_per_tenant`, `schedule_count` ([schedule limits](#schedule-limits)) |
+| `409` | `FIRES_PER_DAY` | a fire past the tenant's fires for the UTC day (`RUNS__SCHEDULES__MAX_FIRES_PER_DAY`), recorded on the schedule with the same code; `details`: `max_fires_per_day`, `fires_today`, `day` |
+| `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a cancel of a run that ended, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a schedule create racing a delete of its identity, a fire of a paused or ended schedule, a 21st webhook, a redelivery of a delivery still owed |
 | `413` | `PAYLOAD_TOO_LARGE` | a JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (4 MiB), a run's `input`, `output` or `checkpoint` past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), an artifact past 50 MiB (see [Limits](#limits)) |
+| `422` | `CADENCE_TOO_FREQUENT` | a cadence whose occurrences come closer than the deployment's floor (`RUNS__SCHEDULES__MIN_INTERVAL_SECONDS`); `details`: `min_interval_seconds`, `interval_seconds` (its real shortest gap) |
 | `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators), a cursor this listing did not issue, or a webhook URL this deployment does not deliver to (scheme, or a host that does not resolve or resolves to a private address) |
 | `429` | `RATE_LIMIT` | the tenant's request budget is spent for now; retryable after `Retry-After` (see [Limits](#limits)) |
 | `500` | `INTERNAL` | a fault here (an artifact's stored bytes no longer match their checksum, a statement the database refuses, anything unanticipated); the detail says nothing about internals |
@@ -129,12 +135,13 @@ sections after the table have the bodies and the exact semantics.
 | `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&concurrency_key=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
-| `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare) or the tenant's schedule limit, `422` |
+| `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare, `CONFLICT`) or the tenant's schedule limit (`SCHEDULE_LIMIT`), `422` (`CADENCE_TOO_FREQUENT` under the floor) |
 | `GET /v1/schedules` | `?enabled=&agent_id=&on_behalf_of=&cursor=&limit=` | `200 [Schedule]` | `422` |
+| `GET /v1/schedules/policy` | | `200 SchedulePolicy` | |
 | `GET /v1/schedules/{id}` | | `200 Schedule` | `404` |
-| `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` |
+| `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` (`CADENCE_TOO_FREQUENT` under the floor) |
 | `DELETE /v1/schedules/{id}` | | `204` | `403` `on_behalf_of`, `404` |
-| `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused, ended or the tenant's fires for the day spent, `422` `at` ahead or naive, `503` not queued |
+| `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused or ended (`CONFLICT`), or the tenant's fires for the day spent (`FIRES_PER_DAY`), `422` `at` ahead or naive, `503` not queued |
 | `POST /v1/webhooks` | `{url, events}` | `201 WebhookCreated` | `409` 20 already, `422` (also a URL this deployment does not deliver to) |
 | `GET /v1/webhooks` | `?cursor=&limit=` | `200 [Webhook]` | `422` |
 | `GET /v1/webhooks/{id}` | | `200 Webhook` | `404` |
@@ -697,10 +704,20 @@ scheduled run so carries whatever a caller keeps there for a started one.
 `cadence` is `hourly | daily | weekly | weekdays | manual` (local midnight; weekly on Monday;
 `manual` never fires on its own) or a cron expression firing at most once an hour (the
 deployment may lower that floor, never under five minutes: `RUNS__SCHEDULES__MIN_INTERVAL_SECONDS`).
+A faster one is `422 CADENCE_TOO_FREQUENT`, measured on its real occurrences (`0,30 * * * *`
+is every 30 minutes):
+
+```json
+{"type": "urn:trellis:problem:cadence-too-frequent", "status": 422,
+ "code": "CADENCE_TOO_FREQUENT", "detail": "cadence '*/5 * * * *' fires every 0:05:00, …",
+ "retryable": false, "details": {"min_interval_seconds": 3600, "interval_seconds": 300}, …}
+```
 
 A tenant has at most 50 schedules unless the deployment says otherwise
 (`RUNS__SCHEDULES__MAX_PER_TENANT`; `0` is no limit): a create of a new schedule past it is
-`409`; a create whose identity exists still answers `200`.
+`409 SCHEDULE_LIMIT`, `details` `{"max_per_tenant": 50, "schedule_count": 50}`; a create whose
+identity exists still answers `200`. (`409 CONFLICT` on a create is only the rare race of a
+delete of the same identity: repeat it.)
 
 **An upsert.** A schedule's identity is `(tenant_id, agent_id, on_behalf_of, cadence,
 input_sha256)`, where `cadence` is the normalised expression and `input_sha256` is the
@@ -756,7 +773,15 @@ schedules fire at most 500 runs a UTC day unless the deployment says otherwise
 against its tenant's UTC day, by hand or by the ticker; past it the fire is `409` and queues nothing, and
 the schedule records why in `last_error` (code `FIRES_PER_DAY`, category `RATE_LIMIT`) and is
 armed for its next occurrence. It is never paused for it, and `consecutive_failures` does not
-grow. A repeat for an instant already fired returns its run, counting nothing.
+grow. A repeat for an instant already fired returns its run, counting nothing. The `409`'s
+code is the recorded one, `FIRES_PER_DAY`, and its `details` hold the numbers the recorded
+error's `details` do, with that error:
+
+```json
+{"type": "urn:trellis:problem:fires-per-day", "status": 409, "code": "FIRES_PER_DAY",
+ "retryable": false, "details": {"max_fires_per_day": 500, "fires_today": 500,
+ "day": "2026-11-20", "error": {"code": "FIRES_PER_DAY", "category": "RATE_LIMIT", …}}, …}
+```
 `503 DEPENDENCY_UNAVAILABLE` when the run could not be queued; `details` says what the
 schedule did about it (`retryable` is false once the schedule paused itself):
 
@@ -766,6 +791,31 @@ schedule did about it (`retryable` is false once the schedule paused itself):
  "retryable": true, "details": {"consecutive_failures": 1, "auto_paused": false,
  "error": {…AgentError…}}, …}
 ```
+
+### Schedule limits
+
+The three limits a schedule meets each have their own `code`, so a caller tells a person
+which one and its numbers without reading `detail`: `SCHEDULE_LIMIT` (`409`, a create),
+`FIRES_PER_DAY` (`409`, a fire; also `last_error.code` of a tick the ticker could not fire for
+it) and `CADENCE_TOO_FREQUENT` (`422`, a create or a `PATCH`). Each keeps the status its
+category always had, so a client that does not know the code still classes it by the status
+(`409` a conflict, `422` invalid).
+
+### `GET /v1/schedules/policy` → `SchedulePolicy`
+
+How this deployment's schedules fire, and where the caller's tenant stands: what a harness
+tells a model as facts before it sets a schedule. Any key of the tenant may read it (a
+platform key names the tenant in `X-Trellis-Tenant`).
+
+```json
+{"min_interval_seconds": 3600, "jitter_seconds": 60, "max_failed_fires": 3,
+ "max_per_tenant": 50, "max_fires_per_day": 500,
+ "schedule_count": 12, "fires_today": 40, "day": "2026-11-20"}
+```
+
+`max_per_tenant` and `max_fires_per_day` are `null` when that limit is off (`0`).
+`schedule_count` is the schedules the tenant has; `fires_today` the fires its schedules used
+on the UTC `day`, `null` while `max_fires_per_day` is off (nothing is counted then).
 
 ## Webhooks
 

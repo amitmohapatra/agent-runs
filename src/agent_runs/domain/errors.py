@@ -3,8 +3,12 @@ on. Raised by the stores and the firing path; one exception handler in the app t
 into RFC 9457 problems (``api/errors.py``), so no route translates errors by hand.
 
 ``code`` is the Memory Service's vocabulary (one client maps both services' errors) plus
-``LEASE_LOST``: a worker writing to a run whose lease it no longer holds must stop working
-it, which is a different thing to do from any other conflict.
+the codes a caller acts on differently from the category they refine: ``LEASE_LOST`` (a
+worker writing to a run whose lease it no longer holds must stop working it, which is a
+different thing to do from any other conflict) and the three schedule limits (a person is
+told the limit and where they stand, which is not what a lost race calls for). Each keeps
+its category's status, so a client that does not know the code still classes it by the
+status, as it did before the code existed.
 """
 
 from __future__ import annotations
@@ -40,6 +44,15 @@ class ErrorCode(StrEnum):
     CONFLICT = "CONFLICT"
     #: the worker no longer holds the run's lease: stop working the run (409)
     LEASE_LOST = "LEASE_LOST"
+    #: the tenant has the most schedules the deployment allows
+    #: (``RUNS__SCHEDULES__MAX_PER_TENANT``); ``details`` has the limit and the count (409)
+    SCHEDULE_LIMIT = "SCHEDULE_LIMIT"
+    #: the tenant's schedule fires for the UTC day are spent
+    #: (``RUNS__SCHEDULES__MAX_FIRES_PER_DAY``); ``details`` has the limit and the fires (409)
+    FIRES_PER_DAY = "FIRES_PER_DAY"
+    #: a cadence firing more often than the deployment's floor
+    #: (``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS``); ``details`` has both in seconds (422)
+    CADENCE_TOO_FREQUENT = "CADENCE_TOO_FREQUENT"
     #: the body, or a part of it with its own bound, is too large (413)
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     #: the tenant's request budget is spent for now (429, ``Retry-After``)

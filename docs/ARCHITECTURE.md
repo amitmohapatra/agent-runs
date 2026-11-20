@@ -521,8 +521,13 @@ With `RUNS__SCHEDULES__MAX_FIRES_PER_DAY` on (500 unless set; `0` is off), a fir
 tenant's counter for the UTC day (`schedule_fire_counts`, an upsert that adds one only while
 under the limit, under the row's lock, so replicas never pass it) inside the fire's savepoint.
 Past the limit the savepoint is rolled back, so no run is queued, and `record_refusal` records
-`last_error` (`FIRES_PER_DAY`) and arms the next occurrence, as a skipped tick is; the
-failure count, which auto-pauses, is not touched.
+`last_error` (`FIRES_PER_DAY`, with the limit, the day's fires and the day in `details`) and
+arms the next occurrence, as a skipped tick is; the failure count, which auto-pauses, is not
+touched. A fire by hand refused so is `409 FIRES_PER_DAY`, the recorded code; a create past
+the schedule limit is `409 SCHEDULE_LIMIT`, a cadence under the floor `422
+CADENCE_TOO_FREQUENT`, each with its numbers. `GET /v1/schedules/policy` reads the policy and
+where a tenant stands. A tick missed while the ticker was down is caught up once, for the
+tick owed, by one replica (`tests/test_schedule_catch_up.py`).
 
 ## Webhook delivery and dead letters
 

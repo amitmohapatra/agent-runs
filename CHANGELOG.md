@@ -6,6 +6,25 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **Each schedule limit has its own error code, with its numbers.** A create past
+  `RUNS__SCHEDULES__MAX_PER_TENANT` is `409 SCHEDULE_LIMIT` (it was `409 CONFLICT`, the code a
+  create racing a delete still has), `details` `{"max_per_tenant", "schedule_count"}`. A fire
+  past `MAX_FIRES_PER_DAY` is `409 FIRES_PER_DAY` (it was `CONFLICT`), the code its
+  `last_error` already had; both now carry `{"max_fires_per_day", "fires_today", "day"}` in
+  `details` (the problem's also keeps the recorded `error`). A cadence under the floor is
+  `422 CADENCE_TOO_FREQUENT` (it was `VALIDATION`), `details` `{"min_interval_seconds",
+  "interval_seconds"}`, its real shortest gap. The statuses and the `detail` words are
+  unchanged. **A caller that branched on `code == "CONFLICT"` or `"VALIDATION"` for these
+  must add the new code**; one that branched on the status, or catches the SDK's
+  `ConflictError` / `ValidationError`, needs nothing: the SDK raises `ScheduleLimitError`,
+  `FiresPerDayError` (both `ConflictError`) and `CadenceTooFrequentError` (a
+  `ValidationError`), and an older SDK classes the new codes by their status.
+* **`GET /v1/schedules/policy`** (SDK `runs.schedules.policy()` → `SchedulePolicy`): the
+  schedule policy in force (`min_interval_seconds`, `jitter_seconds`, `max_failed_fires`,
+  `max_per_tenant` and `max_fires_per_day`, `null` when off) and the tenant's
+  `schedule_count` and `fires_today` (of the UTC `day`; `null` while the daily limit is off),
+  for any key of the tenant. A route's own `422` description in the OpenAPI document is now
+  kept (only FastAPI's generic one is replaced).
 * **A schedule may end.** `ScheduleSpec.end_at` (trellis-contracts' unreleased `main`, still
   0.7.1), and `end_at` in `PATCH /v1/schedules/{id}` and the SDK's `ScheduleUpdate` (`null` /
   `None` removes it). It is stored (migration `f6a7b8c9d0e1`, a nullable column: every

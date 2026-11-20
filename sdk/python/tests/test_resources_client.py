@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -12,7 +12,14 @@ import respx
 from conftest import URL, artifact, record, schedule, webhook
 from pydantic import ValidationError
 from trellis.contracts.runs import ScheduleSpec
-from trellis.runs import NotFoundError, RunsClient, ScheduleUpdate, WebhookEvent, artifacts
+from trellis.runs import (
+    NotFoundError,
+    RunsClient,
+    SchedulePolicy,
+    ScheduleUpdate,
+    WebhookEvent,
+    artifacts,
+)
 from trellis.runs.payloads import MEDIA_TYPE, encode, ref_of
 
 
@@ -256,3 +263,26 @@ async def test_a_record_with_a_field_the_sdk_does_not_know_still_parses() -> Non
         respx.get(f"{URL}/v1/runs/run_1").respond(200, json={**record(), "future_field": 1})
         found = await RunsClient(URL).get("run_1")
     assert found is not None and found.run_id == "run_1"
+
+
+@respx.mock
+async def test_policy_reads_the_limits_and_where_the_tenant_stands(runs: RunsClient) -> None:
+    read = {
+        "min_interval_seconds": 3600,
+        "jitter_seconds": 60,
+        "max_failed_fires": 3,
+        "max_per_tenant": 50,
+        "max_fires_per_day": None,
+        "schedule_count": 4,
+        "fires_today": None,
+        "day": "2026-11-20",
+    }
+    route = respx.get(f"{URL}/v1/schedules/policy").respond(200, json=read)
+    policy = await runs.schedules.policy(tenant="acme")
+    assert isinstance(policy, SchedulePolicy)
+    assert (policy.max_per_tenant, policy.max_fires_per_day) == (50, None)
+    assert (policy.schedule_count, policy.fires_today) == (4, None)
+    assert policy.day == date(2026, 11, 20) and policy.min_interval_seconds == 3600
+    assert sent(route).headers["X-Trellis-Tenant"] == "acme"
+    await runs.schedules.policy()
+    assert route.call_count == 2

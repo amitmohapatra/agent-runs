@@ -43,6 +43,7 @@ from agent_runs.domain.schedules import (
     FireTimeOutOfRange,
     ScheduleEnded,
     ScheduleNotFiring,
+    fires_per_day_details,
 )
 from agent_runs.store.runs import RunStore
 from agent_runs.store.schedules import ScheduleStore
@@ -123,14 +124,17 @@ class Firing:
                 ):
                     raise _OverTheDay  # the run is rolled back with the savepoint
         except _OverTheDay:
-            day = now.astimezone(UTC).date().isoformat()
+            assert limit is not None
+            day = now.astimezone(UTC).date()
+            fires = await self._schedules.fires_on(schedule.tenant_id, day)
             error = AgentError(
                 code=FIRES_PER_DAY,
-                message=f"tenant {schedule.tenant_id} has fired its {limit} fires for {day} "
-                "(UTC): this tick queued no run",
+                message=f"tenant {schedule.tenant_id} has fired its {limit} fires for "
+                f"{day.isoformat()} (UTC): this tick queued no run",
                 category=ErrorCategory.RATE_LIMIT,
                 retryable=False,
                 source="agent-runs",
+                details=fires_per_day_details(limit, fires, day),
             )
             refused = await self._schedules.record_refusal(
                 schedule.schedule_id, error=error, now=now

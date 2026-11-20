@@ -13,14 +13,17 @@ from trellis.contracts.runs import RunStatus
 from trellis.runs import (
     AuthenticationError,
     AuthorizationError,
+    CadenceTooFrequentError,
     ConflictError,
     DependencyUnavailableError,
+    FiresPerDayError,
     LeaseLostError,
     NotFoundError,
     PayloadTooLargeError,
     RateLimitedError,
     RunsClient,
     RunsError,
+    ScheduleLimitError,
     ValidationError,
 )
 from trellis.runs import _transport as transport
@@ -259,3 +262,47 @@ def test_next_cursor_reads_the_next_link_only() -> None:
     both = '<http://r/v1/runs?cursor=a>; rel="prev", <http://r/v1/runs?limit=2&cursor=b>; rel=next'
     assert transport.next_cursor(both) == "b"
     assert transport.next_cursor('<http://r/v1/runs?limit=2>; rel="next"') is None
+
+
+# --------------------------------------------------------------------------- schedule limits
+@pytest.mark.parametrize(
+    ("status", "code", "cls", "kind", "details"),
+    [
+        (
+            409,
+            "SCHEDULE_LIMIT",
+            ScheduleLimitError,
+            ConflictError,
+            {"max_per_tenant": 50, "schedule_count": 50},
+        ),
+        (
+            409,
+            "FIRES_PER_DAY",
+            FiresPerDayError,
+            ConflictError,
+            {"max_fires_per_day": 500, "fires_today": 500, "day": "2026-11-20"},
+        ),
+        (
+            422,
+            "CADENCE_TOO_FREQUENT",
+            CadenceTooFrequentError,
+            ValidationError,
+            {"min_interval_seconds": 3600, "interval_seconds": 300},
+        ),
+    ],
+)
+def test_each_schedule_limit_is_its_own_class_with_its_numbers(
+    status: int, code: str, cls: type[RunsError], kind: type[RunsError], details: dict
+) -> None:
+    """A caller reads which limit and its numbers from the class, ``code`` and ``details``,
+    never from the text; and ``except ConflictError`` / ``ValidationError``, which caught
+    these before they had their own codes, still does."""
+    error = error_from_problem(status, problem(status, code, details=details), where="POST /x")
+    assert type(error) is cls and isinstance(error, kind)
+    assert (error.code, error.status, error.details, error.retryable) == (
+        code,
+        status,
+        details,
+        False,
+    )
+    assert not isinstance(error, LeaseLostError)

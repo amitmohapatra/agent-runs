@@ -410,6 +410,9 @@
           "NOT_FOUND",
           "CONFLICT",
           "LEASE_LOST",
+          "SCHEDULE_LIMIT",
+          "FIRES_PER_DAY",
+          "CADENCE_TOO_FREQUENT",
           "PAYLOAD_TOO_LARGE",
           "RATE_LIMIT",
           "DEPENDENCY_UNAVAILABLE",
@@ -1090,7 +1093,7 @@
         "properties": {
           "code": {
             "$ref": "#/components/schemas/ErrorCode",
-            "description": "Stable machine-readable category. LEASE_LOST: the worker no longer holds the run's lease and must stop working it; CONFLICT: any other state conflict; DEPENDENCY_UNAVAILABLE and RATE_LIMIT are retryable after Retry-After."
+            "description": "Stable machine-readable category. LEASE_LOST: the worker no longer holds the run's lease and must stop working it; SCHEDULE_LIMIT (409), FIRES_PER_DAY (409) and CADENCE_TOO_FREQUENT (422): a schedule limit, its numbers in `details`; CONFLICT: any other state conflict; DEPENDENCY_UNAVAILABLE and RATE_LIMIT are retryable after Retry-After."
           },
           "detail": {
             "description": "What went wrong in this occurrence. Never echoes a submitted value.",
@@ -1102,7 +1105,7 @@
           },
           "details": {
             "additionalProperties": true,
-            "description": "Category-specific structured context: `errors` (each with `loc`, `msg`, `type`) for a 422, the schedule's state for a failed fire, the budget for a 429.",
+            "description": "Category-specific structured context: `errors` (each with `loc`, `msg`, `type`) for a 422, the schedule's state for a failed fire, the budget for a 429, the limit and where the tenant stands for a schedule limit.",
             "title": "Details",
             "type": "object"
           },
@@ -2376,6 +2379,85 @@
           "on_behalf_of"
         ],
         "title": "Schedule",
+        "type": "object"
+      },
+      "SchedulePolicy": {
+        "description": "How this deployment's schedules fire, and where the caller's tenant stands against\nits limits: what a harness tells a model as facts before it sets a schedule.",
+        "properties": {
+          "day": {
+            "description": "The UTC day `fires_today` counts.",
+            "format": "date",
+            "title": "Day",
+            "type": "string"
+          },
+          "fires_today": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The fires the tenant's schedules used on `day`; null while max_fires_per_day is off (nothing is counted).",
+            "title": "Fires Today"
+          },
+          "jitter_seconds": {
+            "description": "Each schedule fires a stable 0 to this many seconds after its tick.",
+            "title": "Jitter Seconds",
+            "type": "integer"
+          },
+          "max_failed_fires": {
+            "description": "Fires in a row that could not queue a run before a schedule pauses itself.",
+            "title": "Max Failed Fires",
+            "type": "integer"
+          },
+          "max_fires_per_day": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The most runs a tenant's schedules may fire in a UTC day (FIRES_PER_DAY past it); null: no limit.",
+            "title": "Max Fires Per Day"
+          },
+          "max_per_tenant": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The most schedules a tenant may have (409 SCHEDULE_LIMIT past it); null: no limit.",
+            "title": "Max Per Tenant"
+          },
+          "min_interval_seconds": {
+            "description": "The shortest gap a cadence's occurrences may have, in seconds (RUNS__SCHEDULES__MIN_INTERVAL_SECONDS); a faster one is 422 CADENCE_TOO_FREQUENT.",
+            "title": "Min Interval Seconds",
+            "type": "integer"
+          },
+          "schedule_count": {
+            "description": "The schedules the tenant has now.",
+            "title": "Schedule Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "min_interval_seconds",
+          "jitter_seconds",
+          "max_failed_fires",
+          "max_per_tenant",
+          "max_fires_per_day",
+          "schedule_count",
+          "fires_today",
+          "day"
+        ],
+        "title": "SchedulePolicy",
         "type": "object"
       },
       "ScheduleSpec": {
@@ -9215,7 +9297,7 @@
                 }
               }
             },
-            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "description": "VALIDATION: the body is not a payload object (zstd JSON).",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -11044,7 +11126,7 @@
                 }
               }
             },
-            "description": "CONFLICT: the identity was deleted while this create ran (rare); repeat. Or the tenant has the most schedules the deployment allows (RUNS__SCHEDULES__MAX_PER_TENANT).",
+            "description": "CONFLICT: the identity was deleted while this create ran (rare); repeat. SCHEDULE_LIMIT: the tenant has the most schedules the deployment allows (RUNS__SCHEDULES__MAX_PER_TENANT); `details` has `max_per_tenant` and `schedule_count`.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -11119,7 +11201,7 @@
                 }
               }
             },
-            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "description": "CADENCE_TOO_FREQUENT: the cadence fires more often than the deployment's floor; `details` has `min_interval_seconds` and the cadence's real shortest gap, `interval_seconds`. VALIDATION: anything else is invalid; details.errors says where.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -11209,6 +11291,274 @@
           }
         ],
         "summary": "Create a schedule (an upsert)",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
+    "/v1/schedules/policy": {
+      "get": {
+        "description": "The deployment's schedule policy (``RUNS__SCHEDULES__*``): the cadence floor, the\njitter, the failed fires before an auto-pause and the two limits (``null`` when off),\nwith the tenant's schedules and its fires of the UTC day (``null`` while that limit is\noff). Any key of the tenant may read it.",
+        "operationId": "schedules.policy",
+        "parameters": [
+          {
+            "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+            "in": "header",
+            "name": "X-Trellis-Tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tenant this request acts in. Required with a platform key (one with no tenant of its own), except on a claim, where leaving it out claims from every tenant's queue; a tenant key may send it only with its own tenant (403 otherwise).",
+              "title": "X-Trellis-Tenant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchedulePolicy"
+                }
+              }
+            },
+            "description": "How this deployment's schedules fire, and where the tenant stands against its limits.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "a platform key names the tenant in X-Trellis-Tenant",
+                  "details": {},
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 400,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: a platform key named no tenant in X-Trellis-Tenant.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHENTICATION",
+                  "detail": "missing X-API-Key",
+                  "details": {},
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 401,
+                  "title": "Authentication required",
+                  "type": "urn:trellis:problem:authentication"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHENTICATION: no X-API-Key, or one the key registry does not know.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "AUTHORIZATION",
+                  "detail": "X-Trellis-Tenant is not the tenant of this api key",
+                  "details": {},
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 403,
+                  "title": "Not permitted",
+                  "type": "urn:trellis:problem:authorization"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "AUTHORIZATION: the key registry refuses the key, or the request names a tenant or on_behalf_of the key may not act for.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "VALIDATION",
+                  "detail": "the request is invalid",
+                  "details": {
+                    "errors": [
+                      {
+                        "loc": [
+                          "body",
+                          "agent_id"
+                        ],
+                        "msg": "Field required",
+                        "type": "missing"
+                      }
+                    ]
+                  },
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": false,
+                  "status": 422,
+                  "title": "Invalid request",
+                  "type": "urn:trellis:problem:validation"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "RATE_LIMIT",
+                  "detail": "this tenant's request budget is spent",
+                  "details": {},
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 429,
+                  "title": "Too many requests",
+                  "type": "urn:trellis:problem:rate-limit"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "RATE_LIMIT: the tenant's request budget is spent; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "code": "DEPENDENCY_UNAVAILABLE",
+                  "detail": "the database is unavailable",
+                  "details": {},
+                  "instance": "/v1/schedules/policy",
+                  "request_id": "req_01J8ZQ4Y6V9W3X2K7M5N0P1R2S",
+                  "retryable": true,
+                  "status": 503,
+                  "title": "A dependency is unavailable",
+                  "type": "urn:trellis:problem:dependency-unavailable"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "DEPENDENCY_UNAVAILABLE: PostgreSQL or the key registry did not answer; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-Request-ID": {
+                "$ref": "#/components/headers/X-Request-ID"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "summary": "Read the schedule policy",
         "tags": [
           "schedules"
         ]
@@ -12136,7 +12486,7 @@
                 }
               }
             },
-            "description": "VALIDATION: the body, a parameter or a cursor is invalid; details.errors says where.",
+            "description": "CADENCE_TOO_FREQUENT: the cadence fires more often than the deployment's floor; `details` has `min_interval_seconds` and the cadence's real shortest gap, `interval_seconds`. VALIDATION: anything else is invalid; details.errors says where.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -12465,7 +12815,7 @@
                 }
               }
             },
-            "description": "CONFLICT: the schedule is paused and will not fire; or it has ended (an `at` at or after its `end_at`, or any fire once that has passed); or the tenant's fires for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; recorded on the schedule).",
+            "description": "CONFLICT: the schedule is paused and will not fire; or it has ended (an `at` at or after its `end_at`, or any fire once that has passed). FIRES_PER_DAY: the tenant's fires for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; recorded on the schedule's `last_error` with the same code); `details` has `max_fires_per_day`, `fires_today` and `day`.",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
