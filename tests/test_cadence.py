@@ -200,3 +200,32 @@ def test_a_cadence_that_is_not_one_is_not_too_frequent() -> None:
         validate_cadence("every so often")
     assert not isinstance(refused.value, CadenceTooFrequent)
     assert refused.value.code == "VALIDATION" and refused.value.details == {}
+
+
+@pytest.mark.parametrize(
+    ("cadence", "times"), [("30 1 * * *", ["01:30"]), ("0,30 1 * * *", ["01:00", "01:30"])]
+)
+def test_a_time_the_autumn_change_repeats_fires_once_on_its_first_occurrence(
+    cadence: str, times: list[str]
+) -> None:
+    """01:00-02:00 comes twice in New York on 1 November 2026: a schedule at a fixed hour in
+    it fires on the first pass only, as cron does, never twice in one night."""
+    fires: list[datetime] = []
+    after = datetime(2026, 11, 1, 4, tzinfo=UTC)  # 00:00 EDT
+    while (due := next_fire_at(cadence, after=after, timezone=NY)) is not None and due < datetime(
+        2026, 11, 2, tzinfo=UTC
+    ):
+        fires.append(due)
+        after = due
+    local = [f.astimezone(ZoneInfo(NY)) for f in fires]
+    assert [(f"{t:%H:%M}", t.tzname()) for t in local] == [(t, "EDT") for t in times]
+
+
+def test_hourly_still_fires_every_real_hour_through_the_repeated_one() -> None:
+    """A wildcard hour is a rate, not a time of day: both 01:00s fire, an hour apart."""
+    first = next_fire_at("0 * * * *", after=datetime(2026, 11, 1, 4, 30, tzinfo=UTC), timezone=NY)
+    assert first == datetime(2026, 11, 1, 5, tzinfo=UTC)  # 01:00 EDT
+    assert first is not None
+    assert next_fire_at("0 * * * *", after=first, timezone=NY) == datetime(
+        2026, 11, 1, 6, tzinfo=UTC
+    )  # 01:00 EST

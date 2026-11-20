@@ -6,6 +6,10 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A time of day the autumn clock change repeats fires once.** A cron with a fixed hour in
+  the hour that comes twice (`30 1 * * *` in New York on the first Sunday of November) fired
+  on both passes; it now fires on the first only, as cron does. A wildcard hour (`hourly`,
+  `0 * * * *`) is a rate and still fires every real hour. Nothing for a caller to do.
 * **Each schedule limit has its own error code, with its numbers.** A create past
   `RUNS__SCHEDULES__MAX_PER_TENANT` is `409 SCHEDULE_LIMIT` (it was `409 CONFLICT`, the code a
   create racing a delete still has), `details` `{"max_per_tenant", "schedule_count"}`. A fire

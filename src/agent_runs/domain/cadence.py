@@ -92,14 +92,27 @@ def validate_cadence(cadence: str, *, floor: timedelta = MIN_INTERVAL) -> str:
 def next_fire_at(cadence: str, *, after: datetime, timezone: str) -> datetime | None:
     """The first instant ``cadence`` fires strictly after ``after``, in UTC; ``None`` for
     ``manual``. Computed in the schedule's own zone (a Berlin "daily" is local midnight on
-    both sides of a DST change) and returned as an absolute instant."""
+    both sides of a DST change, and a time in the hour an autumn change repeats fires once,
+    on its first pass) and returned as an absolute instant."""
     if after.tzinfo is None:
         raise ValueError("next_fire_at needs a timezone-aware reference time")
     expression = BUCKETS.get(cadence, cadence)
     if expression is None:
         return None
-    local = after.astimezone(ZoneInfo(timezone))
-    return croniter(expression, local).get_next(datetime).astimezone(UTC)
+    zone = ZoneInfo(timezone)
+    cursor = croniter(expression, after.astimezone(zone))
+    due = cursor.get_next(datetime)
+    while _repeated(due, zone) and not expression.split()[1].startswith("*"):
+        due = cursor.get_next(datetime)  # a time of day the clock repeats fires on its first pass
+    return due.astimezone(UTC)
+
+
+def _repeated(due: datetime, zone: ZoneInfo) -> bool:
+    """Whether ``due`` is the second time its wall-clock time comes (the hour an autumn change
+    repeats). A fixed hour fires on the first only, as cron does; a wildcard hour (``hourly``)
+    is a rate and fires on both."""
+    first = due.replace(tzinfo=None).replace(tzinfo=zone, fold=0)
+    return first.astimezone(UTC) < due.astimezone(UTC)
 
 
 def jitter(schedule_id: str, *, spread: timedelta = JITTER_MAX) -> timedelta:
