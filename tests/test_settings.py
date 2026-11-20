@@ -198,15 +198,13 @@ async def test_the_registry_client_bounds_its_waits_and_keeps_connections_alive(
 
 def test_the_schedule_policy_defaults_to_what_was_hard_coded(fresh_settings) -> None:
     """``RUNS__SCHEDULES__*`` unset is exactly the policy before the group existed: the
-    one-hour floor, the minute of jitter, three failed fires, 5 min doubling to 1 h. The two
-    count limits are on: 50 schedules per tenant, 500 fires per tenant per UTC day."""
+    one-hour floor, the minute of jitter, three failed fires. The two count limits are on: 50
+    schedules per tenant, 500 fires per tenant per UTC day."""
     schedules = get_settings().schedules
     assert schedules == SchedulesSettings()
     assert schedules.min_interval == MIN_INTERVAL == timedelta(hours=1)
     assert schedules.jitter == JITTER_MAX == timedelta(seconds=60)
     assert schedules.max_failed_fires == MAX_CONSECUTIVE_FAILURES == 3
-    assert (schedules.retry_base, schedules.retry_cap) == (FIRE_RETRY_BASE, FIRE_RETRY_CAP)
-    assert (schedules.retry_base, schedules.retry_cap) == (timedelta(minutes=5), timedelta(hours=1))
     assert (schedules.max_per_tenant, schedules.max_fires_per_day) == (50, 500)
     assert (schedules.per_tenant_limit, schedules.fires_per_day_limit) == (50, 500)
 
@@ -225,8 +223,6 @@ def test_the_schedule_policy_is_read_from_its_group(fresh_settings, monkeypatch)
         "RUNS__SCHEDULES__MIN_INTERVAL_SECONDS": "900",
         "RUNS__SCHEDULES__JITTER_SECONDS": "0",
         "RUNS__SCHEDULES__MAX_FAILED_FIRES": "5",
-        "RUNS__SCHEDULES__RETRY_BASE_SECONDS": "60",
-        "RUNS__SCHEDULES__RETRY_CAP_SECONDS": "600",
         "RUNS__SCHEDULES__MAX_PER_TENANT": "100",
         "RUNS__SCHEDULES__MAX_FIRES_PER_DAY": "1000",
     }.items():
@@ -234,11 +230,21 @@ def test_the_schedule_policy_is_read_from_its_group(fresh_settings, monkeypatch)
     schedules = get_settings().schedules
     assert (schedules.min_interval, schedules.jitter) == (timedelta(minutes=15), timedelta(0))
     assert schedules.max_failed_fires == 5
-    assert (schedules.retry_base, schedules.retry_cap) == (
-        timedelta(minutes=1),
-        timedelta(minutes=10),
-    )
     assert (schedules.max_per_tenant, schedules.max_fires_per_day) == (100, 1000)
+
+
+def test_the_fire_backoff_is_not_a_setting(fresh_settings, monkeypatch) -> None:
+    """The wait after a failed fire is ADR 0004's policy, fixed: ``FIRE_RETRY_BASE`` (5 min)
+    doubling to ``FIRE_RETRY_CAP`` (1 h). ``RUNS__SCHEDULES__RETRY_BASE_SECONDS`` and
+    ``RETRY_CAP_SECONDS`` are not read."""
+    assert (timedelta(minutes=5), timedelta(hours=1)) == (FIRE_RETRY_BASE, FIRE_RETRY_CAP)
+    monkeypatch.setenv("RUNS__SCHEDULES__RETRY_BASE_SECONDS", "60")
+    monkeypatch.setenv("RUNS__SCHEDULES__RETRY_CAP_SECONDS", "600")
+    schedules = get_settings().schedules
+    assert schedules == SchedulesSettings()
+    fields = set(SchedulesSettings.model_fields)
+    assert not fields & {"retry_base_seconds", "retry_cap_seconds"}
+    assert not hasattr(schedules, "retry_base") and not hasattr(schedules, "retry_cap")
 
 
 @pytest.mark.parametrize(
@@ -248,8 +254,6 @@ def test_the_schedule_policy_is_read_from_its_group(fresh_settings, monkeypatch)
         {"min_interval_seconds": 900, "jitter_seconds": 900},  # a fire past the next tick
         {"jitter_seconds": -1},
         {"max_failed_fires": 0},
-        {"retry_base_seconds": 0},
-        {"retry_base_seconds": 600, "retry_cap_seconds": 300},
         {"max_per_tenant": -1},
         {"max_fires_per_day": -1},
     ],

@@ -154,8 +154,8 @@ HEARTBEAT_MAX_AGE_SECONDS: Final = 60.0
 #: Consecutive failed fires before a schedule pauses itself, unless the deployment says
 #: otherwise (``RUNS__SCHEDULES__MAX_FAILED_FIRES``). Three is "not a blip".
 MAX_CONSECUTIVE_FAILURES: Final = 3
-#: The wait after a retryable failed fire, doubling per failure up to the cap, unless the
-#: deployment says otherwise (``RUNS__SCHEDULES__RETRY_BASE_SECONDS``, ``RETRY_CAP_SECONDS``).
+#: The wait after a retryable failed fire, doubling per failure up to the cap (ADR 0004).
+#: Fixed, not a setting.
 FIRE_RETRY_BASE: Final = timedelta(minutes=5)
 FIRE_RETRY_CAP: Final = timedelta(hours=1)
 #: The lowest a deployment may set the cadence floor (``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS``,

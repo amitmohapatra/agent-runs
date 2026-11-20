@@ -1,5 +1,5 @@
 """The schedule policy a deployment may set (``RUNS__SCHEDULES__*``): the floor, the jitter,
-the failed fires before an auto-pause and their backoff, each wired to where it acts; and the
+the failed fires before an auto-pause, each wired to where it acts; and the
 two count limits, on by default (50 schedules per tenant, 500 fires per tenant per UTC day)
 and off at 0.
 
@@ -122,22 +122,26 @@ async def test_the_failed_fires_before_an_auto_pause_are_the_deployments(parts, 
         assert (paused["enabled"], paused["consecutive_failures"]) == (False, 1)
 
 
-async def test_the_fire_backoff_is_the_deployments(parts, broken) -> None:
-    """60 s doubling to at most 90 s: the first retry waits 60 s, the second 90 s (capped)."""
-    policy = {"retry_base_seconds": 60, "retry_cap_seconds": 90, "max_failed_fires": 5}
+async def test_the_fire_backoff_is_fixed_whatever_the_deployment_sets(parts, broken) -> None:
+    """Not a setting (ADR 0004): 300 s doubling per failed fire to at most 3600 s, even with
+    the former ``retry_*_seconds`` passed: 300, 600, 1200, 2400, then 3600 twice (capped)."""
+    policy = {"retry_base_seconds": 60, "retry_cap_seconds": 90, "max_failed_fires": 7}
     async with _served(parts, **policy) as served:
         app, client, ticker = served
         sid = await _due(app, client)
         broken.fail()
-        start = datetime.now(UTC)
-        await ticker.tick(now=start)
-        first = (await client.get(f"/v1/schedules/{sid}")).json()
-        assert datetime.fromisoformat(first["retry_after"]) == start + timedelta(seconds=60)
-        await ticker.tick(now=start + timedelta(seconds=61))
-        second = (await client.get(f"/v1/schedules/{sid}")).json()
-        retry = datetime.fromisoformat(second["retry_after"])
-        assert retry == start + timedelta(seconds=61 + 90)
-        assert second["consecutive_failures"] == 2 and second["enabled"] is True
+        at = datetime.now(UTC)
+        waits: list[int] = []
+        backing_off: dict[str, Any] = {}
+        for _ in range(6):
+            await ticker.tick(now=at)
+            backing_off = (await client.get(f"/v1/schedules/{sid}")).json()
+            assert backing_off["enabled"] is True
+            retry = datetime.fromisoformat(backing_off["retry_after"])
+            waits.append(int((retry - at).total_seconds()))
+            at = retry + timedelta(seconds=1)
+        assert waits == [300, 600, 1200, 2400, 3600, 3600]
+        assert backing_off["consecutive_failures"] == 6
 
 
 # ------------------------------------------------------------------ schedules per tenant

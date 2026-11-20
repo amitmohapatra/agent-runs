@@ -18,8 +18,9 @@ instant, the one that fires): ``next_fire_at`` is ``None`` once the next one wou
 past it, and once the end itself has passed, so an ended schedule is never due again.
 
 How schedules fire is the deployment's (``SchedulesSettings``, ``RUNS__SCHEDULES__*``): the
-cadence floor, the jitter, the failed fires before an auto-pause and their backoff, and the
-two count limits, on by default and off at 0.
+cadence floor, the jitter, the failed fires before an auto-pause, and the two count limits,
+on by default and off at 0. The backoff between failed fires is fixed (``FIRE_RETRY_BASE``
+doubling to ``FIRE_RETRY_CAP``, ADR 0004).
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from trellis.contracts.errors import AgentError
 from trellis.contracts.ids import new_id
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
-from agent_runs.config.constants import DEFAULT_PAGE
+from agent_runs.config.constants import DEFAULT_PAGE, FIRE_RETRY_BASE, FIRE_RETRY_CAP
 from agent_runs.config.settings import SchedulesSettings
 from agent_runs.domain.cadence import jitter, next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
@@ -398,8 +399,8 @@ class ScheduleStore:
         self, schedule_id: str, *, error: AgentError, now: datetime
     ) -> Schedule:
         """A fire that could not queue its run. A permanent failure pauses the schedule at
-        once; a retryable one backs off (``RUNS__SCHEDULES__RETRY_BASE_SECONDS`` doubling to
-        ``RETRY_CAP_SECONDS``) and pauses after ``RUNS__SCHEDULES__MAX_FAILED_FIRES``
+        once; a retryable one backs off (``FIRE_RETRY_BASE`` doubling to ``FIRE_RETRY_CAP``)
+        and pauses after ``RUNS__SCHEDULES__MAX_FAILED_FIRES``
         (``MAX_CONSECUTIVE_FAILURES`` unless set)."""
         policy = self._policy
         row = await self._claimed(schedule_id)
@@ -409,7 +410,7 @@ class ScheduleStore:
             row.enabled = False
             row.retry_after = None
         else:
-            wait = backoff(policy.retry_base, row.consecutive_failures, cap=policy.retry_cap)
+            wait = backoff(FIRE_RETRY_BASE, row.consecutive_failures, cap=FIRE_RETRY_CAP)
             row.retry_after = now + wait
         row.updated_at = now
         return await self._flushed(row)

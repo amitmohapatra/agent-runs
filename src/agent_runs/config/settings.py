@@ -21,8 +21,6 @@ from agent_runs.config.constants import (
     CONCURRENCY_PER_KEY,
     DB_CONNECTIONS_PER_PROCESS,
     DB_REGISTRY_SHARE,
-    FIRE_RETRY_BASE,
-    FIRE_RETRY_CAP,
     MAX_CONSECUTIVE_FAILURES,
     MIN_SCHEDULE_FLOOR,
     SCHEDULE_FIRES_PER_DAY,
@@ -208,9 +206,6 @@ class SchedulesSettings(BaseModel):
     jitter_seconds: int = Field(default=_seconds(JITTER_MAX), ge=0)
     #: Fires in a row that could not queue a run before the schedule pauses itself.
     max_failed_fires: int = Field(default=MAX_CONSECUTIVE_FAILURES, ge=1)
-    #: The wait after a retryable failed fire, doubling per failure up to the cap.
-    retry_base_seconds: int = Field(default=_seconds(FIRE_RETRY_BASE), ge=1)
-    retry_cap_seconds: int = Field(default=_seconds(FIRE_RETRY_CAP), ge=1)
     #: The most schedules one tenant may have: a create past it is 409. 0: no limit.
     max_per_tenant: int = Field(default=SCHEDULES_PER_TENANT, ge=0)
     #: The most runs one tenant's schedules may fire in a UTC day: a fire past it queues
@@ -224,10 +219,6 @@ class SchedulesSettings(BaseModel):
             raise ValueError(
                 "RUNS__SCHEDULES__JITTER_SECONDS must be under RUNS__SCHEDULES__MIN_INTERVAL_"
                 "SECONDS: a fire jittered past the next tick would skip it"
-            )
-        if self.retry_cap_seconds < self.retry_base_seconds:
-            raise ValueError(
-                "RUNS__SCHEDULES__RETRY_CAP_SECONDS must be at least RETRY_BASE_SECONDS"
             )
         return self
 
@@ -248,14 +239,6 @@ class SchedulesSettings(BaseModel):
     @property
     def jitter(self) -> timedelta:
         return timedelta(seconds=self.jitter_seconds)
-
-    @property
-    def retry_base(self) -> timedelta:
-        return timedelta(seconds=self.retry_base_seconds)
-
-    @property
-    def retry_cap(self) -> timedelta:
-        return timedelta(seconds=self.retry_cap_seconds)
 
 
 class WebhookSettings(BaseModel):

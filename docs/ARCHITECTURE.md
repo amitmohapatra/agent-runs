@@ -489,7 +489,7 @@ sequenceDiagram
         T->>DB: record_success: last_fired_at, last_run_id, failures 0,<br/>next_fire_at = next occurrence after max(fire_time, now)
       else the database refuses it (DBAPIError), or the blob store does not take its input (Unavailable)
         T->>DB: ROLLBACK TO SAVEPOINT, then record_failure: consecutive_failures + 1, last_error
-        Note over T,DB: permanent error, or RUNS__SCHEDULES__MAX_FAILED_FIRES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h (RETRY_BASE/CAP_SECONDS)
+        Note over T,DB: permanent error, or RUNS__SCHEDULES__MAX_FAILED_FIRES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h (FIRE_RETRY_BASE/CAP)
       end
       T->>DB: COMMIT
     end

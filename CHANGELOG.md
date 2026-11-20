@@ -36,10 +36,10 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
   one fires exactly as before. Nothing to do for a caller that does not send it.
 * **The schedule policy is a setting group, `RUNS__SCHEDULES__*`, with the same defaults.**
   `MIN_INTERVAL_SECONDS` (3600; may be lowered, never under 300, so per-minute schedules stay
-  refused), `JITTER_SECONDS` (60; must be under the floor), `MAX_FAILED_FIRES` (3),
-  `RETRY_BASE_SECONDS` (300) and `RETRY_CAP_SECONDS` (3600) were constants
-  (`cadence.MIN_INTERVAL`, `JITTER_MAX`, `MAX_CONSECUTIVE_FAILURES`, `FIRE_RETRY_*`, kept as
-  the defaults). Unset, nothing changes. The `422` for a cadence under the floor now names
+  refused), `JITTER_SECONDS` (60; must be under the floor) and `MAX_FAILED_FIRES` (3) were
+  constants (`cadence.MIN_INTERVAL`, `JITTER_MAX`, `MAX_CONSECUTIVE_FAILURES`, kept as the
+  defaults). Unset, nothing changes. The backoff between failed fires stays fixed, not a
+  setting: 5 min doubling to 1 h (`FIRE_RETRY_BASE`, `FIRE_RETRY_CAP`, ADR 0004). The `422` for a cadence under the floor now names
   the floor (`under the floor of one run every 1:00:00: per-minute schedules are refused`; it
   said `under the one-run-per-hour floor`).
 * **Behaviour change: two schedule limits, on by default.** An existing deployment that sets
