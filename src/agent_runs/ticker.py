@@ -57,8 +57,8 @@ from agent_runs.config.constants import (
     TICK_SECONDS,
     WEBHOOK_DEAD_RETENTION,
 )
-from agent_runs.config.settings import LimitsSettings, get_settings
-from agent_runs.domain.schedules import FireFailed, FireSkipped
+from agent_runs.config.settings import LimitsSettings, SchedulesSettings, get_settings
+from agent_runs.domain.schedules import FireFailed, FireRefused, FireSkipped, ScheduleEnded
 from agent_runs.firing import Firing
 from agent_runs.observability import metrics
 from agent_runs.observability.logging import configure_logging
@@ -112,6 +112,7 @@ class Ticker:
         *,
         heartbeat_path: Path,
         limits: LimitsSettings,
+        schedules: SchedulesSettings | None = None,
         interval: float = TICK_SECONDS,
         dead_retention: timedelta = WEBHOOK_DEAD_RETENTION,
     ) -> None:
@@ -121,6 +122,7 @@ class Ticker:
         self._heartbeat = heartbeat_path
         self._interval = interval
         self._limits = limits
+        self._schedules = schedules or SchedulesSettings()
         self._dead_retention = dead_retention
         self.breaker = Breaker(BREAKER_THRESHOLD, BREAKER_COOLDOWN)
 
@@ -185,10 +187,10 @@ class Ticker:
         for _ in range(SWEEP_BATCH):
             async with self._sessions() as db:
                 try:
-                    result = await Firing(db, self._runs(db)).fire_due(now=now)
-                except (FireFailed, FireSkipped):
-                    # recorded on the schedule, which now backs off, is paused or waits for
-                    # its next occurrence
+                    result = await Firing(db, self._runs(db), self._schedules).fire_due(now=now)
+                except (FireFailed, FireSkipped, FireRefused, ScheduleEnded):
+                    # recorded on the schedule, which now backs off, is paused, waits for
+                    # its next occurrence or has ended
                     await db.commit()
                     continue
                 await db.commit()
@@ -338,6 +340,7 @@ async def run() -> None:
             blobs,
             heartbeat_path=beat,
             limits=settings.limits,
+            schedules=settings.schedules,
             dead_retention=settings.webhooks.dead_retention,
         )
         await ticker.run_forever(stop)

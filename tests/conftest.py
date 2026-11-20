@@ -217,7 +217,7 @@ async def serving(
                 text(
                     "TRUNCATE run_resolutions, run_artifacts, agent_runs, agent_schedules, "
                     "webhooks, webhook_deliveries, rate_limit_buckets, run_events, run_payloads, "
-                    "payload_blobs"
+                    "payload_blobs, schedule_fire_counts"
                 )
             )
         yield application

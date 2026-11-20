@@ -56,7 +56,7 @@ schedule's state for a failed fire, `differing` for a reused idempotency key.
 | `404` | `NOT_FOUND` | no such run, schedule, webhook or artifact in this tenant (or no such route) |
 | `405` | `VALIDATION` | the route does not take this method (`Allow` lists the ones it does) |
 | `409` | `LEASE_LOST` | a worker's fenced write (`worker_id`: heartbeat, release, pause, finish, artifact upload) on a run whose lease it no longer holds: the lease lapsed and the run went back on the queue, or the run was paused, cancelled, finished, or ended past its deadline or working time. **Stop working the run.** |
-| `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a cancel of a run that ended, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused schedule, a 21st webhook, a redelivery of a delivery still owed |
+| `409` | `CONFLICT` | any other state conflict: an illegal transition, an answer to another interrupt, a cancel of a run that ended, a run id that cannot be used, an idempotency key reused with a different start, a schedule update onto another schedule's identity, a fire of a paused or ended schedule, a schedule or a fire past the deployment's limit (`RUNS__SCHEDULES__MAX_PER_TENANT`, `MAX_FIRES_PER_DAY`), a 21st webhook, a redelivery of a delivery still owed |
 | `413` | `PAYLOAD_TOO_LARGE` | a JSON body past `RUNS__SERVICE__MAX_BODY_BYTES` (4 MiB), a run's `input`, `output` or `checkpoint` past `RUNS__SERVICE__MAX_PAYLOAD_BYTES` (1 MiB), an artifact past 50 MiB (see [Limits](#limits)) |
 | `422` | `VALIDATION` | the body or query is invalid (including the contracts' own validators), a cursor this listing did not issue, or a webhook URL this deployment does not deliver to (scheme, or a host that does not resolve or resolves to a private address) |
 | `429` | `RATE_LIMIT` | the tenant's request budget is spent for now; retryable after `Retry-After` (see [Limits](#limits)) |
@@ -129,12 +129,12 @@ sections after the table have the bodies and the exact semantics.
 | `GET /v1/runs` | `?status=&assignee=&agent_id=&thread_id=&concurrency_key=&parent_run_id=&top_level=&cursor=&limit=` | `200 [RunSummary]` | `422` |
 | `POST /v1/runs/{id}/artifacts` | raw bytes, `Content-Type`, `?worker_id=&checksum=` | `201 ArtifactRef` (`200` repeat) | `403` paused run, non-service key, `404`, `409`, `413`, `422` empty or checksum mismatch |
 | `GET /v1/artifacts/{artifact_id}` | | `200` the bytes | `404`, `500` corrupt |
-| `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare), `422` |
+| `POST /v1/schedules` | `ScheduleSpec` | `201 Schedule` (`200` existing) | `403` tenant or `on_behalf_of`, `409` identity deleted mid-create (rare) or the tenant's schedule limit, `422` |
 | `GET /v1/schedules` | `?enabled=&agent_id=&on_behalf_of=&cursor=&limit=` | `200 [Schedule]` | `422` |
 | `GET /v1/schedules/{id}` | | `200 Schedule` | `404` |
 | `PATCH /v1/schedules/{id}` | `ScheduleUpdate` | `200 Schedule` | `403` `on_behalf_of`, `404`, `409` another schedule's identity, `422` |
 | `DELETE /v1/schedules/{id}` | | `204` | `403` `on_behalf_of`, `404` |
-| `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused, `422` `at` ahead or naive, `503` not queued |
+| `POST /v1/schedules/{id}/fire` | optional `{at}` | `200 FireResult` | `403` `on_behalf_of`, `404`, `409` paused, ended or the tenant's fires for the day spent, `422` `at` ahead or naive, `503` not queued |
 | `POST /v1/webhooks` | `{url, events}` | `201 WebhookCreated` | `409` 20 already, `422` (also a URL this deployment does not deliver to) |
 | `GET /v1/webhooks` | `?cursor=&limit=` | `200 [Webhook]` | `422` |
 | `GET /v1/webhooks/{id}` | | `200 Webhook` | `404` |
@@ -678,8 +678,14 @@ Body: a `ScheduleSpec` (`created_by` is refused; it is the key's principal):
  "cadence": "0 8 * * 1-5", "timezone": "Europe/Berlin", "on_behalf_of": "user_ada",
  "input": {"topic": "inbox"}, "workspace_id": null, "enabled": true,
  "timeout_seconds": 600, "agent_version": "2026.10.05-3f2a1c", "priority": 0,
- "concurrency_key": null, "metadata": {}}
+ "concurrency_key": null, "end_at": null, "metadata": {}}
 ```
+
+`end_at` (optional, with an offset; kept and returned in UTC) is when the schedule ends:
+nothing fires at or after it, by the ticker or by `POST /fire`. The schedule is armed only for
+an occurrence strictly before it (the jittered instant, the one that fires), so once the next
+one would be at or past it `next_fire_at` is `null`; a tick still owed from before the end is
+dropped once the end has passed. `null` (the default) never ends.
 
 `timeout_seconds`, `agent_version`, `priority` and `concurrency_key` (optional) are copied
 into the `RunStart` of every run the schedule fires: its working-time limit, which code set
@@ -689,7 +695,12 @@ the schedule up, and how its runs wait their turn on the queue (as on `POST /v1/
 scheduled run so carries whatever a caller keeps there for a started one.
 
 `cadence` is `hourly | daily | weekly | weekdays | manual` (local midnight; weekly on Monday;
-`manual` never fires on its own) or a cron expression firing at most once an hour.
+`manual` never fires on its own) or a cron expression firing at most once an hour (the
+deployment may lower that floor, never under five minutes: `RUNS__SCHEDULES__MIN_INTERVAL_SECONDS`).
+
+A tenant has at most 50 schedules unless the deployment says otherwise
+(`RUNS__SCHEDULES__MAX_PER_TENANT`; `0` is no limit): a create of a new schedule past it is
+`409`; a create whose identity exists still answers `200`.
 
 **An upsert.** A schedule's identity is `(tenant_id, agent_id, on_behalf_of, cadence,
 input_sha256)`, where `cadence` is the normalised expression and `input_sha256` is the
@@ -711,14 +722,17 @@ deleting one needs a key that may act as its `on_behalf_of` (`404` before `403`)
 ### `PATCH /v1/schedules/{id}` → `Schedule`
 
 Any of `agent_id, name, cadence, timezone, input, workspace_id, enabled, timeout_seconds,
-agent_version, priority, concurrency_key, metadata` (`metadata` is merged; `null` removes a
-limit, a version or a concurrency key; `priority` takes a number, not `null`). `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
+agent_version, priority, concurrency_key, end_at, metadata` (`metadata` is merged; `null`
+removes a limit, a version, a concurrency key or an end; `priority` takes a number, not
+`null`). A new `end_at` drops an armed fire at or past it; removing or moving out an end that
+had dropped one arms the next occurrence again. `tenant_id` and `on_behalf_of` are refused (`422`). Changing the
 cadence or zone re-arms the next fire. A change that would give the schedule the identity of
 another one is `409`.
 
 Pausing and resuming are `PATCH`es: `{"enabled": false}` pauses; `{"enabled": true}` on a
 paused schedule resumes it, clearing an auto-pause (failure count, last error, backoff) and
-firing from the next occurrence it can still honour, never the backlog.
+firing from the next occurrence it can still honour, never the backlog, and nothing at all
+once its `end_at` has passed.
 
 ### `POST /v1/schedules/{id}/fire` → `FireResult`
 
@@ -735,7 +749,14 @@ advances the schedule:
  "idempotency_key": "sch_…@2026-10-01T06:00:00+00:00", "schedule": {…Schedule…}}
 ```
 
-A repeat for the same instant returns the same run. `409` when the schedule is paused.
+A repeat for the same instant returns the same run. `409` when the schedule is paused, or
+has ended (an `at` at or after its `end_at`, or any fire once that has passed). A tenant's
+schedules fire at most 500 runs a UTC day unless the deployment says otherwise
+(`RUNS__SCHEDULES__MAX_FIRES_PER_DAY`; `0` is no limit): each fire that queues a new run counts
+against its tenant's UTC day, by hand or by the ticker; past it the fire is `409` and queues nothing, and
+the schedule records why in `last_error` (code `FIRES_PER_DAY`, category `RATE_LIMIT`) and is
+armed for its next occurrence. It is never paused for it, and `consecutive_failures` does not
+grow. A repeat for an instant already fired returns its run, counting nothing.
 `503 DEPENDENCY_UNAVAILABLE` when the run could not be queued; `details` says what the
 schedule did about it (`retryable` is false once the schedule paused itself):
 

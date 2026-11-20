@@ -6,6 +6,38 @@ with which: [docs/versioning.md](docs/versioning.md). Why: [docs/adr/](docs/adr/
 
 ## Unreleased
 
+* **A schedule may end.** `ScheduleSpec.end_at` (trellis-contracts' unreleased `main`, still
+  0.7.1), and `end_at` in `PATCH /v1/schedules/{id}` and the SDK's `ScheduleUpdate` (`null` /
+  `None` removes it). It is stored (migration `f6a7b8c9d0e1`, a nullable column: every
+  existing schedule never ends) and returned in UTC. Nothing fires at or after it: the
+  schedule is armed only for an occurrence strictly before it (the jittered instant), so
+  `next_fire_at` is `null` once the next one would be at or past it; a tick owed from before
+  the end is dropped once the end has passed; `POST /fire` is `409` for an `at` at or after it
+  and for any fire once it has passed; a resume past the end arms nothing. A schedule without
+  one fires exactly as before. Nothing to do for a caller that does not send it.
+* **The schedule policy is a setting group, `RUNS__SCHEDULES__*`, with the same defaults.**
+  `MIN_INTERVAL_SECONDS` (3600; may be lowered, never under 300, so per-minute schedules stay
+  refused), `JITTER_SECONDS` (60; must be under the floor), `MAX_FAILED_FIRES` (3),
+  `RETRY_BASE_SECONDS` (300) and `RETRY_CAP_SECONDS` (3600) were constants
+  (`cadence.MIN_INTERVAL`, `JITTER_MAX`, `MAX_CONSECUTIVE_FAILURES`, `FIRE_RETRY_*`, kept as
+  the defaults). Unset, nothing changes. The `422` for a cadence under the floor now names
+  the floor (`under the floor of one run every 1:00:00: per-minute schedules are refused`; it
+  said `under the one-run-per-hour floor`).
+* **Behaviour change: two schedule limits, on by default.** An existing deployment that sets
+  nothing now refuses a tenant's 51st schedule and its schedules' 501st run of a UTC day,
+  where both were unlimited: `RUNS__SCHEDULES__MAX_PER_TENANT` (default `50`) and
+  `RUNS__SCHEDULES__MAX_FIRES_PER_DAY` (default `500`), the platform's per-organisation
+  limits (a tenant is an organisation). **To keep the old behaviour set either to `0`** (no
+  limit). A deployment whose tenants already have more than 50 schedules keeps them all; only
+  new creates are refused. `MAX_PER_TENANT`: a create of a new schedule past it is `409` (a
+  repeated create of one the tenant has still answers it; concurrent creates are counted one
+  after another). `MAX_FIRES_PER_DAY`: fires that queue a new run count against the tenant's
+  UTC day (a new table, `schedule_fire_counts`, migration `a1b2c3d4e5f7`, written only while
+  the limit is on); past it a
+  fire queues nothing, the schedule records `last_error` (`FIRES_PER_DAY`, category
+  `RATE_LIMIT`) and is armed for its next occurrence, as a skipped tick is, and `POST /fire`
+  answers `409`. The failure count is not touched, so the limit never auto-pauses a schedule.
+  A repeat for an instant already fired returns its run and counts nothing.
 * **A heartbeat saves the events that show its checkpoint, with it.** `POST
   /v1/runs/{id}/heartbeat` takes optional `events` (at most 500), added to the run's log in the
   checkpoint's transaction (as an append: in order, one already logged skipped; one naming

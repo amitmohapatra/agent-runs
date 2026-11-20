@@ -1,8 +1,9 @@
 """How often a schedule fires, and when it next does.
 
-Granularity is capped at one run per hour: a schedule is an unattended loop, and a
-per-minute unattended loop is a slow denial of service against whatever it calls, paid for
-by someone who is not watching.
+Granularity is capped at one run per hour unless the deployment lowers the floor
+(``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS``, never under five minutes): a schedule is an
+unattended loop, and a per-minute unattended loop is a slow denial of service against
+whatever it calls, paid for by someone who is not watching.
 
 Nothing here reads the clock; every entry point takes its reference time, so a DST
 transition or a schedule created at 23:59 is a test rather than a wait.
@@ -30,11 +31,13 @@ BUCKETS: dict[str, str | None] = {
     "manual": None,
 }
 
-#: The floor: one run per hour.
+#: The floor: one run per hour, unless the deployment says otherwise
+#: (``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS``, passed in as ``floor``).
 MIN_INTERVAL = timedelta(hours=1)
 
 #: A schedule fires this much after its tick at most (:func:`jitter`): a tenth of the one-hour
-#: floor would allow six minutes, a minute keeps "daily at 9" at 9:00.
+#: floor would allow six minutes, a minute keeps "daily at 9" at 9:00. The deployment may
+#: say otherwise (``RUNS__SCHEDULES__JITTER_SECONDS``, passed in as ``spread``).
 JITTER_MAX = timedelta(seconds=60)
 
 #: Validation measures real occurrences from a fixed instant, so whether a cadence is
@@ -47,8 +50,9 @@ class InvalidCadence(Unprocessable):
     """A cadence this service refuses to run."""
 
 
-def validate_cadence(cadence: str) -> str:
-    """The normalised cadence: a bucket, or a cron expression firing at most hourly.
+def validate_cadence(cadence: str, *, floor: timedelta = MIN_INTERVAL) -> str:
+    """The normalised cadence: a bucket, or a cron expression firing at most once per
+    ``floor`` (hourly unless the deployment lowered it).
 
     ``croniter`` accepts ``* * * * *`` and six-field expressions with a seconds column, so
     "too frequent" is measured on actual consecutive occurrences, not read off a field.
@@ -63,10 +67,10 @@ def validate_cadence(cadence: str) -> str:
     cursor = croniter(normalized, _PROBE_FROM)
     times = [cursor.get_next(datetime) for _ in range(_PROBE_COUNT)]
     interval = min(later - earlier for earlier, later in pairwise(times))
-    if interval < MIN_INTERVAL:
+    if interval < floor:
         raise InvalidCadence(
-            f"cadence {cadence!r} fires every {interval}, under the one-run-per-hour floor: "
-            "per-minute schedules are refused"
+            f"cadence {cadence!r} fires every {interval}, under the floor of one run every "
+            f"{floor}: per-minute schedules are refused"
         )
     return normalized
 
@@ -84,9 +88,13 @@ def next_fire_at(cadence: str, *, after: datetime, timezone: str) -> datetime | 
     return croniter(expression, local).get_next(datetime).astimezone(UTC)
 
 
-def jitter(schedule_id: str) -> timedelta:
-    """The schedule's own delay after each tick, in ``[0, JITTER_MAX)``: a hash of its id, so
-    it is the same on every replica and restart while a thousand "daily at 9" schedules
-    spread over the minute (systemd's ``RandomizedDelaySec``, Jenkins' ``H``)."""
+def jitter(schedule_id: str, *, spread: timedelta = JITTER_MAX) -> timedelta:
+    """The schedule's own delay after each tick, in whole seconds in ``[0, spread)``: a hash
+    of its id, so it is the same on every replica and restart while a thousand "daily at 9"
+    schedules spread over the minute (systemd's ``RandomizedDelaySec``, Jenkins' ``H``). A
+    spread under a second is no delay."""
+    seconds = int(spread.total_seconds())
+    if seconds <= 0:
+        return timedelta(0)
     digest = hashlib.sha256(schedule_id.encode()).digest()
-    return timedelta(seconds=int.from_bytes(digest[:4]) % int(JITTER_MAX.total_seconds()))
+    return timedelta(seconds=int.from_bytes(digest[:4]) % seconds)

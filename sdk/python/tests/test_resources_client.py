@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
 import pytest
 import respx
 from conftest import URL, artifact, record, schedule, webhook
+from pydantic import ValidationError
 from trellis.contracts.runs import ScheduleSpec
 from trellis.runs import NotFoundError, RunsClient, ScheduleUpdate, WebhookEvent, artifacts
 from trellis.runs.payloads import MEDIA_TYPE, encode, ref_of
@@ -177,6 +178,18 @@ async def test_update_sends_only_the_fields_set(runs: RunsClient) -> None:
     assert json.loads(sent(route).content) == {"enabled": False}
     await runs.schedules.update("sch_1", ScheduleUpdate(input=None, metadata={"a": 1}))
     assert json.loads(sent(route).content) == {"input": None, "metadata": {"a": 1}}
+
+
+@respx.mock
+async def test_update_sets_an_end_and_removes_it_with_none(runs: RunsClient) -> None:
+    route = respx.patch(f"{URL}/v1/schedules/sch_1").respond(200, json=schedule())
+    ending = datetime(2026, 12, 31, 9, tzinfo=timezone(timedelta(hours=1)))
+    await runs.schedules.update("sch_1", ScheduleUpdate(end_at=ending))
+    assert json.loads(sent(route).content) == {"end_at": "2026-12-31T09:00:00+01:00"}
+    await runs.schedules.update("sch_1", ScheduleUpdate(end_at=None))
+    assert json.loads(sent(route).content) == {"end_at": None}
+    with pytest.raises(ValidationError):
+        ScheduleUpdate(end_at=datetime(2026, 12, 31, 9))
 
 
 @respx.mock

@@ -151,11 +151,21 @@ HEARTBEAT_MAX_AGE_SECONDS: Final = 60.0
 
 # --------------------------------------------------------------------------- schedules
 
-#: Consecutive failed fires before a schedule pauses itself. Three is "not a blip".
+#: Consecutive failed fires before a schedule pauses itself, unless the deployment says
+#: otherwise (``RUNS__SCHEDULES__MAX_FAILED_FIRES``). Three is "not a blip".
 MAX_CONSECUTIVE_FAILURES: Final = 3
-#: The wait after a retryable failed fire, doubling per failure up to the cap.
+#: The wait after a retryable failed fire, doubling per failure up to the cap, unless the
+#: deployment says otherwise (``RUNS__SCHEDULES__RETRY_BASE_SECONDS``, ``RETRY_CAP_SECONDS``).
 FIRE_RETRY_BASE: Final = timedelta(minutes=5)
 FIRE_RETRY_CAP: Final = timedelta(hours=1)
+#: The lowest a deployment may set the cadence floor (``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS``,
+#: one hour unless set): a per-minute unattended loop is refused whatever the floor.
+MIN_SCHEDULE_FLOOR: Final = timedelta(minutes=5)
+#: The schedules one tenant (an organisation) may have, and the runs its schedules may fire in
+#: a UTC day, unless the deployment says otherwise (``RUNS__SCHEDULES__MAX_PER_TENANT``,
+#: ``MAX_FIRES_PER_DAY``; 0 turns either off): the platform's per-organisation limits.
+SCHEDULES_PER_TENANT: Final = 50
+SCHEDULE_FIRES_PER_DAY: Final = 500
 #: How far ahead of the clock a fire may claim to be for: a replica's clock a little ahead,
 #: not a typo'd year that would retire the schedule.
 MAX_FIRE_SKEW: Final = timedelta(minutes=1)

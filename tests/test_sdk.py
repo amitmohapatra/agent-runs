@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -288,6 +289,15 @@ async def test_schedules_through_the_sdk(runs: RunsClient) -> None:
         made.schedule_id, ScheduleUpdate(enabled=False), tenant="acme"
     )
     assert paused.enabled is False and paused.name == "morning"
+    ending = datetime.now(UTC).replace(microsecond=0) + timedelta(days=7)
+    ends = await runs.schedules.update(
+        made.schedule_id, ScheduleUpdate(end_at=ending), tenant="acme"
+    )
+    assert ends.end_at == ending and ends.enabled is False
+    endless = await runs.schedules.update(
+        made.schedule_id, ScheduleUpdate(end_at=None), tenant="acme"
+    )
+    assert endless.end_at is None
     await runs.schedules.delete(made.schedule_id, tenant="acme")
     assert await runs.schedules.get(made.schedule_id, tenant="acme") is None
     with pytest.raises(NotFoundError):

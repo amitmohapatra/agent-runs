@@ -2197,6 +2197,22 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "end_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the schedule ends (ISO 8601, timezone-aware, kept in UTC): it never fires at or after this instant, and once its next occurrence would be, next_fire_at is None. None: it never ends.",
+            "examples": [
+              "2026-12-31T00:00:00Z"
+            ],
+            "title": "End At"
+          },
           "input": {
             "description": "Input each fired run starts with, any JSON value.",
             "title": "Input"
@@ -2364,7 +2380,7 @@
       },
       "ScheduleSpec": {
         "additionalProperties": false,
-        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can\n(:meth:`Schedule.run_start` is that copy).",
+        "description": "A standing intent (\"every weekday at 8\"): which agent, what input, on whose behalf.\n``cadence`` is a cron expression or one of agent-runs' named buckets (``hourly``,\n``daily``, ``weekly``, ``weekdays``, ``manual``) evaluated in ``timezone``; agent-runs\nvalidates the expression and its floor. ``on_behalf_of`` is required: a run fired with\nnobody present acts as the person who set the schedule, never wider. ``timeout_seconds``,\n``agent_version``, ``priority`` and ``concurrency_key`` are copied into the\n:class:`RunStart` of every fire, and ``metadata`` into its ``metadata`` under the fire's\nown keys, so a scheduled run carries everything a started one can\n(:meth:`Schedule.run_start` is that copy). ``end_at``, when set, is the instant from which\nit fires no more; it belongs to the schedule, not to its runs.",
         "properties": {
           "agent_id": {
             "description": "Id of the agent each fire starts a run of.",
@@ -2419,6 +2435,22 @@
             "description": "Whether it fires; a disabled schedule is kept but skipped.",
             "title": "Enabled",
             "type": "boolean"
+          },
+          "end_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the schedule ends (ISO 8601, timezone-aware, kept in UTC): it never fires at or after this instant, and once its next occurrence would be, next_fire_at is None. None: it never ends.",
+            "examples": [
+              "2026-12-31T00:00:00Z"
+            ],
+            "title": "End At"
           },
           "input": {
             "description": "Input each fired run starts with, any JSON value.",
@@ -2578,6 +2610,19 @@
             ],
             "description": "false pauses; true resumes (clearing an auto-pause).",
             "title": "Enabled"
+          },
+          "end_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When it ends (with an offset; kept in UTC): nothing fires at or after it, and an armed fire at or past it is dropped. null removes it, re-arming the next occurrence.",
+            "title": "End At"
           },
           "input": {
             "description": "The input each fired run gets.",
@@ -10789,7 +10834,7 @@
         ]
       },
       "post": {
-        "description": "An upsert on the schedule's identity ``(agent_id, on_behalf_of, cadence, input)`` in\nthis tenant: ``201`` with a new schedule armed for its next occurrence (``created_by`` is\nthe key's principal), or ``200`` with the existing one, unchanged.",
+        "description": "An upsert on the schedule's identity ``(agent_id, on_behalf_of, cadence, input)`` in\nthis tenant: ``201`` with a new schedule armed for its next occurrence before its\n``end_at`` (``created_by`` is the key's principal), or ``200`` with the existing one,\nunchanged.",
         "operationId": "schedules.create",
         "parameters": [
           {
@@ -10999,7 +11044,7 @@
                 }
               }
             },
-            "description": "CONFLICT: the identity was deleted while this create ran (rare); repeat.",
+            "description": "CONFLICT: the identity was deleted while this create ran (rare); repeat. Or the tenant has the most schedules the deployment allows (RUNS__SCHEDULES__MAX_PER_TENANT).",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"
@@ -11782,7 +11827,7 @@
         ]
       },
       "patch": {
-        "description": "Change the fields sent; ``on_behalf_of`` is not one of them. ``{\"enabled\": false}``\npauses, ``{\"enabled\": true}`` resumes (clearing an auto-pause).",
+        "description": "Change the fields sent; ``on_behalf_of`` is not one of them. ``{\"enabled\": false}``\npauses, ``{\"enabled\": true}`` resumes (clearing an auto-pause; nothing is armed once the\nschedule's ``end_at`` has passed). ``{\"end_at\": null}`` removes the end.",
         "operationId": "schedules.update",
         "parameters": [
           {
@@ -12188,7 +12233,7 @@
     },
     "/v1/schedules/{schedule_id}/fire": {
       "post": {
-        "description": "Queue the run for this schedule's tick now. Repeating it for the same ``at`` returns\nthe same run. 409 when paused, 422 for an ``at`` that has not arrived, 503 when the run\ncould not be queued (recorded on the schedule, which may pause itself).",
+        "description": "Queue the run for this schedule's tick now. Repeating it for the same ``at`` returns\nthe same run. 409 when paused, ended, or over the tenant's fires for the day (recorded on\nthe schedule), 422 for an ``at`` that has not arrived, 503 when the run could not be\nqueued (recorded on the schedule, which may pause itself).",
         "operationId": "schedules.fire",
         "parameters": [
           {
@@ -12420,7 +12465,7 @@
                 }
               }
             },
-            "description": "CONFLICT: the schedule is paused and will not fire.",
+            "description": "CONFLICT: the schedule is paused and will not fire; or it has ended (an `at` at or after its `end_at`, or any fire once that has passed); or the tenant's fires for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; recorded on the schedule).",
             "headers": {
               "X-RateLimit-Limit": {
                 "$ref": "#/components/headers/X-RateLimit-Limit"

@@ -12,16 +12,24 @@ real run. No caller-supplied instant becomes that clock unfiltered.
 Firing locks the row for the rest of the transaction (``claim`` / ``claim_due``), and the
 success or failure bookkeeping happens under that lock: two ticker replicas on one tick is
 the normal case, and the idempotency key alone dedupes only the run, not these counters.
+
+A schedule with an ``end_at`` is armed only for an occurrence strictly before it (the jittered
+instant, the one that fires): ``next_fire_at`` is ``None`` once the next one would be at or
+past it, and once the end itself has passed, so an ended schedule is never due again.
+
+How schedules fire is the deployment's (``SchedulesSettings``, ``RUNS__SCHEDULES__*``): the
+cadence floor, the jitter, the failed fires before an auto-pause and their backoff, and the
+two count limits, on by default and off at 0.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import Select, or_, select, tuple_
+from sqlalchemy import Select, delete, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,18 +37,19 @@ from trellis.contracts.errors import AgentError
 from trellis.contracts.ids import new_id
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
-from agent_runs.config.constants import (
-    DEFAULT_PAGE,
-    FIRE_RETRY_BASE,
-    FIRE_RETRY_CAP,
-    MAX_CONSECUTIVE_FAILURES,
-)
+from agent_runs.config.constants import DEFAULT_PAGE
+from agent_runs.config.settings import SchedulesSettings
 from agent_runs.domain.cadence import jitter, next_fire_at, validate_cadence
 from agent_runs.domain.errors import NotFound, Unprocessable, field_errors
-from agent_runs.domain.schedules import DuplicateSchedule, ScheduleUpdate, input_sha256
+from agent_runs.domain.schedules import (
+    DuplicateSchedule,
+    ScheduleUpdate,
+    TooManySchedules,
+    input_sha256,
+)
 from agent_runs.retry import backoff
 from agent_runs.store.paging import Page, page_of
-from agent_runs.store.tables import ScheduleRow
+from agent_runs.store.tables import ScheduleFireCountRow, ScheduleRow
 
 _UNKEPT = frozenset({"metadata"})
 _SPEC_FIELDS = tuple(name for name in ScheduleSpec.model_fields if name not in _UNKEPT)
@@ -52,7 +61,7 @@ def _schedule(row: ScheduleRow) -> Schedule:
     return Schedule.read({**fields, "metadata": row.schedule_metadata or {}})
 
 
-def _checked(fields: dict[str, Any]) -> ScheduleSpec:
+def _checked(fields: dict[str, Any], policy: SchedulesSettings) -> ScheduleSpec:
     """A spec as the contracts validate it, with a cadence this service will run."""
     try:
         spec = ScheduleSpec.model_validate(fields)
@@ -60,7 +69,8 @@ def _checked(fields: dict[str, Any]) -> ScheduleSpec:
         raise Unprocessable(
             "the schedule is invalid", details={"errors": field_errors(exc.errors())}
         ) from exc
-    return spec.model_copy(update={"cadence": validate_cadence(spec.cadence)})
+    cadence = validate_cadence(spec.cadence, floor=policy.min_interval)
+    return spec.model_copy(update={"cadence": cadence})
 
 
 _IDENTITY = ("tenant_id", "agent_id", "on_behalf_of", "cadence", "input_sha256")
@@ -73,28 +83,43 @@ def _apply(row: ScheduleRow, spec: ScheduleSpec) -> None:
     row.input_sha256 = input_sha256(spec.input)
 
 
-def _arm(row: ScheduleRow, *, after: datetime) -> None:
+def _before_end(row: ScheduleRow, fire: datetime | None) -> datetime | None:
+    """``fire``, unless the schedule ends at or before it."""
+    if fire is None or (row.end_at is not None and fire >= row.end_at):
+        return None
+    return fire
+
+
+def _arm(row: ScheduleRow, *, after: datetime, policy: SchedulesSettings) -> None:
     tick = next_fire_at(row.cadence, after=after, timezone=row.timezone)
-    row.next_fire_at = None if tick is None else tick + jitter(row.schedule_id)
+    fire = None if tick is None else tick + jitter(row.schedule_id, spread=policy.jitter)
+    row.next_fire_at = _before_end(row, fire)
 
 
-def _rearm(row: ScheduleRow, *, at: datetime) -> None:
+def _rearm(row: ScheduleRow, *, at: datetime, policy: SchedulesSettings) -> None:
     """Arm the next fire, keeping an occurrence that is merely late rather than superseded:
     the fire a short outage swallowed is the one a person clicking resume came for, while
-    one a later occurrence has already replaced is gone."""
+    one a later occurrence has already replaced is gone. Once the schedule's end has passed
+    nothing is kept or armed: a late occurrence would fire after the end."""
+    if row.end_at is not None and at >= row.end_at:
+        row.next_fire_at = None
+        return
     pending = row.next_fire_at
     if pending is not None:
         following = next_fire_at(row.cadence, after=pending, timezone=row.timezone)
         if pending > at or (following is not None and following > at):
+            row.next_fire_at = _before_end(row, pending)
             return
-    _arm(row, after=at)
+    _arm(row, after=at, policy=policy)
 
 
 class ScheduleStore:
-    """Every schedule operation, in one place. The caller commits."""
+    """Every schedule operation, in one place, under the deployment's ``policy`` (unset: the
+    defaults). The caller commits."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, policy: SchedulesSettings | None = None) -> None:
         self._session = session
+        self._policy = policy or SchedulesSettings()
 
     async def upsert(
         self, spec: ScheduleSpec, *, created_by: str, now: datetime
@@ -102,8 +127,11 @@ class ScheduleStore:
         """The schedule with this spec's identity: created (armed for its first occurrence
         after ``now``; ``created_by`` is the credential's principal) or, when it exists,
         returned as it is. Returns ``(schedule, created)``. ``ON CONFLICT DO NOTHING`` on the
-        identity index makes two concurrent creates one schedule."""
-        spec = _checked(spec.model_dump())
+        identity index makes two concurrent creates one schedule. With
+        ``RUNS__SCHEDULES__MAX_PER_TENANT`` on (50 unless set; 0 is off), a create of a new
+        schedule past it is ``TooManySchedules``; one with an existing identity still returns
+        that one."""
+        spec = _checked(spec.model_dump(), self._policy)
         row = ScheduleRow(
             schedule_id=new_id("sch_"),
             created_by=created_by,
@@ -112,7 +140,11 @@ class ScheduleStore:
             updated_at=now,
         )
         _apply(row, spec)
-        _arm(row, after=now)
+        _arm(row, after=now, policy=self._policy)
+        if (limit := self._policy.per_tenant_limit) is not None:
+            existing = await self._counted(row, limit)
+            if existing is not None:
+                return _schedule(existing), False
         values = {column.key: getattr(row, column.key) for column in ScheduleRow.__table__.columns}
         inserted = await self._session.scalar(
             insert(ScheduleRow)
@@ -130,6 +162,36 @@ class ScheduleStore:
         if existing is None:  # deleted between the insert and the read: vanishingly rare
             raise DuplicateSchedule(row.schedule_id)
         return _schedule(existing), False
+
+    async def _counted(self, row: ScheduleRow, limit: int) -> ScheduleRow | None:
+        """Before a create under a per-tenant limit: ``None`` while the tenant has room (the
+        create goes on as without a limit); at the limit, the schedule with ``row``'s identity
+        when there is one (a repeated create still answers it), else ``TooManySchedules``. A
+        lock on the tenant's count, held to the end of the transaction, makes concurrent
+        creates of one tenant count one after another."""
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"agent_schedules:{row.tenant_id}"},
+        )
+        held = (
+            await self._session.execute(
+                select(func.count())
+                .select_from(ScheduleRow)
+                .where(ScheduleRow.tenant_id == row.tenant_id)
+            )
+        ).scalar_one()
+        if held < limit:
+            return None
+        existing = (
+            await self._session.execute(
+                select(ScheduleRow).where(
+                    *(getattr(ScheduleRow, name) == getattr(row, name) for name in _IDENTITY)
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise TooManySchedules(limit)
+        return existing
 
     async def get(self, tenant_id: str, schedule_id: str) -> Schedule:
         return _schedule(await self._row(tenant_id, schedule_id))
@@ -174,21 +236,28 @@ class ScheduleStore:
         actually *changed* (a client sending the whole representation back must not throw
         tonight's run away). ``enabled: false`` pauses; ``enabled: true`` on a paused schedule
         resumes it: it clears the failure count, last error and backoff of an auto-pause and
-        fires from the next occurrence it can still honour, never the backlog. A change that
-        would give the schedule another schedule's identity is ``DuplicateSchedule``."""
+        fires from the next occurrence it can still honour, never the backlog, and nothing
+        once its end has passed. A changed ``end_at`` drops an armed fire at or past it, and
+        re-arms one an earlier end had dropped. A change that would give the schedule another
+        schedule's identity is ``DuplicateSchedule``."""
         row = await self._row(tenant_id, schedule_id)
         changes = change.model_dump(exclude_unset=True)
         if "metadata" in changes:
             changes["metadata"] = {**(row.schedule_metadata or {}), **(changes["metadata"] or {})}
         current = {name: getattr(row, name) for name in _SPEC_FIELDS}
-        spec = _checked({**current, "metadata": row.schedule_metadata or {}, **changes})
+        spec = _checked(
+            {**current, "metadata": row.schedule_metadata or {}, **changes}, self._policy
+        )
         retimed = (spec.cadence, spec.timezone) != (row.cadence, row.timezone)
         re_enabled = spec.enabled and not row.enabled
+        re_ended = spec.end_at != row.end_at
         _apply(row, spec)
         if retimed:
-            _arm(row, after=now)
-        elif re_enabled:
-            _rearm(row, at=now)
+            _arm(row, after=now, policy=self._policy)
+            if row.end_at is not None and now >= row.end_at:
+                row.next_fire_at = None
+        elif re_enabled or re_ended:
+            _rearm(row, at=now, policy=self._policy)
         if re_enabled:
             row.consecutive_failures = 0
             row.last_error = row.retry_after = None
@@ -237,30 +306,78 @@ class ScheduleStore:
         row.last_run_id = run_id
         row.consecutive_failures = 0
         row.last_error = row.retry_after = None
-        _arm(row, after=max(fire_time, now))
+        _arm(row, after=max(fire_time, now), policy=self._policy)
         row.updated_at = now
         return await self._flushed(row)
 
     async def record_skip(self, schedule_id: str, *, now: datetime) -> Schedule:
         """A tick skipped while the last run goes on: arm the next occurrence after ``now``."""
         row = await self._claimed(schedule_id)
-        _arm(row, after=now)
+        _arm(row, after=now, policy=self._policy)
         row.updated_at = now
         return await self._flushed(row)
+
+    async def record_end(self, schedule_id: str, *, now: datetime) -> Schedule:
+        """A tick owed from before the schedule's end, found once the end has passed: it is
+        not fired, and nothing is armed again."""
+        row = await self._claimed(schedule_id)
+        row.next_fire_at = None
+        row.updated_at = now
+        return await self._flushed(row)
+
+    async def record_refusal(
+        self, schedule_id: str, *, error: AgentError, now: datetime
+    ) -> Schedule:
+        """A fire the tenant's daily fire limit refused: recorded as a failed fire is
+        (``last_error``), and the tick skipped as an overlapping one is (armed for the next
+        occurrence after ``now``). The failure count, which auto-pauses, is left alone: a
+        limit the tenant reached is no reason to stop its schedules."""
+        row = await self._claimed(schedule_id)
+        row.last_error = error.model_dump(mode="json")
+        row.retry_after = None
+        _arm(row, after=now, policy=self._policy)
+        row.updated_at = now
+        return await self._flushed(row)
+
+    async def take_fire(self, tenant_id: str, *, now: datetime, limit: int) -> bool:
+        """Count one fire of the tenant's UTC day against ``limit``: ``True`` and counted
+        while there is room, else ``False`` and nothing counted. The counter row's lock
+        orders concurrent fires of one tenant; the tenant's earlier days are dropped."""
+        day = now.astimezone(UTC).date()
+        table = ScheduleFireCountRow.__table__
+        taken = await self._session.scalar(
+            insert(ScheduleFireCountRow)
+            .values(tenant_id=tenant_id, day=day, fires=1)
+            .on_conflict_do_update(
+                index_elements=[table.c.tenant_id, table.c.day],
+                set_={"fires": table.c.fires + 1},
+                where=table.c.fires < limit,
+            )
+            .returning(table.c.fires)
+        )
+        await self._session.execute(
+            delete(ScheduleFireCountRow).where(
+                ScheduleFireCountRow.tenant_id == tenant_id, ScheduleFireCountRow.day < day
+            )
+        )
+        return taken is not None
 
     async def record_failure(
         self, schedule_id: str, *, error: AgentError, now: datetime
     ) -> Schedule:
         """A fire that could not queue its run. A permanent failure pauses the schedule at
-        once; a retryable one backs off and pauses after ``MAX_CONSECUTIVE_FAILURES``."""
+        once; a retryable one backs off (``RUNS__SCHEDULES__RETRY_BASE_SECONDS`` doubling to
+        ``RETRY_CAP_SECONDS``) and pauses after ``RUNS__SCHEDULES__MAX_FAILED_FIRES``
+        (``MAX_CONSECUTIVE_FAILURES`` unless set)."""
+        policy = self._policy
         row = await self._claimed(schedule_id)
         row.consecutive_failures += 1
         row.last_error = error.model_dump(mode="json")
-        if not error.retryable or row.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+        if not error.retryable or row.consecutive_failures >= policy.max_failed_fires:
             row.enabled = False
             row.retry_after = None
         else:
-            wait = backoff(FIRE_RETRY_BASE, row.consecutive_failures, cap=FIRE_RETRY_CAP)
+            wait = backoff(policy.retry_base, row.consecutive_failures, cap=policy.retry_cap)
             row.retry_after = now + wait
         row.updated_at = now
         return await self._flushed(row)

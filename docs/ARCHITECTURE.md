@@ -489,7 +489,7 @@ sequenceDiagram
         T->>DB: record_success: last_fired_at, last_run_id, failures 0,<br/>next_fire_at = next occurrence after max(fire_time, now)
       else the database refuses it (DBAPIError), or the blob store does not take its input (Unavailable)
         T->>DB: ROLLBACK TO SAVEPOINT, then record_failure: consecutive_failures + 1, last_error
-        Note over T,DB: permanent error, or MAX_CONSECUTIVE_FAILURES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h
+        Note over T,DB: permanent error, or RUNS__SCHEDULES__MAX_FAILED_FIRES (3): enabled = false<br/>retryable: retry_after = now + 5 min doubling, at most 1 h (RETRY_BASE/CAP_SECONDS)
       end
       T->>DB: COMMIT
     end
@@ -509,7 +509,20 @@ overlap `SKIP`), so workers down for a day run each schedule once on recovery
 (`test_a_tick_while_the_last_run_is_still_active_is_skipped`). Each schedule fires a stable
 0 to 59 seconds after its tick, a hash of its id (`cadence.jitter`, like systemd's
 `RandomizedDelaySec` and Jenkins' `H`), so a thousand "daily at 9" schedules spread over the
-minute and still fire at 9:00.
+minute and still fire at 9:00 (`RUNS__SCHEDULES__JITTER_SECONDS`, under the floor).
+
+A schedule with an `end_at` is armed only for an occurrence strictly before it, jitter
+included: when the next one would be at or past it, `next_fire_at` is null and the schedule
+is never due again, so its last fire happens once (`tests/test_schedule_ends.py`). Nothing
+fires once the end has passed either: a tick owed from before it (a ticker down across the
+end) is dropped (`record_end`), `POST /fire` is `409`, and a resume arms nothing.
+
+With `RUNS__SCHEDULES__MAX_FIRES_PER_DAY` on (500 unless set; `0` is off), a fire that queues a new run takes one from its
+tenant's counter for the UTC day (`schedule_fire_counts`, an upsert that adds one only while
+under the limit, under the row's lock, so replicas never pass it) inside the fire's savepoint.
+Past the limit the savepoint is rolled back, so no run is queued, and `record_refusal` records
+`last_error` (`FIRES_PER_DAY`) and arms the next occurrence, as a skipped tick is; the
+failure count, which auto-pauses, is not touched.
 
 ## Webhook delivery and dead letters
 
@@ -619,7 +632,9 @@ a run's events.
 1. **Schedules.** Each due schedule is claimed with `FOR UPDATE SKIP LOCKED` and fired: its
    run is inserted `QUEUED` in the same transaction, idempotent on `(schedule_id,
    fire_time)`. A run that cannot be queued is recorded on the schedule, which backs off
-   (retryable) or pauses itself (permanent, or `MAX_CONSECUTIVE_FAILURES`).
+   (retryable) or pauses itself (permanent, or `RUNS__SCHEDULES__MAX_FAILED_FIRES`). One at
+   or past its `end_at` is not fired, and one past its tenant's fires for the day
+   (`RUNS__SCHEDULES__MAX_FIRES_PER_DAY`) is refused and recorded.
 2. **Run deadlines.** A run not yet ended (`QUEUED`, `RUNNING` or `PAUSED`) past its own
    `deadline` (`RunStart.deadline`) ends in `TIMEOUT` with an `AgentError` of code
    `run_deadline` (`retryable: false`: a retry would only be later). The deadline is when
@@ -748,6 +763,12 @@ erDiagram
     timestamptz tat "when the budget would be full again (GCRA)"
   }
 
+  schedule_fire_counts {
+    varchar tenant_id PK
+    date day PK "UTC"
+    int fires "only while RUNS__SCHEDULES__MAX_FIRES_PER_DAY is on (not 0)"
+  }
+
   run_artifacts {
     varchar artifact_id PK
     varchar run_id FK, UK "uq_run_artifacts_content with checksum"
@@ -783,6 +804,7 @@ erDiagram
     int consecutive_failures
     jsonb last_error
     timestamptz retry_after "backoff gate after a retryable failure"
+    timestamptz end_at "nothing fires at or after it"
     jsonb schedule_metadata "under the fire's keys in every fired run"
     timestamptz created_at
     timestamptz updated_at

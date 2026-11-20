@@ -3,8 +3,8 @@
 Every setting of the service, from `src/agent_runs/config/settings.py`. Settings are
 environment variables with one prefix, `RUNS__`, and `__` between levels (or a `.env` file in
 the working directory); [.env.example](../.env.example) lists them with their defaults. Every
-other number (lease bounds, retry backoffs, page sizes, webhook attempts) is a named constant
-in `src/agent_runs/config/constants.py`, not a setting.
+other number (lease bounds, retry backoffs other than a schedule fire's, page sizes, webhook
+attempts) is a named constant in `src/agent_runs/config/constants.py`, not a setting.
 
 **Automatic?** says what happens when you set nothing: **yes** means the default is right
 for a deployment as well as a laptop; **derived** means it is computed from something else;
@@ -87,6 +87,26 @@ old names.
 | `RUNS__LIMITS__CONCURRENCY_PER_KEY` | `1` | yes | API | how many of a tenant's runs sharing a `concurrency_key` may be `RUNNING` at once | `2` |
 | `RUNS__LIMITS__MAX_RUNNING_PER_TENANT` | unset: no cap | yes | API | the most runs one tenant's workers may hold at once; a claim past it is `204`. Fair share between tenants needs no setting | `50` |
 | `RUNS__LIMITS__RETENTION_DAYS` | unset: kept forever | **set it** in production | ticker | days an ended run is kept, with its resolutions, events and payload objects (unset, the store grows with every run) | `90` |
+
+## Schedules (`RUNS__SCHEDULES__*`)
+
+How schedules fire. Unset, each is the policy the service always had (the constants it was
+hard-coded as: `cadence.MIN_INTERVAL`, `cadence.JITTER_MAX`, `MAX_CONSECUTIVE_FAILURES`,
+`FIRE_RETRY_BASE`, `FIRE_RETRY_CAP`). The two limits are **on** by default, at the platform's
+per-organisation figures (a tenant is an organisation): 50 schedules and 500 fires a day; `0`
+turns either off. `Settings` refuses a jitter
+that is not under the floor (a fire jittered past the next tick would skip it) and a cap
+under the base.
+
+| Variable | Default | Automatic? | Read by | What it does | Example |
+|---|---|---|---|---|---|
+| `RUNS__SCHEDULES__MIN_INTERVAL_SECONDS` | `3600` | yes | API | the floor: a cadence firing more often than this (measured on its real occurrences) is `422`. A schedule is an unattended loop, so it may be lowered but never under `300`: per-minute schedules stay refused | `900` |
+| `RUNS__SCHEDULES__JITTER_SECONDS` | `60` | yes | API, ticker | each schedule fires a stable 0 to this many seconds after its tick (a hash of its id), so schedules sharing a tick spread out; `0` fires on the tick | `30` |
+| `RUNS__SCHEDULES__MAX_FAILED_FIRES` | `3` | yes | API, ticker | fires in a row that could not queue a run before the schedule pauses itself | `5` |
+| `RUNS__SCHEDULES__RETRY_BASE_SECONDS` | `300` | yes | API, ticker | the wait after a retryable failed fire, doubling per failure | `60` |
+| `RUNS__SCHEDULES__RETRY_CAP_SECONDS` | `3600` | yes | API, ticker | the most that wait grows to | `900` |
+| `RUNS__SCHEDULES__MAX_PER_TENANT` | `50` (`0`: no limit) | yes | API | the most schedules one tenant may have: a create of a new one past it is `409` (a create of one it has still answers `200`) | `0` |
+| `RUNS__SCHEDULES__MAX_FIRES_PER_DAY` | `500` (`0`: no limit) | yes | API, ticker | the most runs one tenant's schedules may fire in a UTC day, by the ticker or by hand: past it the fire queues nothing and is recorded on the schedule (`last_error` `FIRES_PER_DAY`; `POST /fire` is `409`), which is armed for its next occurrence and never paused for it. Counted while on (from zero when turned on); `0` counts nothing | `10000` |
 
 ## Webhooks (`RUNS__WEBHOOKS__*`)
 

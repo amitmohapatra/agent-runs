@@ -1,4 +1,5 @@
-"""Request-scoped dependencies: a session, the run store on it, and who is calling."""
+"""Request-scoped dependencies: a session, the run store on it, the schedule policy, and who
+is calling."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_runs.api.ratelimit import TenantRateLimiter
 from agent_runs.config.constants import HEADER_API_KEY, HEADER_TENANT
+from agent_runs.config.settings import SchedulesSettings
 from agent_runs.domain.errors import BadRequest, Forbidden, RateLimited, Unauthorized
 from agent_runs.keys import KeyInfo, KeyRegistry
 from agent_runs.observability.metrics import rate_limited_total
@@ -139,6 +141,12 @@ def run_store(request: Request, db: Session) -> RunStore:
     return RunStore(db, request.app.state.settings.limits)
 
 
+def schedule_policy(request: Request) -> SchedulesSettings:
+    """How the deployment's schedules fire (``RUNS__SCHEDULES__*``)."""
+    return request.app.state.settings.schedules
+
+
 Runs = Annotated[RunStore, Depends(run_store)]
+SchedulePolicy = Annotated[SchedulesSettings, Depends(schedule_policy)]
 Who = Annotated[Caller, Depends(caller)]
 Claiming = Annotated[Claimer, Depends(claimer)]

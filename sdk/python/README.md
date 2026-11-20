@@ -214,6 +214,8 @@ async with RunsClient(api_key=priya_key) as runs:  # a key with may_act_as=["use
 ## Schedules
 
 ```python
+from datetime import UTC, datetime
+
 from trellis.contracts.runs import ScheduleSpec
 from trellis.runs import RunsClient, ScheduleUpdate
 
@@ -234,12 +236,17 @@ async with RunsClient() as runs:
     fired = await runs.schedules.fire(briefing.schedule_id)  # fired.run_id is QUEUED
     await runs.schedules.update(briefing.schedule_id, ScheduleUpdate(enabled=False))  # pause
     await runs.schedules.update(briefing.schedule_id, ScheduleUpdate(enabled=True))  # resume
+    await runs.schedules.update(  # nothing fires at or after it; end_at=None removes it
+        briefing.schedule_id, ScheduleUpdate(end_at=datetime(2027, 1, 1, tzinfo=UTC))
+    )
 ```
 
 A fired run is queued: a [worker](#the-worker) runs it. It carries everything a started run
 can: the schedule's `timeout_seconds`, `agent_version`, `priority` and `concurrency_key`, and
 its `metadata` under the fire's own keys (`schedule_id`, `schedule_name`, `fire_time`,
-`created_by`), which win on conflict. `ScheduleUpdate` changes any of them.
+`created_by`), which win on conflict. `ScheduleUpdate` changes any of them. A schedule with
+an `end_at` (on the spec or set by an update) fires nothing at or after it: its
+`next_fire_at` is `None` once the next occurrence would be.
 
 ## Webhooks
 

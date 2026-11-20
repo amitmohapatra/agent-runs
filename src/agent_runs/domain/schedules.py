@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from hashlib import sha256
-from typing import Any
+from typing import Any, Final
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from trellis.contracts.errors import AgentError
@@ -64,6 +64,12 @@ class ScheduleUpdate(BaseModel):
         max_length=200,
         description="The concurrency key of the runs it fires; null removes it.",
     )
+    end_at: AwareDatetime | None = Field(
+        default=None,
+        description="When it ends (with an offset; kept in UTC): nothing fires at or after it, "
+        "and an armed fire at or past it is dropped. null removes it, re-arming the next "
+        "occurrence.",
+    )
     metadata: dict[str, Any] | None = Field(
         default=None, description="Merged into the schedule's metadata."
     )
@@ -107,6 +113,42 @@ class DuplicateSchedule(Conflict):
 class ScheduleNotFiring(Conflict):
     def __init__(self, schedule_id: str) -> None:
         super().__init__(f"schedule {schedule_id} is paused and will not fire")
+
+
+class ScheduleEnded(Conflict):
+    """A fire at or after the schedule's ``end_at``: for an instant at or past it, or at all
+    once it has passed. Nothing fires at or after an end, by hand or by the ticker."""
+
+    def __init__(self, schedule: Schedule) -> None:
+        assert schedule.end_at is not None
+        super().__init__(
+            f"schedule {schedule.schedule_id} ended at {schedule.end_at.isoformat()} and fires "
+            "no more"
+        )
+        self.schedule = schedule
+
+
+class TooManySchedules(Conflict):
+    """A create past the tenant's ``RUNS__SCHEDULES__MAX_PER_TENANT``."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"a tenant has at most {limit} schedules")
+
+
+#: ``AgentError.code`` of a fire refused by ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY``.
+FIRES_PER_DAY: Final = "FIRES_PER_DAY"
+
+
+class FireRefused(Conflict):
+    """A fire past the tenant's ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY`` for the UTC day: it
+    queued nothing. Recorded on the schedule (``last_error``) and the tick skipped, as a
+    failed fire is recorded and an overlapping tick skipped; the schedule is not paused for
+    it. The caller commits that before answering."""
+
+    def __init__(self, schedule: Schedule, error: AgentError) -> None:
+        super().__init__(error.message, details={"error": error.model_dump(mode="json")})
+        self.schedule = schedule
+        self.error = error
 
 
 class FireTimeOutOfRange(Unprocessable):

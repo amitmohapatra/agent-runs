@@ -10,11 +10,18 @@ one can. The schedule's metadata goes under the fire's own keys (``schedule_id``
 pass its run off as another's fire. A schedule whose metadata names a ``thread_id`` fires its
 runs into that conversation. A repeated fire for the same tick finds the run the first one
 queued.
+
+Nothing fires at or after a schedule's ``end_at``: not a tick at or past it, and nothing at all
+once the end has passed, even a tick owed from before it (``ScheduleEnded``). With
+``RUNS__SCHEDULES__MAX_FIRES_PER_DAY`` on (500 unless set; 0 is off), each fire that queues a
+new run takes one from its tenant's count for the UTC day, in the fire's transaction; past it
+the run is not queued (``FireRefused``, recorded on the schedule). A repeat that finds its
+run takes nothing.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final
 
 import structlog
@@ -25,12 +32,16 @@ from trellis.contracts.errors import AgentError, ErrorCategory
 from trellis.contracts.runs import RunStatus, Schedule
 
 from agent_runs.config.constants import MAX_FIRE_SKEW
+from agent_runs.config.settings import SchedulesSettings
 from agent_runs.domain.errors import Unavailable
 from agent_runs.domain.schedules import (
+    FIRES_PER_DAY,
     FireFailed,
+    FireRefused,
     FireResult,
     FireSkipped,
     FireTimeOutOfRange,
+    ScheduleEnded,
     ScheduleNotFiring,
 )
 from agent_runs.store.runs import RunStore
@@ -42,12 +53,16 @@ log = structlog.get_logger(__name__)
 
 class Firing:
     """Fires schedules within the caller's transaction, queueing their runs through ``runs``
-    (the store on ``session``); the caller commits, also after a :class:`FireFailed` (the
-    failure is recorded on the schedule)."""
+    (the store on ``session``) under the deployment's schedule ``policy`` (unset: the
+    defaults); the caller commits, also after a :class:`FireFailed` or :class:`FireRefused`
+    (recorded on the schedule) and, from :meth:`fire_due`, a :class:`ScheduleEnded`."""
 
-    def __init__(self, session: AsyncSession, runs: RunStore) -> None:
+    def __init__(
+        self, session: AsyncSession, runs: RunStore, policy: SchedulesSettings | None = None
+    ) -> None:
         self._session = session
-        self._schedules = ScheduleStore(session)
+        self._policy = policy or SchedulesSettings()
+        self._schedules = ScheduleStore(session, self._policy)
         self._runs = runs
 
     async def fire(
@@ -62,6 +77,8 @@ class Firing:
             raise FireTimeOutOfRange(at, now)
         due = schedule.next_fire_at
         fire_time = at or (due if due is not None and due <= now else now)
+        if _ended(schedule, fire_time=fire_time, now=now):
+            raise ScheduleEnded(schedule)
         return await self._fire(schedule, fire_time=fire_time, now=now)
 
     async def fire_due(self, *, now: datetime) -> FireResult | None:
@@ -71,6 +88,10 @@ class Firing:
         schedule = await self._schedules.claim_due(now=now)
         if schedule is None or schedule.next_fire_at is None:
             return None
+        if _ended(schedule, fire_time=schedule.next_fire_at, now=now):
+            ended = await self._schedules.record_end(schedule.schedule_id, now=now)
+            log.info("schedule.ended", schedule_id=schedule.schedule_id)
+            raise ScheduleEnded(ended)
         if (active := await self._active(schedule)) is not None:
             skipped = await self._schedules.record_skip(schedule.schedule_id, now=now)
             log.info("schedule.skipped", schedule_id=schedule.schedule_id, active_run_id=active)
@@ -89,9 +110,33 @@ class Firing:
     async def _fire(self, schedule: Schedule, *, fire_time: datetime, now: datetime) -> FireResult:
         start = schedule.run_start(fire_time=fire_time, thread_id=_thread(schedule))
         assert start.idempotency_key is not None
+        limit = self._policy.fires_per_day_limit
         try:
             async with self._session.begin_nested():
-                run, _ = await self._runs.start(start, queue=True, now=now, strict=False)
+                run, created = await self._runs.start(start, queue=True, now=now, strict=False)
+                if (
+                    created
+                    and limit is not None
+                    and not await self._schedules.take_fire(
+                        schedule.tenant_id, now=now, limit=limit
+                    )
+                ):
+                    raise _OverTheDay  # the run is rolled back with the savepoint
+        except _OverTheDay:
+            day = now.astimezone(UTC).date().isoformat()
+            error = AgentError(
+                code=FIRES_PER_DAY,
+                message=f"tenant {schedule.tenant_id} has fired its {limit} fires for {day} "
+                "(UTC): this tick queued no run",
+                category=ErrorCategory.RATE_LIMIT,
+                retryable=False,
+                source="agent-runs",
+            )
+            refused = await self._schedules.record_refusal(
+                schedule.schedule_id, error=error, now=now
+            )
+            log.warning("schedule.fire_refused", schedule_id=schedule.schedule_id, limit=limit)
+            raise FireRefused(refused, error) from None
         except (DBAPIError, Unavailable) as exc:
             # the database refused the run, or the blob store did not take its input
             error = AgentError.of(
@@ -119,6 +164,17 @@ class Firing:
             idempotency_key=start.idempotency_key,
             schedule=fired,
         )
+
+
+class _OverTheDay(Exception):
+    """The tenant's daily fire limit is reached: roll the fire's run back."""
+
+
+def _ended(schedule: Schedule, *, fire_time: datetime, now: datetime) -> bool:
+    """Nothing fires at or after the end: neither for an instant at or past it, nor at all
+    once it has passed."""
+    end = schedule.end_at
+    return end is not None and (fire_time >= end or now >= end)
 
 
 #: The schedule metadata key naming the conversation its runs are turns of: a schedule set

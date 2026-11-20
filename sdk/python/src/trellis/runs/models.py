@@ -16,7 +16,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_validator
 from trellis.contracts.runs import (
     Interrupt,
     InterruptResolution,
@@ -114,7 +114,9 @@ class EventsAppended(BaseModel):
 class ScheduleUpdate(BaseModel):
     """The fields a schedule's owner may change; only the ones set are sent, and only those
     change. ``enabled=False`` pauses the schedule; ``enabled=True`` resumes it, clearing an
-    auto-pause. ``metadata`` is merged into the schedule's."""
+    auto-pause. ``metadata`` is merged into the schedule's. ``end_at`` (timezone-aware) is
+    when the schedule ends, nothing firing at or after it; ``end_at=None`` set explicitly
+    removes the end."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -129,6 +131,7 @@ class ScheduleUpdate(BaseModel):
     agent_version: str | None = None
     priority: int | None = None
     concurrency_key: str | None = None
+    end_at: AwareDatetime | None = None
     metadata: dict[str, Any] | None = None
 
 

@@ -17,7 +17,7 @@ from trellis.contracts.ids import now
 from trellis.contracts.runs import Schedule, ScheduleSpec
 
 from agent_runs.api import examples
-from agent_runs.api.deps import Runs, Session, Who
+from agent_runs.api.deps import Runs, SchedulePolicy, Session, Who
 from agent_runs.api.openapi import conflict
 from agent_runs.api.pagination import (
     DEFAULT_LIMIT,
@@ -26,7 +26,13 @@ from agent_runs.api.pagination import (
     decode_cursor,
     link_next,
 )
-from agent_runs.domain.schedules import FireFailed, FireRequest, FireResult, ScheduleUpdate
+from agent_runs.domain.schedules import (
+    FireFailed,
+    FireRefused,
+    FireRequest,
+    FireResult,
+    ScheduleUpdate,
+)
 from agent_runs.firing import Firing
 from agent_runs.store.schedules import ScheduleStore
 
@@ -55,21 +61,28 @@ _ADMINISTER = (
             "description": "The schedule with this identity (agent, on_behalf_of, cadence, "
             "input) already exists: it, unchanged.",
         },
-        **conflict("CONFLICT: the identity was deleted while this create ran (rare); repeat."),
+        **conflict(
+            "CONFLICT: the identity was deleted while this create ran (rare); repeat. Or the "
+            "tenant has the most schedules the deployment allows (RUNS__SCHEDULES__MAX_PER_"
+            "TENANT)."
+        ),
     },
 )
 async def create(
     spec: Annotated[ScheduleSpec, Body(openapi_examples=examples.SCHEDULE)],
     db: Session,
     who: Who,
+    policy: SchedulePolicy,
     response: Response,
 ) -> Schedule:
     """An upsert on the schedule's identity ``(agent_id, on_behalf_of, cadence, input)`` in
-    this tenant: ``201`` with a new schedule armed for its next occurrence (``created_by`` is
-    the key's principal), or ``200`` with the existing one, unchanged."""
+    this tenant: ``201`` with a new schedule armed for its next occurrence before its
+    ``end_at`` (``created_by`` is the key's principal), or ``200`` with the existing one,
+    unchanged."""
     who.require_tenant(spec.tenant_id)
     who.require_may_act_for(spec.on_behalf_of)
-    schedule, created = await ScheduleStore(db).upsert(spec, created_by=who.principal, now=now())
+    store = ScheduleStore(db, policy)
+    schedule, created = await store.upsert(spec, created_by=who.principal, now=now())
     await db.commit()
     if created:
         response.headers["Location"] = f"{router.prefix}/{schedule.schedule_id}"
@@ -139,11 +152,14 @@ async def update(
     change: Annotated[ScheduleUpdate, Body(openapi_examples=examples.SCHEDULE_UPDATE)],
     db: Session,
     who: Who,
+    policy: SchedulePolicy,
 ) -> Schedule:
     """Change the fields sent; ``on_behalf_of`` is not one of them. ``{"enabled": false}``
-    pauses, ``{"enabled": true}`` resumes (clearing an auto-pause)."""
+    pauses, ``{"enabled": true}`` resumes (clearing an auto-pause; nothing is armed once the
+    schedule's ``end_at`` has passed). ``{"end_at": null}`` removes the end."""
     await _administered(schedule_id, db, who)
-    schedule = await ScheduleStore(db).update(who.tenant_id, schedule_id, change, now=now())
+    store = ScheduleStore(db, policy)
+    schedule = await store.update(who.tenant_id, schedule_id, change, now=now())
     await db.commit()
     return schedule
 
@@ -171,7 +187,12 @@ async def delete(schedule_id: ScheduleId, db: Session, who: Who) -> Response:
     "schedule as advanced.",
     responses={
         403: {"description": _ADMINISTER},
-        **conflict("CONFLICT: the schedule is paused and will not fire."),
+        **conflict(
+            "CONFLICT: the schedule is paused and will not fire; or it has ended (an `at` at "
+            "or after its `end_at`, or any fire once that has passed); or the tenant's fires "
+            "for the UTC day are spent (RUNS__SCHEDULES__MAX_FIRES_PER_DAY; recorded on the "
+            "schedule)."
+        ),
         503: {
             "description": "DEPENDENCY_UNAVAILABLE: the run could not be queued; recorded on "
             "the schedule (`details`), which may have paused itself (then not retryable)."
@@ -183,16 +204,19 @@ async def fire(
     db: Session,
     runs: Runs,
     who: Who,
+    policy: SchedulePolicy,
     body: Annotated[FireRequest | None, Body(openapi_examples=examples.FIRE)] = None,
 ) -> FireResult:
     """Queue the run for this schedule's tick now. Repeating it for the same ``at`` returns
-    the same run. 409 when paused, 422 for an ``at`` that has not arrived, 503 when the run
-    could not be queued (recorded on the schedule, which may pause itself)."""
+    the same run. 409 when paused, ended, or over the tenant's fires for the day (recorded on
+    the schedule), 422 for an ``at`` that has not arrived, 503 when the run could not be
+    queued (recorded on the schedule, which may pause itself)."""
     await _administered(schedule_id, db, who)
     at = body.at if body is not None else None
+    firing = Firing(db, runs, policy)
     try:
-        result = await Firing(db, runs).fire(who.tenant_id, schedule_id, at=at, now=now())
-    except FireFailed:
+        result = await firing.fire(who.tenant_id, schedule_id, at=at, now=now())
+    except (FireFailed, FireRefused):
         await db.commit()
         raise
     await db.commit()

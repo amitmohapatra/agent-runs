@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from agent_runs.domain.cadence import (
+    JITTER_MAX,
     MIN_INTERVAL,
     InvalidCadence,
     jitter,
@@ -156,3 +157,25 @@ def test_jitter_is_stable_bounded_and_spread() -> None:
     assert all(timedelta(0) <= s < timedelta(seconds=60) <= MIN_INTERVAL / 10 for s in shifts)
     assert jitter("sch_1") == jitter("sch_1")
     assert len(set(shifts)) > 40
+
+
+def test_a_deployment_may_lower_the_floor_and_the_cadence_is_measured_against_it() -> None:
+    """``RUNS__SCHEDULES__MIN_INTERVAL_SECONDS`` passes its floor here: a quarter-hour cron is
+    accepted under a fifteen-minute floor and still refused under the default one; anything
+    faster than the floor given is refused the same way."""
+    quarter = timedelta(minutes=15)
+    assert validate_cadence("*/15 * * * *", floor=quarter) == "*/15 * * * *"
+    with pytest.raises(InvalidCadence, match="per-minute"):
+        validate_cadence("*/15 * * * *")
+    with pytest.raises(InvalidCadence, match="0:15:00"):
+        validate_cadence("*/5 * * * *", floor=quarter)
+
+
+def test_the_jitter_spread_is_the_deployments_and_zero_turns_it_off() -> None:
+    """``RUNS__SCHEDULES__JITTER_SECONDS`` passes its spread here; the default is the minute
+    of ``JITTER_MAX``, and the same id lands on the same second for a given spread."""
+    narrow = [jitter(f"sch_{n}", spread=timedelta(seconds=10)) for n in range(200)]
+    assert all(timedelta(0) <= s < timedelta(seconds=10) for s in narrow)
+    assert len(set(narrow)) == 10
+    assert jitter("sch_1", spread=JITTER_MAX) == jitter("sch_1")
+    assert {jitter(f"sch_{n}", spread=timedelta(0)) for n in range(20)} == {timedelta(0)}

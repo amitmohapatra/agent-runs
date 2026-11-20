@@ -21,8 +21,15 @@ from agent_runs.config.constants import (
     CONCURRENCY_PER_KEY,
     DB_CONNECTIONS_PER_PROCESS,
     DB_REGISTRY_SHARE,
+    FIRE_RETRY_BASE,
+    FIRE_RETRY_CAP,
+    MAX_CONSECUTIVE_FAILURES,
+    MIN_SCHEDULE_FLOOR,
+    SCHEDULE_FIRES_PER_DAY,
+    SCHEDULES_PER_TENANT,
     WEBHOOK_DEAD_RETENTION,
 )
+from agent_runs.domain.cadence import JITTER_MAX, MIN_INTERVAL
 
 DEV = "dev"
 TEST = "test"
@@ -178,6 +185,79 @@ class LimitsSettings(BaseModel):
         return None if self.retention_days is None else timedelta(days=self.retention_days)
 
 
+def _seconds(span: timedelta) -> int:
+    return int(span.total_seconds())
+
+
+class SchedulesSettings(BaseModel):
+    """How schedules fire. Unset, every value is the policy as it was hard-coded (the
+    constants named in each default): a deployment changes it, nothing else does. The two
+    count limits are on by default (``SCHEDULES_PER_TENANT``, ``SCHEDULE_FIRES_PER_DAY``, the
+    platform's per-organisation figures; a tenant is an organisation); 0 turns either off."""
+
+    #: The floor: the shortest interval a cadence may fire at, measured on its real
+    #: occurrences (``cadence.validate_cadence``). A schedule is an unattended loop, so a
+    #: deployment may lower it (a quarter hour, 900) but never to one run a minute
+    #: (``MIN_SCHEDULE_FLOOR``, five minutes).
+    min_interval_seconds: int = Field(
+        default=_seconds(MIN_INTERVAL), ge=_seconds(MIN_SCHEDULE_FLOOR)
+    )
+    #: Each schedule fires a stable 0 to this many seconds after its tick (a hash of its id),
+    #: so schedules that share a tick spread out; 0 fires on the tick. Under the floor: a
+    #: jittered fire must come before the next tick, or that tick would be skipped.
+    jitter_seconds: int = Field(default=_seconds(JITTER_MAX), ge=0)
+    #: Fires in a row that could not queue a run before the schedule pauses itself.
+    max_failed_fires: int = Field(default=MAX_CONSECUTIVE_FAILURES, ge=1)
+    #: The wait after a retryable failed fire, doubling per failure up to the cap.
+    retry_base_seconds: int = Field(default=_seconds(FIRE_RETRY_BASE), ge=1)
+    retry_cap_seconds: int = Field(default=_seconds(FIRE_RETRY_CAP), ge=1)
+    #: The most schedules one tenant may have: a create past it is 409. 0: no limit.
+    max_per_tenant: int = Field(default=SCHEDULES_PER_TENANT, ge=0)
+    #: The most runs one tenant's schedules may fire in a UTC day: a fire past it queues
+    #: nothing and is recorded on the schedule (``last_error``), which is never paused for it.
+    #: Counted while on. 0: no limit (nothing counted).
+    max_fires_per_day: int = Field(default=SCHEDULE_FIRES_PER_DAY, ge=0)
+
+    @model_validator(mode="after")
+    def _a_policy_that_holds(self) -> Self:
+        if self.jitter_seconds >= self.min_interval_seconds:
+            raise ValueError(
+                "RUNS__SCHEDULES__JITTER_SECONDS must be under RUNS__SCHEDULES__MIN_INTERVAL_"
+                "SECONDS: a fire jittered past the next tick would skip it"
+            )
+        if self.retry_cap_seconds < self.retry_base_seconds:
+            raise ValueError(
+                "RUNS__SCHEDULES__RETRY_CAP_SECONDS must be at least RETRY_BASE_SECONDS"
+            )
+        return self
+
+    @property
+    def per_tenant_limit(self) -> int | None:
+        """``max_per_tenant``, or ``None`` when it is off (0)."""
+        return self.max_per_tenant or None
+
+    @property
+    def fires_per_day_limit(self) -> int | None:
+        """``max_fires_per_day``, or ``None`` when it is off (0)."""
+        return self.max_fires_per_day or None
+
+    @property
+    def min_interval(self) -> timedelta:
+        return timedelta(seconds=self.min_interval_seconds)
+
+    @property
+    def jitter(self) -> timedelta:
+        return timedelta(seconds=self.jitter_seconds)
+
+    @property
+    def retry_base(self) -> timedelta:
+        return timedelta(seconds=self.retry_base_seconds)
+
+    @property
+    def retry_cap(self) -> timedelta:
+        return timedelta(seconds=self.retry_cap_seconds)
+
+
 class WebhookSettings(BaseModel):
     #: Deliver to hosts that resolve to private, loopback or link-local addresses (a receiver
     #: inside the deployment's own network). Unset: only in ``dev``. Elsewhere such a URL is
@@ -226,6 +306,7 @@ class Settings(BaseSettings):
     #: The old name of ``limits`` (``RUNS__RUNS__*``), still read for one release, with a
     #: warning (:meth:`_old_limits`); removed in the next.
     runs: LimitsSettings | None = Field(default=None, exclude=True)
+    schedules: SchedulesSettings = Field(default_factory=SchedulesSettings)
     webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

@@ -4,6 +4,7 @@ registry client they build."""
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -12,15 +13,18 @@ from pydantic import ValidationError
 from sqlalchemy import text
 
 from agent_runs.api.errors import is_unavailable
+from agent_runs.config.constants import FIRE_RETRY_BASE, FIRE_RETRY_CAP, MAX_CONSECUTIVE_FAILURES
 from agent_runs.config.settings import (
     BlobSettings,
     DatabaseSettings,
     LimitsSettings,
     PoolPlan,
+    SchedulesSettings,
     ServiceSettings,
     Settings,
     get_settings,
 )
+from agent_runs.domain.cadence import JITTER_MAX, MIN_INTERVAL
 from agent_runs.keys import KeyRegistry
 from agent_runs.store.database import connect, registry_engine
 from tests.conftest import SETTINGS
@@ -190,3 +194,66 @@ async def test_the_registry_client_bounds_its_waits_and_keeps_connections_alive(
         assert pool._keepalive_expiry == 30.0
     finally:
         await registry.aclose()
+
+
+def test_the_schedule_policy_defaults_to_what_was_hard_coded(fresh_settings) -> None:
+    """``RUNS__SCHEDULES__*`` unset is exactly the policy before the group existed: the
+    one-hour floor, the minute of jitter, three failed fires, 5 min doubling to 1 h. The two
+    count limits are on: 50 schedules per tenant, 500 fires per tenant per UTC day."""
+    schedules = get_settings().schedules
+    assert schedules == SchedulesSettings()
+    assert schedules.min_interval == MIN_INTERVAL == timedelta(hours=1)
+    assert schedules.jitter == JITTER_MAX == timedelta(seconds=60)
+    assert schedules.max_failed_fires == MAX_CONSECUTIVE_FAILURES == 3
+    assert (schedules.retry_base, schedules.retry_cap) == (FIRE_RETRY_BASE, FIRE_RETRY_CAP)
+    assert (schedules.retry_base, schedules.retry_cap) == (timedelta(minutes=5), timedelta(hours=1))
+    assert (schedules.max_per_tenant, schedules.max_fires_per_day) == (50, 500)
+    assert (schedules.per_tenant_limit, schedules.fires_per_day_limit) == (50, 500)
+
+
+def test_zero_turns_either_count_limit_off(fresh_settings, monkeypatch) -> None:
+    """``RUNS__SCHEDULES__MAX_PER_TENANT=0`` and ``MAX_FIRES_PER_DAY=0``: no limit."""
+    monkeypatch.setenv("RUNS__SCHEDULES__MAX_PER_TENANT", "0")
+    monkeypatch.setenv("RUNS__SCHEDULES__MAX_FIRES_PER_DAY", "0")
+    schedules = get_settings().schedules
+    assert (schedules.max_per_tenant, schedules.max_fires_per_day) == (0, 0)
+    assert schedules.per_tenant_limit is None and schedules.fires_per_day_limit is None
+
+
+def test_the_schedule_policy_is_read_from_its_group(fresh_settings, monkeypatch) -> None:
+    for name, value in {
+        "RUNS__SCHEDULES__MIN_INTERVAL_SECONDS": "900",
+        "RUNS__SCHEDULES__JITTER_SECONDS": "0",
+        "RUNS__SCHEDULES__MAX_FAILED_FIRES": "5",
+        "RUNS__SCHEDULES__RETRY_BASE_SECONDS": "60",
+        "RUNS__SCHEDULES__RETRY_CAP_SECONDS": "600",
+        "RUNS__SCHEDULES__MAX_PER_TENANT": "100",
+        "RUNS__SCHEDULES__MAX_FIRES_PER_DAY": "1000",
+    }.items():
+        monkeypatch.setenv(name, value)
+    schedules = get_settings().schedules
+    assert (schedules.min_interval, schedules.jitter) == (timedelta(minutes=15), timedelta(0))
+    assert schedules.max_failed_fires == 5
+    assert (schedules.retry_base, schedules.retry_cap) == (
+        timedelta(minutes=1),
+        timedelta(minutes=10),
+    )
+    assert (schedules.max_per_tenant, schedules.max_fires_per_day) == (100, 1000)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"min_interval_seconds": 60},  # per-minute stays refused, whatever the floor
+        {"min_interval_seconds": 900, "jitter_seconds": 900},  # a fire past the next tick
+        {"jitter_seconds": -1},
+        {"max_failed_fires": 0},
+        {"retry_base_seconds": 0},
+        {"retry_base_seconds": 600, "retry_cap_seconds": 300},
+        {"max_per_tenant": -1},
+        {"max_fires_per_day": -1},
+    ],
+)
+def test_a_schedule_policy_that_cannot_hold_is_refused(fields) -> None:
+    with pytest.raises(ValidationError):
+        SchedulesSettings(**fields)

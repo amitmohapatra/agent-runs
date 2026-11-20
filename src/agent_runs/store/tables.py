@@ -3,12 +3,13 @@ mappings must agree with them (a test compares the two)."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -231,6 +232,8 @@ class ScheduleRow(Base):
     last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: the backoff gate after a retryable failed fire; ``next_fire_at`` stays the tick owed
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: nothing fires at or after it (ScheduleSpec.end_at); null: it never ends
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     schedule_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
@@ -249,6 +252,19 @@ class ScheduleRow(Base):
         # the ticker: enabled schedules by next fire
         Index("ix_schedules_due", "next_fire_at", postgresql_where=text("enabled")),
     )
+
+
+class ScheduleFireCountRow(Base):
+    """How many runs a tenant's schedules fired in one UTC day, kept only while
+    ``RUNS__SCHEDULES__MAX_FIRES_PER_DAY`` is set: the counter a fire takes from, under its
+    row lock, so replicas firing at once never pass the limit. A tenant's earlier days are
+    dropped as it fires."""
+
+    __tablename__ = "schedule_fire_counts"
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    fires: Mapped[int] = mapped_column(Integer)
 
 
 class WebhookRow(Base):
